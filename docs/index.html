@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TDB Documentation - SQL Database Engine v1.2.0</title>
+<style>
+:root {
+    --bg: #0d1117;
+    --bg2: #161b22;
+    --border: #30363d;
+    --fg: #c9d1d9;
+    --fg2: #8b949e;
+    --accent: #58a6ff;
+    --accent2: #bc8cff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --code-bg: #1c2128;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.6;
+}
+.container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+header {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 20px 0;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+header h1 { font-size: 1.5em; font-weight: 600; }
+header h1 span { color: var(--accent2); }
+header .subtitle { color: var(--fg2); font-size: 0.9em; margin-top: 4px; }
+nav {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 0;
+    position: sticky;
+    top: 68px;
+    z-index: 99;
+    overflow-x: auto;
+}
+nav a {
+    color: var(--fg2);
+    text-decoration: none;
+    padding: 6px 16px;
+    border-radius: 6px;
+    font-size: 0.9em;
+    white-space: nowrap;
+}
+nav a:hover, nav a.active { color: var(--fg); background: var(--border); }
+main { padding: 32px 0 64px; }
+section { margin-bottom: 48px; }
+h2 {
+    font-size: 1.6em;
+    font-weight: 600;
+    color: var(--fg);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+}
+h3 { font-size: 1.2em; color: var(--accent); margin: 24px 0 12px; }
+h4 { font-size: 1em; color: var(--accent2); margin: 16px 0 8px; }
+p { margin-bottom: 12px; }
+code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 0.88em;
+    color: var(--accent);
+}
+pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+    margin: 12px 0 20px;
+    font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 0.85em;
+    line-height: 1.5;
+}
+pre code { background: none; padding: 0; color: var(--fg); }
+.kw { color: var(--accent2); font-weight: 600; }
+.fn { color: var(--accent); }
+.str { color: var(--green); }
+.num { color: var(--orange); }
+.cmt { color: var(--fg2); font-style: italic; }
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0 20px;
+    font-size: 0.9em;
+}
+th {
+    background: var(--bg2);
+    color: var(--fg);
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+}
+td {
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    vertical-align: top;
+}
+tr:hover td { background: rgba(88, 166, 255, 0.05); }
+td code { font-size: 0.92em; }
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 16px;
+    margin: 16px 0;
+}
+.card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+}
+.card h4 { margin-top: 0; }
+.badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 0.75em;
+    font-weight: 600;
+}
+.badge-green { background: rgba(63, 185, 80, 0.2); color: var(--green); }
+.badge-blue { background: rgba(88, 166, 255, 0.2); color: var(--accent); }
+.badge-purple { background: rgba(188, 140, 255, 0.2); color: var(--accent2); }
+.badge-orange { background: rgba(210, 153, 34, 0.2); color: var(--orange); }
+.stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 12px;
+    margin: 20px 0;
+}
+.stat {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+}
+.stat .num { font-size: 2em; font-weight: 700; color: var(--accent); display: block; }
+.stat .label { color: var(--fg2); font-size: 0.85em; }
+ul { margin: 8px 0 16px 24px; }
+li { margin: 4px 0; }
+.toc { column-count: 2; column-gap: 32px; }
+.toc li { break-inside: avoid; }
+@media (max-width: 768px) {
+    .grid { grid-template-columns: 1fr; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .toc { column-count: 1; }
+}
+</style>
+</head>
+<body>
+
+<header>
+<div class="container">
+<h1>TDB <span>Documentation</span></h1>
+<div class="subtitle">SQL Database Engine v1.2.0 &mdash; Apache 2.0 License &mdash; Copyright 2026 Rick Holland</div>
+</div>
+</header>
+
+<nav>
+<div class="container">
+<a href="#overview">Overview</a>
+<a href="#quickstart">Quick Start</a>
+<a href="#types">Data Types</a>
+<a href="#ddl">DDL</a>
+<a href="#dml">DML</a>
+<a href="#functions">Functions</a>
+<a href="#window">Window</a>
+<a href="#plsql">PL/SQL</a>
+<a href="#features">Features</a>
+<a href="#cli">CLI</a>
+<a href="#scripting">Scripting</a>
+<a href="#architecture">Architecture</a>
+</div>
+</nav>
+
+<main>
+<div class="container">
+
+<!-- OVERVIEW -->
+<section id="overview">
+<h2>Overview</h2>
+<p>TDB is a full-featured SQL database engine written in C11 and C++20. It supports 53 statement types, 200+ scalar functions, PL/SQL stored procedures, Lua and JavaScript scripting with optional LLVM JIT compilation, AES-256-GCM encryption, partitioned tables, window functions, recursive CTEs, cursors, and graph queries.</p>
+
+<div class="stats">
+<div class="stat"><span class="num">200+</span><span class="label">Scalar Functions</span></div>
+<div class="stat"><span class="num">53</span><span class="label">Statement Types</span></div>
+<div class="stat"><span class="num">23</span><span class="label">Data Types</span></div>
+<div class="stat"><span class="num">15</span><span class="label">Window Functions</span></div>
+<div class="stat"><span class="num">13</span><span class="label">Aggregate Functions</span></div>
+<div class="stat"><span class="num">6</span><span class="label">Index Types</span></div>
+<div class="stat"><span class="num">37K</span><span class="label">Lines of Code</span></div>
+<div class="stat"><span class="num">11</span><span class="label">Libraries</span></div>
+</div>
+
+<div class="grid">
+<div class="card">
+<h4>Multi-Language Scripting</h4>
+<p>Lua 5.4 with optional LLVM JIT, JavaScriptCore (macOS), and PL/SQL interpreter with IF/ELSIF, FOR, WHILE loops.</p>
+</div>
+<div class="card">
+<h4>Enterprise Features</h4>
+<p>AES-256-GCM TDE, GRANT/REVOKE, partitioning (RANGE/LIST/HASH), materialized views, prepared statements, cursors.</p>
+</div>
+<div class="card">
+<h4>Advanced SQL</h4>
+<p>Window functions, recursive CTEs, GROUPING SETS/CUBE/ROLLUP, ON CONFLICT upsert, RETURNING, MERGE, graph MATCH.</p>
+</div>
+<div class="card">
+<h4>Spatial Support</h4>
+<p>40+ PostGIS-compatible functions, R-Tree and R+Tree indexes, WKT geometry, distance calculations.</p>
+</div>
+</div>
+</section>
+
+<!-- QUICK START -->
+<section id="quickstart">
+<h2>Quick Start</h2>
+<h3>Build</h3>
+<pre><code>mkdir build && cd build
+cmake .. -DTDB_BUILD_TESTS=OFF
+cmake --build . --target tdbcli --target tdb-tui -j8</code></pre>
+
+<h3>Run</h3>
+<pre><code><span class="cmt"># Interactive mode</span>
+./tdbcli
+
+<span class="cmt"># Named database (auto-saves)</span>
+./tdbcli mydb.tdb
+
+<span class="cmt"># Execute SQL file</span>
+./tdbcli -f examples/erp_sample.sql
+
+<span class="cmt"># Single statement</span>
+./tdbcli -e "<span class="kw">SELECT</span> <span class="num">1</span> + <span class="num">1</span> <span class="kw">AS</span> result"</code></pre>
+
+<h3>Optional Features</h3>
+<table>
+<tr><th>Flag</th><th>Description</th><th>Requires</th></tr>
+<tr><td><code>TDB_WITH_LLVM=ON</code></td><td>Lua LLVM JIT compiler</td><td>LLVM 18+</td></tr>
+<tr><td><code>TDB_WITH_JSC=ON</code></td><td>JavaScript engine</td><td>macOS (JavaScriptCore.framework)</td></tr>
+<tr><td><code>TDB_WITH_ZSTD=ON</code></td><td>Page compression</td><td>libzstd</td></tr>
+<tr><td><code>TDB_WITH_OPENSSL=ON</code></td><td>Hardware AES-256-GCM</td><td>OpenSSL</td></tr>
+<tr><td><code>TDB_WITH_ICU=ON</code></td><td>Unicode case folding</td><td>libicu</td></tr>
+</table>
+</section>
+
+<!-- DATA TYPES -->
+<section id="types">
+<h2>Data Types</h2>
+<div class="grid">
+<div class="card">
+<h4>Numeric</h4>
+<p><code>INTEGER</code>, <code>BIGINT</code>, <code>SMALLINT</code>, <code>TINYINT</code>, <code>FLOAT</code>, <code>DOUBLE</code>, <code>DECIMAL(p,s)</code>, <code>SERIAL</code>, <code>MONEY</code>, <code>BOOLEAN</code></p>
+</div>
+<div class="card">
+<h4>String</h4>
+<p><code>VARCHAR(n)</code>, <code>TEXT</code>, <code>CHAR(n)</code>, <code>NCHAR(n)</code>, <code>NVARCHAR(n)</code></p>
+</div>
+<div class="card">
+<h4>Date/Time</h4>
+<p><code>DATE</code>, <code>TIME</code>, <code>TIMESTAMP</code>, <code>TIMESTAMP WITH TIME ZONE</code>, <code>INTERVAL</code></p>
+</div>
+<div class="card">
+<h4>Binary</h4>
+<p><code>BLOB</code>, <code>BINARY(n)</code>, <code>VARBINARY(n)</code>, <code>BIT(n)</code></p>
+</div>
+<div class="card">
+<h4>Extended</h4>
+<p><code>UUID</code>, <code>JSON</code>, <code>JSONB</code>, <code>XML</code>, <code>GEOMETRY</code>, <code>GEOGRAPHY</code></p>
+</div>
+<div class="card">
+<h4>Collections</h4>
+<p><code>ARRAY</code>, <code>MULTISET</code>, <code>ENUM</code>, <code>COMPOSITE</code> (user-defined record types)</p>
+</div>
+</div>
+</section>
+
+<!-- DDL -->
+<section id="ddl">
+<h2>DDL Statements</h2>
+<pre><code><span class="kw">CREATE</span> [<span class="kw">TEMPORARY</span>] <span class="kw">TABLE</span> [<span class="kw">IF NOT EXISTS</span>] name (
+    col <span class="fn">INTEGER</span> <span class="kw">PRIMARY KEY</span> <span class="kw">AUTO_INCREMENT</span>,
+    name <span class="fn">VARCHAR</span>(<span class="num">100</span>) <span class="kw">NOT NULL</span>,
+    email <span class="fn">VARCHAR</span>(<span class="num">255</span>) <span class="kw">UNIQUE</span>,
+    salary <span class="fn">DECIMAL</span>(<span class="num">10</span>,<span class="num">2</span>) <span class="kw">CHECK</span> (salary > <span class="num">0</span>),
+    dept_id <span class="fn">INTEGER</span> <span class="kw">REFERENCES</span> departments(id) <span class="kw">ON DELETE CASCADE</span>,
+    created <span class="fn">TIMESTAMP</span> <span class="kw">DEFAULT</span> <span class="fn">CURRENT_TIMESTAMP</span>
+) <span class="kw">ENCRYPTED</span>
+  <span class="kw">PARTITION BY RANGE</span> (created) (
+    <span class="kw">PARTITION</span> p1 <span class="kw">VALUES LESS THAN</span> (<span class="str">'2026-01-01'</span>),
+    <span class="kw">PARTITION</span> p2 <span class="kw">VALUES LESS THAN MAXVALUE</span>
+);</code></pre>
+
+<p>All <code>CREATE</code> statements support <code>IF NOT EXISTS</code>. All <code>DROP</code> statements support <code>IF EXISTS</code> and <code>CASCADE</code>.</p>
+
+<h3>Supported DDL</h3>
+<ul class="toc">
+<li><code>CREATE/ALTER/DROP TABLE</code></li>
+<li><code>CREATE/DROP INDEX</code> (BTREE, BPTREE, HASH, RTREE, RPTREE, GIST)</li>
+<li><code>CREATE/DROP VIEW</code></li>
+<li><code>CREATE/ALTER/DROP/REFRESH MATERIALIZED VIEW</code></li>
+<li><code>CREATE/DROP SEQUENCE</code></li>
+<li><code>CREATE/DROP TYPE</code> (composite, enum, domain)</li>
+<li><code>CREATE/DROP TRIGGER</code></li>
+<li><code>CREATE/DROP PROCEDURE/FUNCTION</code></li>
+<li><code>CREATE/DROP TABLESPACE</code></li>
+<li><code>CREATE SAVED QUERY</code></li>
+<li><code>TRUNCATE TABLE</code></li>
+</ul>
+</section>
+
+<!-- DML -->
+<section id="dml">
+<h2>DML Statements</h2>
+
+<h3>SELECT</h3>
+<pre><code>[<span class="kw">WITH</span> [<span class="kw">RECURSIVE</span>] cte <span class="kw">AS</span> (<span class="kw">SELECT</span> ...)]
+<span class="kw">SELECT</span> [<span class="kw">DISTINCT</span>] expr [<span class="kw">AS</span> alias], ...
+<span class="kw">FROM</span> table [<span class="kw">INNER</span>|<span class="kw">LEFT</span>|<span class="kw">RIGHT JOIN</span> table <span class="kw">ON</span> cond]
+[<span class="kw">WHERE</span> condition]
+[<span class="kw">GROUP BY</span> expr | <span class="kw">GROUPING SETS</span>(...) | <span class="kw">CUBE</span>(...) | <span class="kw">ROLLUP</span>(...)]
+[<span class="kw">HAVING</span> condition]
+[<span class="kw">ORDER BY</span> expr [<span class="kw">ASC</span>|<span class="kw">DESC</span>] [<span class="kw">NULLS FIRST</span>|<span class="kw">LAST</span>]]
+[<span class="kw">LIMIT</span> n] [<span class="kw">OFFSET</span> n]</code></pre>
+
+<h3>INSERT with Upsert</h3>
+<pre><code><span class="kw">INSERT INTO</span> users (name, email) <span class="kw">VALUES</span> (<span class="str">'Alice'</span>, <span class="str">'a@b.com'</span>)
+<span class="kw">ON CONFLICT DO UPDATE SET</span> name = <span class="str">'Alice Updated'</span>
+<span class="kw">RETURNING</span> id, name;</code></pre>
+
+<h3>UPDATE / DELETE with RETURNING</h3>
+<pre><code><span class="kw">UPDATE</span> users <span class="kw">SET</span> active = <span class="num">FALSE</span> <span class="kw">WHERE</span> last_login < <span class="str">'2025-01-01'</span> <span class="kw">RETURNING</span> id, name;
+<span class="kw">DELETE FROM</span> sessions <span class="kw">WHERE</span> expired = <span class="num">TRUE</span> <span class="kw">RETURNING</span> user_id;</code></pre>
+
+<h3>MERGE</h3>
+<pre><code><span class="kw">MERGE INTO</span> target <span class="kw">USING</span> source <span class="kw">ON</span> target.id = source.id
+<span class="kw">WHEN MATCHED THEN UPDATE SET</span> val = source.val
+<span class="kw">WHEN NOT MATCHED THEN INSERT</span> (id, val) <span class="kw">VALUES</span> (source.id, source.val);</code></pre>
+</section>
+
+<!-- FUNCTIONS -->
+<section id="functions">
+<h2>Scalar Functions <span class="badge badge-blue">200+</span></h2>
+
+<h3>String Functions</h3>
+<table>
+<tr><th>Function</th><th>Example</th><th>Result</th></tr>
+<tr><td><code>UPPER(s)</code></td><td><code>UPPER('hello')</code></td><td><code>HELLO</code></td></tr>
+<tr><td><code>LOWER(s)</code></td><td><code>LOWER('HELLO')</code></td><td><code>hello</code></td></tr>
+<tr><td><code>LENGTH(s)</code></td><td><code>LENGTH('hello')</code></td><td><code>5</code></td></tr>
+<tr><td><code>SUBSTRING(s,start,len)</code></td><td><code>SUBSTRING('hello',2,3)</code></td><td><code>ell</code></td></tr>
+<tr><td><code>REPLACE(s,old,new)</code></td><td><code>REPLACE('foo','oo','ee')</code></td><td><code>fee</code></td></tr>
+<tr><td><code>LEFT(s,n)</code> / <code>RIGHT(s,n)</code></td><td><code>LEFT('hello',3)</code></td><td><code>hel</code></td></tr>
+<tr><td><code>REVERSE(s)</code></td><td><code>REVERSE('abc')</code></td><td><code>cba</code></td></tr>
+<tr><td><code>LPAD(s,len,pad)</code></td><td><code>LPAD('42',5,'0')</code></td><td><code>00042</code></td></tr>
+</table>
+
+<h3>Math Functions</h3>
+<table>
+<tr><th>Function</th><th>Example</th><th>Result</th></tr>
+<tr><td><code>ABS(n)</code></td><td><code>ABS(-5)</code></td><td><code>5</code></td></tr>
+<tr><td><code>ROUND(n,d)</code></td><td><code>ROUND(3.14159,2)</code></td><td><code>3.14</code></td></tr>
+<tr><td><code>POWER(b,e)</code></td><td><code>POWER(2,10)</code></td><td><code>1024</code></td></tr>
+<tr><td><code>SQRT(n)</code></td><td><code>SQRT(144)</code></td><td><code>12</code></td></tr>
+<tr><td><code>FACTORIAL(n)</code></td><td><code>FACTORIAL(5)</code></td><td><code>120</code></td></tr>
+<tr><td><code>GCD(a,b)</code></td><td><code>GCD(48,18)</code></td><td><code>6</code></td></tr>
+<tr><td><code>PI()</code></td><td><code>PI()</code></td><td><code>3.14159</code></td></tr>
+</table>
+
+<h3>Cryptographic</h3>
+<table>
+<tr><th>Function</th><th>Description</th></tr>
+<tr><td><code>SHA256(s)</code></td><td>SHA-256 hash</td></tr>
+<tr><td><code>MD5(s)</code></td><td>MD5 hash</td></tr>
+<tr><td><code>GEN_RANDOM_UUID()</code></td><td>Random UUID</td></tr>
+<tr><td><code>HMAC_SHA256(key,msg)</code></td><td>HMAC</td></tr>
+</table>
+
+<h3>Date/Time</h3>
+<table>
+<tr><th>Function</th><th>Description</th></tr>
+<tr><td><code>NOW()</code></td><td>Current timestamp</td></tr>
+<tr><td><code>YEAR(d)</code> / <code>MONTH(d)</code> / <code>DAY(d)</code></td><td>Extract date component</td></tr>
+<tr><td><code>DATEDIFF(unit,start,end)</code></td><td>Date difference</td></tr>
+<tr><td><code>DATEADD(unit,n,date)</code></td><td>Add to date</td></tr>
+</table>
+
+<h3>Aggregates <span class="badge badge-green">13</span></h3>
+<p><code>COUNT</code>, <code>SUM</code>, <code>AVG</code>, <code>MIN</code>, <code>MAX</code>, <code>STDDEV</code>, <code>STDDEV_SAMP</code>, <code>VARIANCE</code>, <code>VAR_SAMP</code>, <code>STRING_AGG</code>, <code>MEDIAN</code>, <code>GROUPING</code></p>
+</section>
+
+<!-- WINDOW FUNCTIONS -->
+<section id="window">
+<h2>Window Functions <span class="badge badge-purple">15</span></h2>
+<pre><code><span class="kw">SELECT</span> name, dept, salary,
+    <span class="fn">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">ORDER BY</span> salary <span class="kw">DESC</span>) <span class="kw">AS</span> rn,
+    <span class="fn">RANK</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION BY</span> dept <span class="kw">ORDER BY</span> salary <span class="kw">DESC</span>) <span class="kw">AS</span> dept_rank,
+    <span class="fn">LAG</span>(salary) <span class="kw">OVER</span> (<span class="kw">ORDER BY</span> salary) <span class="kw">AS</span> prev_sal,
+    <span class="fn">SUM</span>(salary) <span class="kw">OVER</span> (<span class="kw">ORDER BY</span> salary <span class="kw">ROWS UNBOUNDED PRECEDING</span>) <span class="kw">AS</span> running
+<span class="kw">FROM</span> employees;</code></pre>
+<p>Ranking: <code>ROW_NUMBER</code>, <code>RANK</code>, <code>DENSE_RANK</code>, <code>NTILE</code>, <code>PERCENT_RANK</code>, <code>CUME_DIST</code></p>
+<p>Value: <code>LAG</code>, <code>LEAD</code>, <code>FIRST_VALUE</code>, <code>LAST_VALUE</code>, <code>NTH_VALUE</code></p>
+<p>Aggregate: <code>SUM</code>, <code>COUNT</code>, <code>AVG</code>, <code>MIN</code>, <code>MAX</code> as running/sliding window aggregates</p>
+</section>
+
+<!-- PL/SQL -->
+<section id="plsql">
+<h2>PL/SQL</h2>
+<pre><code><span class="kw">CREATE PROCEDURE</span> <span class="fn">factorial</span>(n <span class="fn">INT</span>) <span class="kw">AS</span>
+    <span class="str">'DECLARE result INT := 1;
+     DECLARE i INT := 1;
+     WHILE i <= n LOOP
+         result := result * i;
+         i := i + 1;
+     END LOOP;
+     RETURN result'</span>;
+
+<span class="kw">CALL</span> <span class="fn">factorial</span>(<span class="num">5</span>);  <span class="cmt">-- Returns 120</span></code></pre>
+
+<h3>Control Flow</h3>
+<ul>
+<li><code>DECLARE var type := value</code> -- variable declaration</li>
+<li><code>var := expr</code> -- variable assignment</li>
+<li><code>IF cond THEN ... ELSIF cond THEN ... ELSE ... END IF</code></li>
+<li><code>FOR var IN start..end LOOP ... END LOOP</code></li>
+<li><code>WHILE cond LOOP ... END LOOP</code></li>
+<li><code>RETURN expr</code></li>
+<li><code>RAISE EXCEPTION 'msg'</code></li>
+</ul>
+
+<h3>Triggers</h3>
+<pre><code><span class="kw">CREATE TRIGGER</span> audit_insert
+    <span class="kw">AFTER INSERT ON</span> orders
+    <span class="kw">LANGUAGE</span> lua
+    <span class="kw">AS</span> <span class="str">'db.execute("INSERT INTO log VALUES (''new order'')")'</span>;</code></pre>
+</section>
+
+<!-- FEATURES -->
+<section id="features">
+<h2>Features</h2>
+<div class="grid">
+<div class="card">
+<h4>Partitioning</h4>
+<p><span class="badge badge-green">RANGE</span> <span class="badge badge-blue">LIST</span> <span class="badge badge-purple">HASH</span></p>
+<p>Automatic partition pruning on WHERE clauses. ALTER TABLE ADD/DROP PARTITION.</p>
+</div>
+<div class="card">
+<h4>Encryption</h4>
+<p>AES-256-GCM transparent data encryption at table and column level. Built-in crypto functions.</p>
+</div>
+<div class="card">
+<h4>Recursive CTEs</h4>
+<pre><code><span class="kw">WITH RECURSIVE</span> nums <span class="kw">AS</span> (
+  <span class="kw">SELECT</span> <span class="num">1</span> <span class="kw">AS</span> n
+  <span class="kw">UNION ALL</span>
+  <span class="kw">SELECT</span> n+<span class="num">1</span> <span class="kw">FROM</span> nums
+  <span class="kw">WHERE</span> n < <span class="num">10</span>
+) <span class="kw">SELECT</span> * <span class="kw">FROM</span> nums;</code></pre>
+</div>
+<div class="card">
+<h4>Graph Queries</h4>
+<pre><code><span class="kw">MATCH</span> (a:follows)
+  -[e:to_id]->(b:people)
+<span class="kw">RETURN</span> a.from_id, b.name;</code></pre>
+</div>
+<div class="card">
+<h4>Columnar Storage</h4>
+<pre><code><span class="kw">CREATE TABLE</span> metrics (
+  ts <span class="fn">DATE</span>, val <span class="fn">INT</span>
+) <span class="kw">COLUMNAR</span>;</code></pre>
+</div>
+<div class="card">
+<h4>Transactions</h4>
+<p><code>BEGIN</code>, <code>COMMIT</code>, <code>ROLLBACK</code>, <code>SAVEPOINT</code>, <code>RELEASE SAVEPOINT</code>. Isolation levels parsed.</p>
+</div>
+</div>
+</section>
+
+<!-- CLI -->
+<section id="cli">
+<h2>CLI Tools</h2>
+<h3>tdbcli</h3>
+<p>Simple readline-based SQL shell with CSV import/export, SQL dump, and PL/SQL block-aware file processing.</p>
+<h3>tdb-tui</h3>
+<p>Rich terminal UI with syntax highlighting, tab completion, command history, Lua REPL, status bar, and dark/light themes.</p>
+<table>
+<tr><th>Command</th><th>Description</th></tr>
+<tr><td><code>\dt</code> / <code>\dv</code> / <code>\di</code> / <code>\ds</code></td><td>List tables / views / indexes / sequences</td></tr>
+<tr><td><code>\d table</code></td><td>Describe table columns</td></tr>
+<tr><td><code>\import file table</code></td><td>Import CSV</td></tr>
+<tr><td><code>\export table file</code></td><td>Export CSV</td></tr>
+<tr><td><code>\timing</code></td><td>Toggle query timing</td></tr>
+<tr><td><code>\lua</code> / <code>\sql</code></td><td>Switch to Lua REPL / SQL mode</td></tr>
+<tr><td><code>\theme dark|light</code></td><td>Switch color theme</td></tr>
+</table>
+</section>
+
+<!-- SCRIPTING -->
+<section id="scripting">
+<h2>Scripting Engines</h2>
+<div class="grid">
+<div class="card">
+<h4>Lua 5.4 <span class="badge badge-green">Built-in</span></h4>
+<p>Embedded interpreter with <code>db.execute()</code>, <code>db.query()</code>, <code>db.now()</code>, <code>db.user()</code>, <code>db.log()</code>.</p>
+<p>Optional LLVM JIT: compiles Lua bytecode to native ARM64/x86_64 via ORC LLJIT. Tiered execution with auto-JIT after 3 calls.</p>
+</div>
+<div class="card">
+<h4>JavaScript <span class="badge badge-orange">macOS</span></h4>
+<p>JavaScriptCore with built-in FTL JIT. Full <code>db.*</code> API plus <code>db.tables()</code>, <code>db.views()</code>, <code>db.describe()</code>, <code>db.catalog</code>.</p>
+</div>
+<div class="card">
+<h4>PL/SQL <span class="badge badge-purple">Built-in</span></h4>
+<p>Procedural SQL interpreter with DECLARE, IF/ELSIF/ELSE, FOR, WHILE, RETURN, RAISE. Variable substitution with SQL-safe quoting.</p>
+</div>
+</div>
+</section>
+
+<!-- ARCHITECTURE -->
+<section id="architecture">
+<h2>Architecture</h2>
+<pre><code>tdb (top-level facade)
+ +-- tdb_sql       (lexer, parser, AST, optimizer, executor, type coercion)
+ +-- tdb_catalog   (tables, views, matviews, sequences, indexes, partitions)
+ +-- tdb_doc       (XPath/XQuery/GraphQL on JSON/XML columns)
+ +-- tdb_script    (Lua 5.4, optional LLVM JIT, optional JavaScriptCore)
+ |    +-- tdb_lua  (vendored Lua 5.4.7)
+ |    +-- tdb_jit  (optional: Lua bytecode -> LLVM IR -> native)
+ |    +-- tdb_jsc  (optional: JavaScriptCore via jsengine.mm)
+ +-- tdb_persistence (C storage <-> C++ Database bridge)
+ +-- tdb_core      (C: page, storage, buffer, WAL, txn, crypto)
+ +-- tdb_index     (C: B+Tree, B-Tree, R-Tree, R+Tree, Hash)</code></pre>
+<p>Key files: <code>database.h</code> (6600 lines, main executor), <code>parser.cpp</code> (3800 lines), <code>ast.h</code> (870 lines, 53 statement types), <code>catalog.h</code> (schema metadata), <code>executor.h</code> (Value type system with 22 types).</p>
+</section>
+
+</div>
+</main>
+
+<footer style="background:var(--bg2);border-top:1px solid var(--border);padding:20px 0;text-align:center;color:var(--fg2);font-size:0.85em;">
+<div class="container">
+TDB v1.2.0 &mdash; Apache 2.0 License &mdash; Copyright 2026 Rick Holland
+</div>
+</footer>
+
+</body>
+</html>

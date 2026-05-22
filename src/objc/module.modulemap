@@ -1,0 +1,19 @@
+// Framework module map for Swift. With this in place Swift can:
+//   import TDB
+// and see the full Objective-C surface, with NS_REFINED_FOR_SWIFT and
+// NS_SWIFT_NAME annotations driving the bridged names.
+framework module TDB {
+    umbrella header "TDB.h"
+
+    export *
+    module * { export * }
+
+    link "tdb"
+    link "tdb_sql"
+    link "tdb_catalog"
+    link "tdb_doc"
+    link "tdb_script"
+    link "tdb_persistence"
+    link "tdb_core"
+    link "tdb_index"
+}

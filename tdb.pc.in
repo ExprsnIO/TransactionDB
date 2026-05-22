@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: tdb
+Description: TDB SQL Database Engine
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -ltdb -ltdb_sql -ltdb_catalog -ltdb_doc -ltdb_persistence -ltdb_core -ltdb_index -lm
+Cflags: -I${includedir}

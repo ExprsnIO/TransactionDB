@@ -43,6 +43,7 @@ struct tdb_scan {
   uint8_t      desc[34];
   tdb_keyrange range;
   int          has_range;
+  tdb_txnid    as_of;      /* FOR SYSTEM_TIME AS OF version (0 = snapshot) */
 };
 
 /* --------------------------- row header codec ------------------------- */
@@ -168,7 +169,7 @@ static int eng_create_index(tdb_storage *s, tdb_txn *txn, tdb_table *t,
   if (rc) return rc;
   /* Populate from currently-visible rows. */
   tdb_scan *sc;
-  rc = s->vtab->scan_open(s, txn, t, NULL, NULL, &sc);
+  rc = s->vtab->scan_open(s, txn, t, NULL, NULL, 0, &sc);
   if (rc) return rc;
   tdb_rowid rid; const uint8_t *rec; int reclen;
   while ((rc = s->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {
@@ -300,7 +301,7 @@ static int eng_remove(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_rowid rowi
 /* Resolve the version of `rowid` visible to txn into `out`. */
 static int resolve_visible(row_engine *e, tdb_txn *txn, tdb_btree *bt,
                            tdb_btree *hist, const uint8_t *mainval, int mainlen,
-                           tdb_buf *work, tdb_buf *out, int *found) {
+                           tdb_buf *work, tdb_buf *out, int *found, tdb_txnid as_of) {
   TDB_UNUSED(bt);
   *found = 0;
   tdb_buf_reset(work);
@@ -309,7 +310,9 @@ static int resolve_visible(row_engine *e, tdb_txn *txn, tdb_btree *bt,
   for (;;) {
     tdb_txnid xmin, xmax; uint64_t prev; int rl;
     const uint8_t *rec = get_rowhdr(work->data, (int)work->len, &xmin, &xmax, &prev, &rl);
-    if (tdb_txn_visible(txn, xmin, xmax)) {
+    int vis = as_of ? tdb_txn_visible_asof(txn, xmin, xmax, as_of)
+                    : tdb_txn_visible(txn, xmin, xmax);
+    if (vis) {
       tdb_buf_reset(out);
       rc = tdb_buf_append(out, rec, (size_t)rl);
       if (rc) return rc;
@@ -352,7 +355,7 @@ static int eng_seek_rowid(tdb_storage *s, tdb_txn *txn, tdb_table *t,
   if (!rc && f) {
     tdb_buf work; tdb_buf_init(&work);
     rc = resolve_visible(e, txn, bt, hist, mainv.data, (int)mainv.len, &work,
-                         &e->scratch, found);
+                         &e->scratch, found, 0);
     tdb_buf_free(&work);
     if (!rc && *found) { *rec = e->scratch.data; *reclen = (int)e->scratch.len; }
   }
@@ -364,11 +367,11 @@ static int eng_seek_rowid(tdb_storage *s, tdb_txn *txn, tdb_table *t,
 
 static int eng_scan_open(tdb_storage *s, tdb_txn *txn, tdb_table *t,
                          tdb_index *use_idx, const tdb_keyrange *range,
-                         tdb_scan **out) {
+                         tdb_txnid as_of, tdb_scan **out) {
   row_engine *e = (row_engine *)s->impl;
   tdb_scan *sc = (tdb_scan *)tdb_calloc(sizeof(*sc));
   if (!sc) return TDB_NOMEM;
-  sc->s = s; sc->txn = txn; sc->t = t;
+  sc->s = s; sc->txn = txn; sc->t = t; sc->as_of = as_of;
   tdb_buf_init(&sc->rec); tdb_buf_init(&sc->work);
   int rc = tdb_btree_open(e->pager, t->root, TDB_BT_TABLE, NULL, &sc->tbl);
   if (!rc) rc = tdb_btree_open(e->pager, t->history_root, TDB_BT_TABLE, NULL, &sc->hist);
@@ -430,7 +433,7 @@ static int scan_next_index(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec,
     if (!rc && f) {
       int found = 0;
       rc = resolve_visible(e, sc->txn, sc->tbl, sc->hist, mainv.data, (int)mainv.len,
-                           &sc->work, &sc->rec, &found);
+                           &sc->work, &sc->rec, &found, sc->as_of);
       if (!rc && found) {
         tdb_buf_free(&mainv);
         *rowid = rid; *rec = sc->rec.data; *reclen = (int)sc->rec.len;
@@ -453,7 +456,7 @@ static int eng_scan_next(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec,
     if (rc) return rc;
     tdb_rowid rid; tdb_cursor_rowid(sc->cur, &rid);
     int found = 0;
-    rc = resolve_visible(e, sc->txn, sc->tbl, sc->hist, v, n, &sc->work, &sc->rec, &found);
+    rc = resolve_visible(e, sc->txn, sc->tbl, sc->hist, v, n, &sc->work, &sc->rec, &found, sc->as_of);
     if (rc) return rc;
     tdb_cursor_next(sc->cur);
     if (found) {

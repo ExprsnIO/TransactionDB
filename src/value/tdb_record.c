@@ -70,8 +70,8 @@ int tdb_record_encode(const tdb_value *vals, int n, tdb_buf *out) {
       case TDB_VAL_NULL: st[i] = 0; bl[i] = 0; break;
       case TDB_VAL_INT:  st[i] = int_serial_type(v->u.i, &bl[i]); break;
       case TDB_VAL_REAL: st[i] = 7; bl[i] = 8; break;
-      case TDB_VAL_TEXT: bl[i] = v->u.s.n; st[i] = 13 + 2ull * (uint64_t)v->u.s.n; break;
-      case TDB_VAL_BLOB: bl[i] = v->u.s.n; st[i] = 12 + 2ull * (uint64_t)v->u.s.n; break;
+      case TDB_VAL_TEXT: bl[i] = v->u.s.n; st[i] = (uint64_t)13 + (uint64_t)2 * (uint64_t)(unsigned)v->u.s.n; break;
+      case TDB_VAL_BLOB: bl[i] = v->u.s.n; st[i] = (uint64_t)12 + (uint64_t)2 * (uint64_t)(unsigned)v->u.s.n; break;
       default: st[i] = 0; bl[i] = 0; break;
     }
   }

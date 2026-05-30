@@ -43,6 +43,9 @@ target_include_directories(transactiondb
           "${CMAKE_SOURCE_DIR}/src/lua"
           "${CMAKE_SOURCE_DIR}/src/api")
 target_link_libraries(transactiondb PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+if(NOT WIN32)
+  target_link_libraries(transactiondb PUBLIC m)
+endif()
 tdb_set_warnings(transactiondb)
 
 if(TDB_BUILD_LUA)
@@ -57,7 +60,16 @@ endif()
 if(TDB_BUILD_CLI)
   add_executable(tdb_shell cli/shell.c)
   target_link_libraries(tdb_shell PRIVATE transactiondb)
-  target_include_directories(tdb_shell PRIVATE "${CMAKE_SOURCE_DIR}/include")
+  target_include_directories(tdb_shell PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/common"
+    "${CMAKE_SOURCE_DIR}/src/api"
+    "${CMAKE_SOURCE_DIR}/src/catalog"
+    "${CMAKE_SOURCE_DIR}/src/value"
+    "${CMAKE_SOURCE_DIR}/src/storage"
+    "${CMAKE_SOURCE_DIR}/src/txn"
+    "${CMAKE_SOURCE_DIR}/src/sql")
   tdb_set_warnings(tdb_shell)
 endif()
 
@@ -66,7 +78,8 @@ endif()
 # ---------------------------------------------------------------------------
 if(TDB_BUILD_TESTS)
   enable_testing()
-  set(TDB_TESTS util value_record)
+  set(TDB_TESTS util value_record wal pager sqltype schema btree
+                mvcc lock engine catalog lexer parser exec)
   foreach(t ${TDB_TESTS})
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_${t}.c")
       add_executable(test_${t} "tests/test_${t}.c")
@@ -84,4 +97,20 @@ if(TDB_BUILD_TESTS)
       add_test(NAME ${t} COMMAND test_${t})
     endif()
   endforeach()
+
+  # C++ wrapper test
+  add_executable(test_cpp tests/test_cpp.cpp)
+  target_link_libraries(test_cpp PRIVATE transactiondb)
+  target_include_directories(test_cpp PRIVATE
+    "${CMAKE_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/tests")
+  add_test(NAME cpp COMMAND test_cpp)
+
+  # Lua integration test (only when Lua is built in)
+  if(TDB_BUILD_LUA)
+    add_executable(test_lua tests/test_lua.c)
+    target_link_libraries(test_lua PRIVATE transactiondb)
+    target_include_directories(test_lua PRIVATE
+      "${CMAKE_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/tests")
+    add_test(NAME lua COMMAND test_lua)
+  endif()
 endif()

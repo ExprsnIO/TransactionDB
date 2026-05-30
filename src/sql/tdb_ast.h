@@ -113,6 +113,7 @@ typedef struct tdb_create_table {
   char      **pk_cols;  int npk;    /* table-level PRIMARY KEY (...) */
   char       *check_sql;            /* table-level CHECK */
   int         system_versioning;
+  int         columnar;             /* WITH COLUMNAR */
   char       *period_start;         /* PERIOD FOR SYSTEM_TIME (start,end) */
   char       *period_end;
 } tdb_create_table;

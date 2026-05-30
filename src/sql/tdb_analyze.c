@@ -40,6 +40,7 @@ tdb_table *tdb_ast_to_table(const tdb_create_table *ct, char **err) {
   }
 
   if (ct->check_sql) t->check_sql = tdb_strdup(ct->check_sql);
+  t->columnar = ct->columnar;
 
   /* system-versioned temporal table: add hidden period bound columns */
   if (ct->system_versioning) {

@@ -69,6 +69,11 @@ struct tdb_storage {
 
 /* Row-oriented engine over the b-tree. */
 int  tdb_engine_row_open(tdb_pager *p, tdb_storage **out);
+/* Columnar (DSM) engine: meta b-tree + one value b-tree per column. */
+int  tdb_engine_columnar_open(tdb_pager *p, tdb_storage **out);
+/* Dispatcher: routes each table to the row or columnar engine by t->columnar.
+** This is what a database connection uses. */
+int  tdb_engine_open(tdb_pager *p, tdb_storage **out);
 
 /* Thin dispatch helpers. */
 static inline void tdb_storage_close(tdb_storage *s) { if (s) s->vtab->close(s); }

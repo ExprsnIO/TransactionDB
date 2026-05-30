@@ -581,10 +581,20 @@ static tdb_ast_stmt *parse_create_table(P *p) {
   } while (accept(p, TK_COMMA) && !p->err);
 
   expect(p, TK_RP, "expected )");
-  if (accept(p, TK_WITH)) {
-    expect(p, TK_SYSTEM, "expected SYSTEM");
-    expect(p, TK_VERSIONING, "expected VERSIONING");
-    ct->system_versioning = 1;
+  /* table options: WITH SYSTEM VERSIONING and/or WITH COLUMNAR */
+  while (accept(p, TK_WITH)) {
+    if (p->cur.kind == TK_SYSTEM) {
+      advance(p);
+      expect(p, TK_VERSIONING, "expected VERSIONING");
+      ct->system_versioning = 1;
+    } else if (p->cur.kind == TK_ID && p->cur.n == 8 &&
+               strncasecmp(p->cur.z, "COLUMNAR", 8) == 0) {
+      advance(p);
+      ct->columnar = 1;
+    } else {
+      set_err(p, "expected SYSTEM VERSIONING or COLUMNAR");
+      break;
+    }
   }
   return s;
 }

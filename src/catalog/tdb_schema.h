@@ -106,6 +106,13 @@ typedef struct tdb_table {
   int             row_end_col;    /* hidden valid-to column index, or -1   */
   tdb_pgno        history_root;   /* B-tree root for superseded row versions */
 
+  /* storage engine: 0 = row-oriented, 1 = columnar (DSM). For columnar tables
+  ** `root` is the per-rowid MVCC meta b-tree and col_roots[i] is column i's
+  ** value b-tree. */
+  int             columnar;
+  tdb_pgno       *col_roots;
+  int             ncol_roots;
+
   /* table-level Lua hooks (source text), invoked by the executor */
   char *before_insert_lua;
   char *before_update_lua;

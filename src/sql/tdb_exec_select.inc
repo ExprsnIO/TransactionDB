@@ -199,7 +199,11 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
   return TDB_OK;
 }
 
+static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q);
+
 static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
+  if (q->setop) return exec_setop_chain(db, st, q);
+
   qctx Q; memset(&Q, 0, sizeof(Q));
   rowset sets[MAXSRC];
 
@@ -426,4 +430,136 @@ static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   #undef ADD_RESROW
   #undef FAILP
   #undef FAIL_SETS
+}
+
+/* ------------------------- set operations ----------------------------- */
+
+static int row_equal(tdb_value *a, tdb_value *b, int ncol) {
+  for (int i = 0; i < ncol; i++)
+    if (tdb_value_compare(&a[i], &b[i], TDB_COLL_BINARY) != 0) return 0;
+  return 1;
+}
+static int in_rows(tdb_value **rows, int n, tdb_value *row, int ncol) {
+  for (int i = 0; i < n; i++) if (row_equal(rows[i], row, ncol)) return 1;
+  return 0;
+}
+static tdb_value *dup_row(tdb_value *r, int ncol) {
+  tdb_value *o = row_alloc(ncol);
+  for (int i = 0; i < ncol; i++) tdb_value_copy(&o[i], &r[i]);
+  return o;
+}
+
+/* run one SELECT node ignoring its set-op chain, into `tmp` */
+static int run_single(tdb_db *db, tdb_stmt *parent, tdb_select *sel, tdb_stmt *tmp) {
+  int sop = sel->setop; tdb_select *nx = sel->setop_next;
+  sel->setop = 0; sel->setop_next = NULL;
+  int rc = run_subselect(db, parent, sel, tmp);
+  sel->setop = sop; sel->setop_next = nx;
+  return rc;
+}
+
+typedef struct { tdb_value **rows; int n, cap; } accset;
+static void acc_add(accset *a, tdb_value *row) {
+  if (a->n == a->cap) { a->cap = a->cap ? a->cap * 2 : 16;
+    a->rows = (tdb_value **)tdb_realloc(a->rows, sizeof(void *) * (size_t)a->cap); }
+  a->rows[a->n++] = row;
+}
+
+/* sort the combined result by a trailing ORDER BY whose terms reference output
+** columns by name or 1-based ordinal */
+static void sort_result(tdb_value **rows, int n, int ncol, char **names,
+                        tdb_orderby *ob) {
+  int nk = ob->n;
+  tdb_value **keys = (tdb_value **)tdb_malloc(sizeof(void *) * (size_t)n);
+  for (int r = 0; r < n; r++) {
+    keys[r] = row_alloc(nk);
+    for (int k = 0; k < nk; k++) {
+      tdb_expr *e = ob->exprs[k];
+      int ci = -1;
+      if (e->kind == EX_LITERAL && e->lit.type == TDB_VAL_INT) ci = (int)e->lit.u.i - 1;
+      else if (e->kind == EX_COLUMN && e->name)
+        for (int c = 0; c < ncol; c++) if (names[c] && !strcasecmp(names[c], e->name)) { ci = c; break; }
+      if (ci >= 0 && ci < ncol) tdb_value_copy(&keys[r][k], &rows[r][ci]);
+    }
+  }
+  int *idx = (int *)tdb_malloc(sizeof(int) * (size_t)n);
+  for (int i = 0; i < n; i++) idx[i] = i;
+  sortinfo si; si.keys = keys; si.desc = ob->desc; si.nkey = nk; si.nrows = n;
+  g_sort = &si; qsort(idx, (size_t)n, sizeof(int), sort_cmp); g_sort = NULL;
+  tdb_value **tmp = (tdb_value **)tdb_malloc(sizeof(void *) * (size_t)n);
+  for (int i = 0; i < n; i++) tmp[i] = rows[idx[i]];
+  for (int i = 0; i < n; i++) rows[i] = tmp[i];
+  for (int i = 0; i < n; i++) free_row(keys[i], nk);
+  tdb_mfree(keys); tdb_mfree(idx); tdb_mfree(tmp);
+}
+
+static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q) {
+  /* the trailing ORDER BY/LIMIT (parsed onto the last SELECT) binds to the
+  ** whole result: strip it, combine operands, then apply it */
+  tdb_select *last = q;
+  while (last->setop_next) last = last->setop_next;
+  tdb_orderby *o = last->order; int hl = last->has_limit;
+  tdb_expr *lim = last->limit, *off = last->offset;
+  last->order = NULL; last->has_limit = 0; last->limit = NULL; last->offset = NULL;
+
+  accset acc; memset(&acc, 0, sizeof(acc));
+  char **names = NULL; int ncol = 0; int rc;
+
+  tdb_stmt t0;
+  rc = run_single(db, st, q, &t0);
+  if (rc) { tdb_stmt_clear_results(&t0); goto restore; }
+  ncol = t0.ncol;
+  names = (char **)tdb_calloc(sizeof(char *) * (size_t)(ncol ? ncol : 1));
+  for (int i = 0; i < ncol; i++) names[i] = tdb_strdup(t0.colnames[i] ? t0.colnames[i] : "col");
+  for (int r = 0; r < t0.nrows; r++) acc_add(&acc, dup_row(t0.rows[r], ncol));
+  tdb_stmt_clear_results(&t0);
+
+  for (tdb_select *node = q; node->setop; node = node->setop_next) {
+    tdb_stmt tb;
+    rc = run_single(db, st, node->setop_next, &tb);
+    if (rc) { tdb_stmt_clear_results(&tb); goto done; }
+    int op = node->setop, all = node->setop_all;
+
+    accset out; memset(&out, 0, sizeof(out));
+    if (op == TK_UNION) {
+      for (int i = 0; i < acc.n; i++)
+        if (all || !in_rows(out.rows, out.n, acc.rows[i], ncol)) acc_add(&out, dup_row(acc.rows[i], ncol));
+      for (int r = 0; r < tb.nrows; r++)
+        if (all || !in_rows(out.rows, out.n, tb.rows[r], ncol)) acc_add(&out, dup_row(tb.rows[r], ncol));
+    } else if (op == TK_INTERSECT) {
+      for (int i = 0; i < acc.n; i++)
+        if (in_rows(tb.rows, tb.nrows, acc.rows[i], ncol) &&
+            !in_rows(out.rows, out.n, acc.rows[i], ncol)) acc_add(&out, dup_row(acc.rows[i], ncol));
+    } else { /* EXCEPT */
+      for (int i = 0; i < acc.n; i++)
+        if (!in_rows(tb.rows, tb.nrows, acc.rows[i], ncol) &&
+            !in_rows(out.rows, out.n, acc.rows[i], ncol)) acc_add(&out, dup_row(acc.rows[i], ncol));
+    }
+    for (int i = 0; i < acc.n; i++) free_row(acc.rows[i], ncol);
+    tdb_mfree(acc.rows);
+    acc = out;
+    tdb_stmt_clear_results(&tb);
+  }
+
+  if (o) sort_result(acc.rows, acc.n, ncol, names, o);
+  int limit = hl ? const_int(db, st, lim, -1) : -1;
+  int offset = off ? const_int(db, st, off, 0) : 0;
+  if (offset < 0) offset = 0;
+  st->ncol = ncol; st->colnames = names; names = NULL;
+  for (int i = 0; i < acc.n; i++) {
+    if (i < offset || (limit >= 0 && st->nrows >= limit)) { free_row(acc.rows[i], ncol); continue; }
+    add_result_row(st, acc.rows[i]);
+  }
+  tdb_mfree(acc.rows);
+  st->cur = -1;
+  rc = TDB_OK;
+  goto restore;
+
+done:
+  for (int i = 0; i < acc.n; i++) free_row(acc.rows[i], ncol);
+  tdb_mfree(acc.rows);
+restore:
+  if (names) { for (int i = 0; i < ncol; i++) tdb_mfree(names[i]); tdb_mfree(names); }
+  last->order = o; last->has_limit = hl; last->limit = lim; last->offset = off;
+  return rc;
 }

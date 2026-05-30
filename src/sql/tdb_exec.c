@@ -19,6 +19,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <ctype.h>
 #include <math.h>
 
@@ -657,6 +658,70 @@ static int run_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
 
 #include "tdb_exec_dml.inc"
 
+/* ------------------------------- EXPLAIN ------------------------------ */
+
+static void explain_line(tdb_stmt *st, const char *text) {
+  tdb_value *row = row_alloc(1);
+  tdb_value_set_text(&row[0], text, -1, 1);
+  add_result_row(st, row);
+}
+
+static void explain_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
+  char line[256];
+  if (q->setop) {
+    const char *op = q->setop == TK_UNION ? "UNION" : q->setop == TK_EXCEPT ? "EXCEPT" : "INTERSECT";
+    snprintf(line, sizeof(line), "COMPOUND %s%s", op, q->setop_all ? " ALL" : "");
+    explain_line(st, line);
+  }
+  for (tdb_src *s = q->from; s; s = s->next) {
+    if (s->subquery) { explain_line(st, "SCAN SUBQUERY"); explain_select(db, st, s->subquery); continue; }
+    tdb_table *t = tdb_catalog_find_table(db->cat, s->table);
+    const char *colmark = (t && t->columnar) ? " (columnar)" : "";
+    tdb_index *idx = NULL; tdb_keyrange kr; int chosen = 0;
+    if (t && !q->from->next && t->nindex > 0) {
+      tdb_value_init(&kr.lo); tdb_value_init(&kr.hi);
+      chosen = pick_index(db, st, t, q->where, &idx, &kr);
+      tdb_value_clear(&kr.lo); tdb_value_clear(&kr.hi);
+    }
+    if (chosen) snprintf(line, sizeof(line), "SEARCH %s USING INDEX %s%s", s->table, idx->name, colmark);
+    else        snprintf(line, sizeof(line), "SCAN %s%s", s->table ? s->table : "?", colmark);
+    explain_line(st, line);
+  }
+  if (q->setop_next) explain_select(db, st, q->setop_next);
+  if (q->group || q->cols) {
+    /* note aggregation if any aggregate appears (cheap check: scan projection) */
+  }
+  if (q->order) explain_line(st, "USE TEMP B-TREE FOR ORDER BY");
+}
+
+static int exec_explain(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *inner) {
+  st->is_select = 1;
+  st->ncol = 1;
+  st->colnames = (char **)tdb_malloc(sizeof(char *));
+  st->colnames[0] = tdb_strdup("plan");
+  char line[256];
+  if (!inner) { explain_line(st, "(empty)"); return TDB_OK; }
+  switch (inner->kind) {
+    case ST_SELECT: explain_select(db, st, inner->u.select); break;
+    case ST_INSERT:
+      snprintf(line, sizeof(line), "INSERT INTO %s", inner->u.insert.table);
+      explain_line(st, line);
+      if (inner->u.insert.select) explain_select(db, st, inner->u.insert.select);
+      break;
+    case ST_UPDATE:
+      snprintf(line, sizeof(line), "UPDATE %s (scan)", inner->u.update.table);
+      explain_line(st, line); break;
+    case ST_DELETE:
+      snprintf(line, sizeof(line), "DELETE FROM %s (scan)", inner->u.del.table);
+      explain_line(st, line); break;
+    case ST_CREATE_TABLE: explain_line(st, "CREATE TABLE"); break;
+    case ST_CREATE_INDEX: explain_line(st, "CREATE INDEX (build)"); break;
+    default: explain_line(st, "DDL/UTILITY"); break;
+  }
+  st->cur = -1;
+  return TDB_OK;
+}
+
 /* ------------------------------ dispatch ------------------------------ */
 
 int tdb_stmt_execute(tdb_stmt *st) {
@@ -668,6 +733,13 @@ int tdb_stmt_execute(tdb_stmt *st) {
   if (a->kind == ST_BEGIN || a->kind == ST_COMMIT || a->kind == ST_ROLLBACK ||
       a->kind == ST_SAVEPOINT || a->kind == ST_RELEASE || a->kind == ST_ROLLBACK_TO)
     return exec_txn(db, st, a);
+
+  /* EXPLAIN describes a plan (no execution); VACUUM forces a checkpoint */
+  if (a->kind == ST_EXPLAIN) { st->is_select = 1; return exec_explain(db, st, a->u.explain.inner); }
+  if (a->kind == ST_VACUUM) {
+    if (db->txn) { tdb_db_seterr(db, "cannot VACUUM within a transaction"); return TDB_ERROR; }
+    return tdb_pager_checkpoint(db->pager);
+  }
 
   /* otherwise run inside the explicit txn, or an auto txn we open/close here */
   int started = 0;

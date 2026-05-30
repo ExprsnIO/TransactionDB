@@ -14,22 +14,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int g_mode = 0;   /* 0 = list (aligned-ish), 1 = csv */
+
 static void print_result(tdb_stmt *st, int first_was_row) {
   int nc = tdb_column_count(st);
   if (nc <= 0) return;
+  const char *sep = g_mode ? "," : " | ";
   for (int i = 0; i < nc; i++) {
     const char *n = tdb_column_name(st, i);
-    printf("%s%s", i ? " | " : "", n ? n : "?");
+    printf("%s%s", i ? sep : "", n ? n : "?");
   }
   printf("\n");
-  for (int i = 0; i < nc; i++) printf("%s---", i ? "-+-" : "");
-  printf("\n");
+  if (!g_mode) { for (int i = 0; i < nc; i++) printf("%s---", i ? "-+-" : ""); printf("\n"); }
 
   int have = first_was_row;
   while (have) {
     for (int i = 0; i < nc; i++) {
       const char *t = tdb_column_text(st, i);
-      printf("%s%s", i ? " | " : "", t ? t : "NULL");
+      printf("%s%s", i ? sep : "", t ? t : (g_mode ? "" : "NULL"));
     }
     printf("\n");
     have = (tdb_step(st) == TDB_ROW);
@@ -93,6 +95,7 @@ static int handle_dot(tdb_db **db, const char *line, const char *initial_path) {
   if (!strcmp(cmd, "help")) {
     printf(".tables            list tables\n"
            ".schema [TABLE]    show schema\n"
+           ".mode list|csv     set output format\n"
            ".read FILE         execute SQL from FILE\n"
            ".open FILE         open a different database\n"
            ".quit / .exit      leave the shell\n");
@@ -100,6 +103,10 @@ static int handle_dot(tdb_db **db, const char *line, const char *initial_path) {
     cmd_tables(*db);
   } else if (!strcmp(cmd, "schema")) {
     cmd_schema(*db, arg);
+  } else if (!strcmp(cmd, "mode")) {
+    if (!strcmp(arg, "csv")) g_mode = 1;
+    else if (!strcmp(arg, "list")) g_mode = 0;
+    else fprintf(stderr, "modes: list, csv\n");
   } else if (!strcmp(cmd, "read")) {
     run_file(*db, arg);
   } else if (!strcmp(cmd, "open")) {

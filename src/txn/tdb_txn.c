@@ -123,6 +123,52 @@ void tdb_txn_refresh_snapshot(tdb_txn *t) {
   tdb_mutex_unlock(t->mgr->mu);
 }
 
+static void sp_stack_free(tdb_txn *t) {
+  for (int i = 0; i < t->nsp; i++) tdb_mfree(t->sp_names[i]);
+  tdb_mfree(t->sp_names); tdb_mfree(t->sp_levels);
+  t->sp_names = NULL; t->sp_levels = NULL; t->nsp = t->capsp = 0;
+}
+
+static int find_sp(tdb_txn *t, const char *name) {
+  for (int i = t->nsp - 1; i >= 0; i--)
+    if (strcasecmp(t->sp_names[i], name) == 0) return i;
+  return -1;
+}
+
+int tdb_txn_savepoint(tdb_txn *t, const char *name) {
+  if (!t->writable) return TDB_READONLY;
+  int level = tdb_pager_savepoint(t->mgr->pager);
+  if (level < 0) return TDB_ERROR;
+  if (t->nsp == t->capsp) {
+    int cap = t->capsp ? t->capsp * 2 : 4;
+    t->sp_names = (char **)tdb_realloc(t->sp_names, sizeof(char *) * (size_t)cap);
+    t->sp_levels = (int *)tdb_realloc(t->sp_levels, sizeof(int) * (size_t)cap);
+    t->capsp = cap;
+  }
+  t->sp_names[t->nsp] = tdb_strdup(name);
+  t->sp_levels[t->nsp] = level;
+  t->nsp++;
+  return TDB_OK;
+}
+
+int tdb_txn_release(tdb_txn *t, const char *name) {
+  int i = find_sp(t, name);
+  if (i < 0) return TDB_NOTFOUND;
+  int rc = tdb_pager_savepoint_release(t->mgr->pager, t->sp_levels[i]);
+  for (int j = i; j < t->nsp; j++) tdb_mfree(t->sp_names[j]);
+  t->nsp = i;
+  return rc;
+}
+
+int tdb_txn_rollback_to(tdb_txn *t, const char *name) {
+  int i = find_sp(t, name);
+  if (i < 0) return TDB_NOTFOUND;
+  int rc = tdb_pager_savepoint_rollback(t->mgr->pager, t->sp_levels[i]);
+  for (int j = i + 1; j < t->nsp; j++) tdb_mfree(t->sp_names[j]);
+  t->nsp = i + 1;
+  return rc;
+}
+
 int tdb_txn_commit(tdb_txn *t) {
   tdb_txnmgr *m = t->mgr;
   int rc = TDB_OK;
@@ -140,6 +186,7 @@ int tdb_txn_commit(tdb_txn *t) {
   if (m->locks) tdb_lock_release_all(m->locks, t->id);
 
   t->state = rc ? TDB_XACT_ABORTED : TDB_XACT_COMMITTED;
+  sp_stack_free(t);
   tdb_mfree(t->snap.active);
   tdb_mfree(t);
   return rc;
@@ -156,6 +203,7 @@ int tdb_txn_rollback(tdb_txn *t) {
   if (m->locks) tdb_lock_release_all(m->locks, t->id);
 
   t->state = TDB_XACT_ABORTED;
+  sp_stack_free(t);
   tdb_mfree(t->snap.active);
   tdb_mfree(t);
   return rc;

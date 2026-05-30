@@ -38,6 +38,15 @@ struct tdb_pager {
   tdb_page *buckets[TDB_CACHE_BUCKETS];
   int       ncached;
   tdb_page *lru_head, *lru_tail; /* head = most recent */
+
+  /* savepoint stack: each level snapshots the header + before-images of the
+  ** pages that were dirty when the savepoint was opened */
+  struct pager_sp {
+    tdb_dbhdr hdr;
+    struct { tdb_pgno pgno; uint8_t *data; } *imgs;
+    int nimg, capimg;
+  } *sps;
+  int nsp, capsp;
 };
 
 /* ----------------------------- header codec --------------------------- */
@@ -289,6 +298,8 @@ int tdb_pager_begin(tdb_pager *p) {
   return TDB_OK;
 }
 
+static void sp_clear_all(tdb_pager *p);
+
 /* Write the header into page 1's data buffer and mark it dirty. */
 static int flush_header(tdb_pager *p) {
   tdb_page *pg;
@@ -332,6 +343,7 @@ int tdb_pager_commit(tdb_pager *p) {
   }
 
   p->in_txn = 0;
+  sp_clear_all(p);
 
   /* Auto-checkpoint when the log grows large to bound its size. */
   if (tdb_wal_frame_count(p->wal) > 1000) {
@@ -361,6 +373,85 @@ int tdb_pager_rollback(tdb_pager *p) {
   }
   p->hdr_dirty = 0;
   p->in_txn = 0;
+  sp_clear_all(p);
+  return TDB_OK;
+}
+
+/* ----------------------------- savepoints ----------------------------- */
+
+static void sp_free(struct pager_sp *sp) {
+  for (int i = 0; i < sp->nimg; i++) tdb_mfree(sp->imgs[i].data);
+  tdb_mfree(sp->imgs);
+  sp->imgs = NULL; sp->nimg = sp->capimg = 0;
+}
+static void sp_clear_all(tdb_pager *p) {
+  for (int i = 0; i < p->nsp; i++) sp_free(&p->sps[i]);
+  p->nsp = 0;
+}
+
+int tdb_pager_savepoint(tdb_pager *p) {
+  if (p->readonly) return -1;
+  if (p->nsp == p->capsp) {
+    int cap = p->capsp ? p->capsp * 2 : 4;
+    p->sps = (struct pager_sp *)tdb_realloc(p->sps, sizeof(*p->sps) * (size_t)cap);
+    p->capsp = cap;
+  }
+  struct pager_sp *sp = &p->sps[p->nsp];
+  sp->hdr = p->hdr;
+  sp->imgs = NULL; sp->nimg = sp->capimg = 0;
+  /* snapshot before-images of all currently-dirty pages */
+  for (int b = 0; b < TDB_CACHE_BUCKETS; b++) {
+    for (tdb_page *pg = p->buckets[b]; pg; pg = pg->hnext) {
+      if (!pg->dirty) continue;
+      if (sp->nimg == sp->capimg) {
+        int cap = sp->capimg ? sp->capimg * 2 : 16;
+        sp->imgs = tdb_realloc(sp->imgs, sizeof(sp->imgs[0]) * (size_t)cap);
+        sp->capimg = cap;
+      }
+      uint8_t *copy = (uint8_t *)tdb_malloc(p->page_size);
+      memcpy(copy, pg->data, p->page_size);
+      sp->imgs[sp->nimg].pgno = pg->pgno;
+      sp->imgs[sp->nimg].data = copy;
+      sp->nimg++;
+    }
+  }
+  return p->nsp++;
+}
+
+/* RELEASE: discard savepoint `level` and any nested inside it (changes kept). */
+int tdb_pager_savepoint_release(tdb_pager *p, int level) {
+  if (level < 0 || level >= p->nsp) return TDB_MISUSE;
+  for (int i = p->nsp - 1; i >= level; i--) sp_free(&p->sps[i]);
+  p->nsp = level;
+  return TDB_OK;
+}
+
+/* ROLLBACK TO: revert to savepoint `level` (kept); discard nested savepoints. */
+int tdb_pager_savepoint_rollback(tdb_pager *p, int level) {
+  if (level < 0 || level >= p->nsp) return TDB_MISUSE;
+  for (int i = p->nsp - 1; i > level; i--) sp_free(&p->sps[i]);
+  p->nsp = level + 1;
+  struct pager_sp *sp = &p->sps[level];
+
+  /* collect currently-dirty pages */
+  tdb_page *dirty[TDB_CACHE_SOFT_MAX + 64]; int k = 0;
+  for (int b = 0; b < TDB_CACHE_BUCKETS; b++)
+    for (tdb_page *pg = p->buckets[b]; pg; pg = pg->hnext)
+      if (pg->dirty && k < (int)(sizeof(dirty) / sizeof(dirty[0]))) dirty[k++] = pg;
+
+  for (int i = 0; i < k; i++) {
+    tdb_page *pg = dirty[i];
+    int restored = 0;
+    for (int j = 0; j < sp->nimg; j++) {
+      if (sp->imgs[j].pgno == pg->pgno) {
+        memcpy(pg->data, sp->imgs[j].data, p->page_size); /* dirty at savepoint */
+        restored = 1; break;
+      }
+    }
+    if (!restored) { pg->refs = 0; cache_remove(p, pg); } /* clean at savepoint */
+  }
+  p->hdr = sp->hdr;
+  p->hdr_dirty = 1;
   return TDB_OK;
 }
 
@@ -478,6 +569,8 @@ int tdb_pager_close(tdb_pager *p) {
     tdb_page *pg = p->buckets[b];
     while (pg) { tdb_page *next = pg->hnext; tdb_mfree(pg->data); tdb_mfree(pg); pg = next; }
   }
+  sp_clear_all(p);
+  tdb_mfree(p->sps);
   if (p->wal) tdb_wal_close(p->wal);
   if (p->walfile) tdb_file_close(p->walfile);
   if (p->file) tdb_file_close(p->file);

@@ -33,6 +33,10 @@ typedef struct tdb_txn {
   tdb_snapshot  snap;
   int           state;     /* tdb_xstate */
   int           writable;
+  /* named savepoint stack (maps name -> pager savepoint level) */
+  char        **sp_names;
+  int          *sp_levels;
+  int           nsp, capsp;
 } tdb_txn;
 
 int  tdb_txnmgr_open(tdb_pager *p, tdb_lockmgr *lm, tdb_txnmgr **out);
@@ -49,5 +53,11 @@ void tdb_txn_refresh_snapshot(tdb_txn *t);
 
 /* Test a row version's visibility under this transaction's snapshot. */
 int  tdb_txn_visible(tdb_txn *t, tdb_txnid xmin, tdb_txnid xmax);
+
+/* Named savepoints (write transactions). RELEASE discards a savepoint and any
+** nested inside it; ROLLBACK TO reverts to it (and keeps it). */
+int  tdb_txn_savepoint(tdb_txn *t, const char *name);
+int  tdb_txn_release(tdb_txn *t, const char *name);
+int  tdb_txn_rollback_to(tdb_txn *t, const char *name);
 
 #endif /* TDB_TXN_H */

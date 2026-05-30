@@ -280,12 +280,63 @@ static void test_index_persist(void) {
   remove(path); remove("test_idx.db-wal");
 }
 
+static void test_savepoints(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1, 10)");
+
+  exec(db, "BEGIN");
+  exec(db, "INSERT INTO t VALUES (2, 20)");
+  exec(db, "SAVEPOINT a");
+  exec(db, "INSERT INTO t VALUES (3, 30)");
+  exec(db, "UPDATE t SET v = 99 WHERE id = 1");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 3);
+  TDB_CHECK_EQ(scalar(db, "SELECT v FROM t WHERE id = 1"), 99);
+
+  /* roll back to savepoint a: undoes insert(3) and the update */
+  TDB_CHECK_EQ(exec(db, "ROLLBACK TO a"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 2);
+  TDB_CHECK_EQ(scalar(db, "SELECT v FROM t WHERE id = 1"), 10);
+
+  /* savepoint a still active: continue, release, commit */
+  exec(db, "INSERT INTO t VALUES (4, 40)");
+  TDB_CHECK_EQ(exec(db, "RELEASE a"), TDB_OK);
+  exec(db, "COMMIT");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 3);          /* 1,2,4 */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE id = 3"), 0);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE id = 4"), 1);
+  tdb_close(db);
+}
+
+static void test_nested_savepoints(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+  exec(db, "BEGIN");
+  exec(db, "SAVEPOINT a");
+  exec(db, "INSERT INTO t VALUES (1)");
+  exec(db, "SAVEPOINT b");
+  exec(db, "INSERT INTO t VALUES (2)");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 2);
+  /* rolling back to the OUTER savepoint undoes both inserts */
+  TDB_CHECK_EQ(exec(db, "ROLLBACK TO a"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 0);
+  exec(db, "COMMIT");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 0);
+  /* unknown savepoint errors */
+  exec(db, "BEGIN");
+  TDB_CHECK(exec(db, "ROLLBACK TO nope") != TDB_OK);
+  exec(db, "ROLLBACK");
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"ddl_dml_select", test_ddl_dml_select},
   {"derived_and_view", test_derived_and_view},
   {"outer_joins", test_outer_joins},
   {"index_scan", test_index_scan},
   {"index_persist", test_index_persist},
+  {"savepoints", test_savepoints},
+  {"nested_savepoints", test_nested_savepoints},
   {"like_distinct", test_like_distinct},
   {"builtins", test_builtins},
   {"subqueries", test_subqueries},

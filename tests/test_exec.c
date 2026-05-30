@@ -209,8 +209,44 @@ static void test_insert_select(void) {
   tdb_close(db);
 }
 
+static void test_derived_and_view(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,10),(2,20),(3,30)");
+  /* derived table (subquery in FROM) */
+  TDB_CHECK_EQ(scalar(db, "SELECT SUM(x) FROM (SELECT v AS x FROM t WHERE v >= 20) s"), 50);
+  TDB_CHECK_EQ(rowcount(db, "SELECT * FROM (SELECT v FROM t) d"), 3);
+  /* view expansion in FROM */
+  exec(db, "CREATE VIEW bigv AS SELECT id, v FROM t WHERE v >= 20");
+  TDB_CHECK_EQ(rowcount(db, "SELECT * FROM bigv"), 2);
+  TDB_CHECK_EQ(scalar(db, "SELECT SUM(v) FROM bigv"), 50);
+  tdb_close(db);
+}
+
+static void test_outer_joins(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)");
+  exec(db, "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept_id INTEGER, name TEXT)");
+  exec(db, "INSERT INTO dept VALUES (1,'eng'),(2,'sales'),(3,'empty')");
+  exec(db, "INSERT INTO emp VALUES (1,1,'a'),(2,1,'b'),(3,2,'c'),(4,99,'orphan')");
+
+  /* LEFT: all 4 emp rows kept; orphan has NULL dept */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp LEFT JOIN dept ON emp.dept_id = dept.id"), 4);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp LEFT JOIN dept ON emp.dept_id = dept.id WHERE dept.id IS NULL"), 1);
+  /* RIGHT: 3 matches + 'empty' dept with NULL emp = 4 (orphan dropped) */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp RIGHT JOIN dept ON emp.dept_id = dept.id"), 4);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp RIGHT JOIN dept ON emp.dept_id = dept.id WHERE emp.id IS NULL"), 1);
+  /* FULL: 3 matches + orphan + empty = 5 */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp FULL JOIN dept ON emp.dept_id = dept.id"), 5);
+  /* inner join still correct */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp JOIN dept ON emp.dept_id = dept.id"), 3);
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"ddl_dml_select", test_ddl_dml_select},
+  {"derived_and_view", test_derived_and_view},
+  {"outer_joins", test_outer_joins},
   {"like_distinct", test_like_distinct},
   {"builtins", test_builtins},
   {"subqueries", test_subqueries},

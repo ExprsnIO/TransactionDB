@@ -67,7 +67,7 @@ endif()
 if(TDB_BUILD_TESTS)
   enable_testing()
   set(TDB_TESTS util value_record wal pager sqltype schema btree
-                mvcc lock engine catalog)
+                mvcc lock engine catalog lexer parser)
   foreach(t ${TDB_TESTS})
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_${t}.c")
       add_executable(test_${t} "tests/test_${t}.c")

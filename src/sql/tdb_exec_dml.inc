@@ -51,10 +51,44 @@ static int finalize_row(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_value *full)
   return TDB_OK;
 }
 
+/* Insert one row: place src[0..nsrc) into the target columns, fill DEFAULTs,
+** assign the rowid (INTEGER PRIMARY KEY aliasing), stamp the temporal period,
+** run generated columns / type coercion / NOT NULL, then store. */
+static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *target,
+                           int ntarget, tdb_value *src, int nsrc, int pkc, tdb_buf *rec) {
+  tdb_value *full = row_alloc(t->ncol);
+  for (int i = 0; i < t->ncol; i++) {
+    if (t->cols[i].default_sql) {
+      tdb_expr *de = prepare_col_expr(db, st, t, t->cols[i].default_sql);
+      if (de) { ectx ec = { NULL, 0, NULL, 0, st }; eval(db, &ec, de, &full[i]); }
+    }
+  }
+  int nv = nsrc < ntarget ? nsrc : ntarget;
+  for (int i = 0; i < nv; i++) tdb_value_copy(&full[target[i]], &src[i]);
+
+  tdb_rowid rowid;
+  if (pkc >= 0 && full[pkc].type != TDB_VAL_NULL) {
+    rowid = (tdb_rowid)tdb_value_as_int(&full[pkc]);
+  } else {
+    db->engine->vtab->next_rowid(db->engine, t, &rowid);
+    if (pkc >= 0) tdb_value_set_int(&full[pkc], (int64_t)rowid);
+  }
+  if (t->versioning == TDB_VERSIONING_SYSTEM && t->row_start_col >= 0)
+    tdb_value_set_int(&full[t->row_start_col], (int64_t)db->txn->id);
+
+  int rc = finalize_row(db, st, t, full);
+  if (!rc) {
+    tdb_buf_reset(rec);
+    tdb_record_encode(full, t->ncol, rec);
+    rc = db->engine->vtab->insert(db->engine, db->txn, t, rowid, rec->data, (int)rec->len);
+  }
+  free_row(full, t->ncol);
+  return rc;
+}
+
 static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   tdb_table *t = tdb_catalog_find_table(db->cat, a->u.insert.table);
   if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.insert.table); return TDB_ERROR; }
-  if (a->u.insert.select) { tdb_db_seterr(db, "INSERT...SELECT not yet supported"); return TDB_UNSUPPORTED; }
 
   /* target column indices */
   int target[64]; int ntarget;
@@ -70,56 +104,41 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       if (!t->cols[i].hidden && t->cols[i].generated == TDB_GEN_NONE) target[ntarget++] = i;
   }
 
-  /* resolve value expressions (assigns parameter slots in order) */
-  qctx pq; memset(&pq, 0, sizeof(pq));
-  for (int r = 0; r < a->u.insert.nrows; r++) {
-    tdb_exprlist *row = a->u.insert.rows[r];
-    for (int i = 0; i < row->n; i++)
-      if (resolve_expr(db, &pq, row->items[i])) return TDB_ERROR;
-  }
-
   int pkc = pk_int_col(t);
   tdb_buf rec; tdb_buf_init(&rec);
   int rc = TDB_OK;
 
-  for (int r = 0; r < a->u.insert.nrows; r++) {
-    tdb_exprlist *row = a->u.insert.rows[r];
-    tdb_value *full = row_alloc(t->ncol);
-
-    /* DEFAULTs first */
-    for (int i = 0; i < t->ncol; i++) {
-      if (t->cols[i].default_sql) {
-        tdb_expr *de = prepare_col_expr(db, st, t, t->cols[i].default_sql);
-        if (de) { ectx ec = { NULL, 0, NULL, 0, st }; eval(db, &ec, de, &full[i]); }
+  if (a->u.insert.select) {
+    /* INSERT ... SELECT */
+    tdb_stmt tmp;
+    rc = run_subselect(db, st, a->u.insert.select, &tmp);
+    if (!rc) {
+      for (int r = 0; r < tmp.nrows && !rc; r++) {
+        rc = insert_row_vals(db, st, t, target, ntarget, tmp.rows[r], tmp.ncol, pkc, &rec);
+        if (!rc) st->changes++;
       }
     }
-    /* provided values */
-    int nv = row->n < ntarget ? row->n : ntarget;
+    tdb_stmt_clear_results(&tmp);
+    tdb_buf_free(&rec);
+    return rc;
+  }
+
+  /* INSERT ... VALUES: resolve value expressions (assigns parameter slots) */
+  qctx pq; memset(&pq, 0, sizeof(pq));
+  for (int r = 0; r < a->u.insert.nrows; r++) {
+    tdb_exprlist *row = a->u.insert.rows[r];
+    for (int i = 0; i < row->n; i++)
+      if (resolve_expr(db, &pq, row->items[i])) { tdb_buf_free(&rec); return TDB_ERROR; }
+  }
+
+  for (int r = 0; r < a->u.insert.nrows && !rc; r++) {
+    tdb_exprlist *row = a->u.insert.rows[r];
+    tdb_value *src = row_alloc(row->n ? row->n : 1);
     ectx ec0 = { NULL, 0, NULL, 0, st };
-    for (int i = 0; i < nv; i++) eval(db, &ec0, row->items[i], &full[target[i]]);
-
-    /* rowid + integer-pk aliasing */
-    tdb_rowid rowid;
-    if (pkc >= 0 && full[pkc].type != TDB_VAL_NULL) {
-      rowid = (tdb_rowid)tdb_value_as_int(&full[pkc]);
-    } else {
-      db->engine->vtab->next_rowid(db->engine, t, &rowid);
-      if (pkc >= 0) tdb_value_set_int(&full[pkc], (int64_t)rowid);
-    }
-
-    /* system-versioned: stamp the period start with the txn id */
-    if (t->versioning == TDB_VERSIONING_SYSTEM && t->row_start_col >= 0)
-      tdb_value_set_int(&full[t->row_start_col], (int64_t)st->db->txn->id);
-
-    rc = finalize_row(db, st, t, full);
-    if (rc) { free_row(full, t->ncol); break; }
-
-    tdb_buf_reset(&rec);
-    tdb_record_encode(full, t->ncol, &rec);
-    rc = db->engine->vtab->insert(db->engine, db->txn, t, rowid, rec.data, (int)rec.len);
-    free_row(full, t->ncol);
-    if (rc) break;
-    st->changes++;
+    for (int i = 0; i < row->n; i++) eval(db, &ec0, row->items[i], &src[i]);
+    rc = insert_row_vals(db, st, t, target, ntarget, src, row->n, pkc, &rec);
+    free_row(src, row->n ? row->n : 1);
+    if (!rc) st->changes++;
   }
   tdb_buf_free(&rec);
   return rc;

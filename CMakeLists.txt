@@ -60,7 +60,16 @@ endif()
 if(TDB_BUILD_CLI)
   add_executable(tdb_shell cli/shell.c)
   target_link_libraries(tdb_shell PRIVATE transactiondb)
-  target_include_directories(tdb_shell PRIVATE "${CMAKE_SOURCE_DIR}/include")
+  target_include_directories(tdb_shell PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/common"
+    "${CMAKE_SOURCE_DIR}/src/api"
+    "${CMAKE_SOURCE_DIR}/src/catalog"
+    "${CMAKE_SOURCE_DIR}/src/value"
+    "${CMAKE_SOURCE_DIR}/src/storage"
+    "${CMAKE_SOURCE_DIR}/src/txn"
+    "${CMAKE_SOURCE_DIR}/src/sql")
   tdb_set_warnings(tdb_shell)
 endif()
 
@@ -88,4 +97,11 @@ if(TDB_BUILD_TESTS)
       add_test(NAME ${t} COMMAND test_${t})
     endif()
   endforeach()
+
+  # C++ wrapper test
+  add_executable(test_cpp tests/test_cpp.cpp)
+  target_link_libraries(test_cpp PRIVATE transactiondb)
+  target_include_directories(test_cpp PRIVATE
+    "${CMAKE_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/tests")
+  add_test(NAME cpp COMMAND test_cpp)
 endif()

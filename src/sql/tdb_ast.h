@@ -47,6 +47,9 @@ struct tdb_expr {
   tdb_typespec  cast;     /* EX_CAST target type */
   int           distinct; /* EX_AGG: DISTINCT */
   int           negated;  /* EX_IN / EX_BETWEEN / EX_LIKE: NOT ... */
+  int           col_index;/* analyzer: resolved column slot, or -1 */
+  int           agg_index;/* analyzer: aggregate slot, or -1 */
+  int           fn_id;    /* analyzer: resolved builtin/aggregate id */
   tdb_expr     *left;
   tdb_expr     *right;
   tdb_exprlist *args;     /* func args / IN list / CASE when-then pairs */
@@ -133,7 +136,7 @@ typedef enum tdb_stmt_kind {
   ST_PREPARE, ST_ALTER_TABLE
 } tdb_stmt_kind;
 
-typedef struct tdb_stmt {
+typedef struct tdb_ast_stmt {
   tdb_stmt_kind kind;
   union {
     tdb_select *select;
@@ -177,7 +180,7 @@ typedef struct tdb_stmt {
 
     struct { char *table; int action; char *col; char *newname; tdb_coldef *add; } alter;
   } u;
-} tdb_stmt;
+} tdb_ast_stmt;
 
 /* alter actions */
 #define TDB_ALTER_ADD_COLUMN    1

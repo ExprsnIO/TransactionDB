@@ -339,3 +339,14 @@ tdb_routine *tdb_catalog_find_routine(tdb_catalog *c, const char *name) {
 }
 int tdb_catalog_table_count(tdb_catalog *c) { return c->ntable; }
 tdb_table *tdb_catalog_table_at(tdb_catalog *c, int i) { return c->tables[i]; }
+
+void tdb_catalog_drop_table(tdb_catalog *c, const char *name) {
+  for (int i = 0; i < c->ntable; i++) {
+    if (strcasecmp(c->tables[i]->name, name) == 0) {
+      tdb_table_free(c->tables[i]);
+      for (int j = i; j < c->ntable - 1; j++) c->tables[j] = c->tables[j + 1];
+      c->ntable--;
+      return;
+    }
+  }
+}

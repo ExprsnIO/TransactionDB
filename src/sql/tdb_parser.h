@@ -13,7 +13,12 @@
 ** returns TDB_ERROR and sets *errmsg (arena-allocated) to a description.
 ** All AST memory lives in `a`.
 */
-int tdb_parse(tdb_arena *a, const char *sql, tdb_stmt **out,
+int tdb_parse(tdb_arena *a, const char *sql, tdb_ast_stmt **out,
               char **errmsg, const char **tail);
+
+/* Parse a standalone expression (for generated-column / DEFAULT / CHECK
+** bodies stored as text). */
+int tdb_parse_expression(tdb_arena *a, const char *sql, tdb_expr **out,
+                         char **errmsg);
 
 #endif /* TDB_PARSER_H */

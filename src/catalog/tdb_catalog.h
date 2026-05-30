@@ -37,4 +37,8 @@ tdb_routine *tdb_catalog_find_routine(tdb_catalog *c, const char *name);
 int        tdb_catalog_table_count(tdb_catalog *c);
 tdb_table *tdb_catalog_table_at(tdb_catalog *c, int i);
 
+/* Remove a table from the in-memory cache (session-scoped; on-disk catalog
+** row reclamation is left to a future vacuum/rewrite). */
+void       tdb_catalog_drop_table(tdb_catalog *c, const char *name);
+
 #endif /* TDB_CATALOG_H */

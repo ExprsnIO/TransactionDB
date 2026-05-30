@@ -8,7 +8,14 @@
 
 tdb_expr *tdb_expr_new(tdb_arena *a, tdb_expr_kind k) {
   tdb_expr *e = (tdb_expr *)tdb_arena_alloc(a, sizeof(*e));
-  if (e) { memset(e, 0, sizeof(*e)); e->kind = k; tdb_value_init(&e->lit); }
+  if (e) {
+    memset(e, 0, sizeof(*e));
+    e->kind = k;
+    e->col_index = -1;
+    e->agg_index = -1;
+    e->fn_id = -1;
+    tdb_value_init(&e->lit);
+  }
   return e;
 }
 

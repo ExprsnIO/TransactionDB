@@ -5,8 +5,8 @@
 
 #include <string.h>
 
-static tdb_stmt *parse1(tdb_arena *a, const char *sql) {
-  tdb_stmt *s = NULL; char *err = NULL; const char *tail = NULL;
+static tdb_ast_stmt *parse1(tdb_arena *a, const char *sql) {
+  tdb_ast_stmt *s = NULL; char *err = NULL; const char *tail = NULL;
   int rc = tdb_parse(a, sql, &s, &err, &tail);
   TDB_CHECK_EQ(rc, TDB_OK);
   return s;
@@ -15,7 +15,7 @@ static tdb_stmt *parse1(tdb_arena *a, const char *sql) {
 /* render the first projection expression of "SELECT <expr>" */
 static void check_expr(const char *sql, const char *expect) {
   tdb_arena *a = tdb_arena_new(4096);
-  tdb_stmt *s = parse1(a, sql);
+  tdb_ast_stmt *s = parse1(a, sql);
   if (s && s->kind == ST_SELECT && s->u.select->cols->n > 0) {
     tdb_buf b; tdb_buf_init(&b);
     tdb_expr_debug(&b, s->u.select->cols->items[0]);
@@ -39,7 +39,7 @@ static void test_expr_precedence(void) {
 
 static void test_select(void) {
   tdb_arena *a = tdb_arena_new(4096);
-  tdb_stmt *s = parse1(a,
+  tdb_ast_stmt *s = parse1(a,
     "SELECT a, b AS x FROM t JOIN u ON t.id = u.id "
     "WHERE a > 1 GROUP BY a HAVING c < 2 ORDER BY a DESC LIMIT 10 OFFSET 5");
   TDB_CHECK_EQ(s->kind, ST_SELECT);
@@ -56,7 +56,7 @@ static void test_select(void) {
 
 static void test_create_table(void) {
   tdb_arena *a = tdb_arena_new(4096);
-  tdb_stmt *s = parse1(a,
+  tdb_ast_stmt *s = parse1(a,
     "CREATE TABLE t ("
     " id INTEGER PRIMARY KEY,"
     " name VARCHAR(20) NOT NULL,"
@@ -82,7 +82,7 @@ static void test_create_table(void) {
 
 static void test_dml(void) {
   tdb_arena *a = tdb_arena_new(4096);
-  tdb_stmt *s;
+  tdb_ast_stmt *s;
 
   s = parse1(a, "INSERT INTO t (a, b) VALUES (1, 2), (3, 4)");
   TDB_CHECK_EQ(s->kind, ST_INSERT);
@@ -106,7 +106,7 @@ static void test_dml(void) {
 
 static void test_index_view_routine(void) {
   tdb_arena *a = tdb_arena_new(4096);
-  tdb_stmt *s;
+  tdb_ast_stmt *s;
 
   s = parse1(a, "CREATE UNIQUE INDEX i ON t (a, b DESC)");
   TDB_CHECK_EQ(s->kind, ST_CREATE_INDEX);
@@ -133,7 +133,7 @@ static void test_txn_drop(void) {
   TDB_CHECK_EQ(parse1(a, "ROLLBACK")->kind, ST_ROLLBACK);
   TDB_CHECK_EQ(parse1(a, "SAVEPOINT s1")->kind, ST_SAVEPOINT);
   TDB_CHECK_EQ(parse1(a, "ROLLBACK TO s1")->kind, ST_ROLLBACK_TO);
-  tdb_stmt *d = parse1(a, "DROP TABLE IF EXISTS t");
+  tdb_ast_stmt *d = parse1(a, "DROP TABLE IF EXISTS t");
   TDB_CHECK_EQ(d->kind, ST_DROP_TABLE);
   TDB_CHECK_EQ(d->u.drop.if_exists, 1);
   tdb_arena_free(a);
@@ -141,7 +141,7 @@ static void test_txn_drop(void) {
 
 static void test_errors_and_tail(void) {
   tdb_arena *a = tdb_arena_new(4096);
-  tdb_stmt *s = NULL; char *err = NULL; const char *tail = NULL;
+  tdb_ast_stmt *s = NULL; char *err = NULL; const char *tail = NULL;
 
   TDB_CHECK_EQ(tdb_parse(a, "SELECT FROM", &s, &err, &tail), TDB_ERROR);
   TDB_CHECK(err != NULL);

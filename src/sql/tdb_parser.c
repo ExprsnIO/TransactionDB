@@ -361,8 +361,8 @@ static tdb_select *parse_select(P *p) {
 
 /* -------------------------------- DML --------------------------------- */
 
-static tdb_stmt *new_stmt(P *p, tdb_stmt_kind k) {
-  tdb_stmt *s = (tdb_stmt *)tdb_arena_alloc(p->a, sizeof(*s));
+static tdb_ast_stmt *new_stmt(P *p, tdb_stmt_kind k) {
+  tdb_ast_stmt *s = (tdb_ast_stmt *)tdb_arena_alloc(p->a, sizeof(*s));
   memset(s, 0, sizeof(*s));
   s->kind = k;
   return s;
@@ -384,10 +384,10 @@ static char **parse_name_list(P *p, int *count) {
   return names;
 }
 
-static tdb_stmt *parse_insert(P *p) {
+static tdb_ast_stmt *parse_insert(P *p) {
   advance(p); /* INSERT */
   expect(p, TK_INTO, "expected INTO");
-  tdb_stmt *s = new_stmt(p, ST_INSERT);
+  tdb_ast_stmt *s = new_stmt(p, ST_INSERT);
   s->u.insert.table = dup_tok(p, &p->cur);
   expect(p, TK_ID, "expected table name");
   if (accept(p, TK_LP)) {
@@ -417,9 +417,9 @@ static tdb_stmt *parse_insert(P *p) {
   return s;
 }
 
-static tdb_stmt *parse_update(P *p) {
+static tdb_ast_stmt *parse_update(P *p) {
   advance(p); /* UPDATE */
-  tdb_stmt *s = new_stmt(p, ST_UPDATE);
+  tdb_ast_stmt *s = new_stmt(p, ST_UPDATE);
   s->u.update.table = dup_tok(p, &p->cur);
   expect(p, TK_ID, "expected table name");
   expect(p, TK_SET, "expected SET");
@@ -442,10 +442,10 @@ static tdb_stmt *parse_update(P *p) {
   return s;
 }
 
-static tdb_stmt *parse_delete(P *p) {
+static tdb_ast_stmt *parse_delete(P *p) {
   advance(p); /* DELETE */
   expect(p, TK_FROM, "expected FROM");
-  tdb_stmt *s = new_stmt(p, ST_DELETE);
+  tdb_ast_stmt *s = new_stmt(p, ST_DELETE);
   s->u.del.table = dup_tok(p, &p->cur);
   expect(p, TK_ID, "expected table name");
   if (accept(p, TK_WHERE)) s->u.del.where = parse_expr(p, 0);
@@ -519,8 +519,8 @@ static void parse_column_constraints(P *p, tdb_coldef *c) {
   }
 }
 
-static tdb_stmt *parse_create_table(P *p) {
-  tdb_stmt *s = new_stmt(p, ST_CREATE_TABLE);
+static tdb_ast_stmt *parse_create_table(P *p) {
+  tdb_ast_stmt *s = new_stmt(p, ST_CREATE_TABLE);
   tdb_create_table *ct = (tdb_create_table *)tdb_arena_alloc(p->a, sizeof(*ct));
   memset(ct, 0, sizeof(*ct));
   s->u.create_table = ct;
@@ -579,8 +579,8 @@ static tdb_stmt *parse_create_table(P *p) {
   return s;
 }
 
-static tdb_stmt *parse_create_index(P *p, int unique) {
-  tdb_stmt *s = new_stmt(p, ST_CREATE_INDEX);
+static tdb_ast_stmt *parse_create_index(P *p, int unique) {
+  tdb_ast_stmt *s = new_stmt(p, ST_CREATE_INDEX);
   tdb_create_index *ci = (tdb_create_index *)tdb_arena_alloc(p->a, sizeof(*ci));
   memset(ci, 0, sizeof(*ci));
   s->u.create_index = ci;
@@ -609,8 +609,8 @@ static tdb_stmt *parse_create_index(P *p, int unique) {
   return s;
 }
 
-static tdb_stmt *parse_create_view(P *p, int materialized) {
-  tdb_stmt *s = new_stmt(p, ST_CREATE_VIEW);
+static tdb_ast_stmt *parse_create_view(P *p, int materialized) {
+  tdb_ast_stmt *s = new_stmt(p, ST_CREATE_VIEW);
   s->u.create_view.materialized = materialized;
   expect(p, TK_VIEW, "expected VIEW");
   if (p->cur.kind == TK_IF) { advance(p); expect(p, TK_NOT, "expected NOT"); expect(p, TK_EXISTS, "expected EXISTS"); s->u.create_view.if_not_exists = 1; }
@@ -622,8 +622,8 @@ static tdb_stmt *parse_create_view(P *p, int materialized) {
   return s;
 }
 
-static tdb_stmt *parse_create_routine(P *p, int is_function) {
-  tdb_stmt *s = new_stmt(p, ST_CREATE_ROUTINE);
+static tdb_ast_stmt *parse_create_routine(P *p, int is_function) {
+  tdb_ast_stmt *s = new_stmt(p, ST_CREATE_ROUTINE);
   s->u.create_routine.is_function = is_function;
   advance(p); /* FUNCTION / PROCEDURE */
   s->u.create_routine.name = dup_tok(p, &p->cur); expect(p, TK_ID, "expected routine name");
@@ -655,7 +655,7 @@ static tdb_stmt *parse_create_routine(P *p, int is_function) {
   return s;
 }
 
-static tdb_stmt *parse_create(P *p) {
+static tdb_ast_stmt *parse_create(P *p) {
   advance(p); /* CREATE */
   if (accept(p, TK_UNIQUE)) return parse_create_index(p, 1);
   if (p->cur.kind == TK_INDEX) return parse_create_index(p, 0);
@@ -667,23 +667,23 @@ static tdb_stmt *parse_create(P *p) {
   return parse_create_table(p);
 }
 
-static tdb_stmt *parse_drop(P *p) {
+static tdb_ast_stmt *parse_drop(P *p) {
   advance(p); /* DROP */
   tdb_stmt_kind k = ST_DROP_TABLE;
   if (p->cur.kind == TK_INDEX) k = ST_DROP_INDEX;
   else if (p->cur.kind == TK_VIEW) k = ST_DROP_VIEW;
   advance(p); /* TABLE/INDEX/VIEW */
-  tdb_stmt *s = new_stmt(p, k);
+  tdb_ast_stmt *s = new_stmt(p, k);
   if (p->cur.kind == TK_IF) { advance(p); expect(p, TK_EXISTS, "expected EXISTS"); s->u.drop.if_exists = 1; }
   s->u.drop.name = dup_tok(p, &p->cur);
   expect(p, TK_ID, "expected name");
   return s;
 }
 
-static tdb_stmt *parse_alter(P *p) {
+static tdb_ast_stmt *parse_alter(P *p) {
   advance(p); /* ALTER */
   expect(p, TK_TABLE, "expected TABLE");
-  tdb_stmt *s = new_stmt(p, ST_ALTER_TABLE);
+  tdb_ast_stmt *s = new_stmt(p, ST_ALTER_TABLE);
   s->u.alter.table = dup_tok(p, &p->cur); expect(p, TK_ID, "expected table name");
   if (accept(p, TK_ADD)) {
     accept(p, TK_COLUMN);
@@ -704,10 +704,10 @@ static tdb_stmt *parse_alter(P *p) {
   return s;
 }
 
-static tdb_stmt *parse_txn(P *p) {
+static tdb_ast_stmt *parse_txn(P *p) {
   tdb_token_kind k = p->cur.kind;
   advance(p);
-  tdb_stmt *s;
+  tdb_ast_stmt *s;
   switch (k) {
     case TK_BEGIN: accept(p, TK_TRANSACTION); return new_stmt(p, ST_BEGIN);
     case TK_COMMIT: accept(p, TK_TRANSACTION); return new_stmt(p, ST_COMMIT);
@@ -733,9 +733,9 @@ static tdb_stmt *parse_txn(P *p) {
   }
 }
 
-static tdb_stmt *parse_call(P *p) {
+static tdb_ast_stmt *parse_call(P *p) {
   advance(p); /* CALL */
-  tdb_stmt *s = new_stmt(p, ST_CALL);
+  tdb_ast_stmt *s = new_stmt(p, ST_CALL);
   s->u.call.name = dup_tok(p, &p->cur); expect(p, TK_ID, "expected routine name");
   s->u.call.args = tdb_exprlist_new(p->a);
   expect(p, TK_LP, "expected (");
@@ -745,9 +745,9 @@ static tdb_stmt *parse_call(P *p) {
   return s;
 }
 
-static tdb_stmt *parse_prepare(P *p) {
+static tdb_ast_stmt *parse_prepare(P *p) {
   advance(p); /* PREPARE */
-  tdb_stmt *s = new_stmt(p, ST_PREPARE);
+  tdb_ast_stmt *s = new_stmt(p, ST_PREPARE);
   s->u.prepare.name = dup_tok(p, &p->cur); expect(p, TK_ID, "expected name");
   expect(p, TK_AS, "expected AS");
   size_t s0 = off(p);
@@ -756,9 +756,9 @@ static tdb_stmt *parse_prepare(P *p) {
   return s;
 }
 
-static tdb_stmt *parse_stmt(P *p) {
+static tdb_ast_stmt *parse_stmt(P *p) {
   switch (p->cur.kind) {
-    case TK_SELECT: { tdb_stmt *s = new_stmt(p, ST_SELECT); s->u.select = parse_select(p); return s; }
+    case TK_SELECT: { tdb_ast_stmt *s = new_stmt(p, ST_SELECT); s->u.select = parse_select(p); return s; }
     case TK_INSERT: return parse_insert(p);
     case TK_UPDATE: return parse_update(p);
     case TK_DELETE: return parse_delete(p);
@@ -773,7 +773,7 @@ static tdb_stmt *parse_stmt(P *p) {
   }
 }
 
-int tdb_parse(tdb_arena *a, const char *sql, tdb_stmt **out, char **errmsg,
+int tdb_parse(tdb_arena *a, const char *sql, tdb_ast_stmt **out, char **errmsg,
               const char **tail) {
   P p;
   p.a = a; p.sql = sql; p.err = 0; p.errmsg = NULL;
@@ -782,7 +782,7 @@ int tdb_parse(tdb_arena *a, const char *sql, tdb_stmt **out, char **errmsg,
 
   if (p.cur.kind == TK_EOF) { if (errmsg) *errmsg = NULL; if (tail) *tail = p.cur.z; if (out) *out = NULL; return TDB_DONE; }
 
-  tdb_stmt *st = parse_stmt(&p);
+  tdb_ast_stmt *st = parse_stmt(&p);
   if (p.err) {
     if (errmsg) *errmsg = p.errmsg;
     if (tail) *tail = p.cur.z;
@@ -797,5 +797,25 @@ int tdb_parse(tdb_arena *a, const char *sql, tdb_stmt **out, char **errmsg,
   while (p.cur.kind == TK_SEMI) advance(&p);
   if (tail) *tail = p.cur.z;
   if (out) *out = st;
+  return TDB_OK;
+}
+
+int tdb_parse_expression(tdb_arena *a, const char *sql, tdb_expr **out,
+                         char **errmsg) {
+  P p;
+  p.a = a; p.sql = sql; p.err = 0; p.errmsg = NULL;
+  tdb_lex_init(&p.lx, sql, 0);
+  advance(&p);
+  tdb_expr *e = parse_expr(&p, 0);
+  if (p.err) {
+    if (errmsg) *errmsg = p.errmsg;
+    return TDB_ERROR;
+  }
+  if (p.cur.kind != TK_EOF) {
+    set_err(&p, "trailing tokens in expression");
+    if (errmsg) *errmsg = p.errmsg;
+    return TDB_ERROR;
+  }
+  if (out) *out = e;
   return TDB_OK;
 }

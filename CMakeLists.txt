@@ -43,6 +43,9 @@ target_include_directories(transactiondb
           "${CMAKE_SOURCE_DIR}/src/lua"
           "${CMAKE_SOURCE_DIR}/src/api")
 target_link_libraries(transactiondb PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+if(NOT WIN32)
+  target_link_libraries(transactiondb PUBLIC m)
+endif()
 tdb_set_warnings(transactiondb)
 
 if(TDB_BUILD_LUA)
@@ -67,7 +70,7 @@ endif()
 if(TDB_BUILD_TESTS)
   enable_testing()
   set(TDB_TESTS util value_record wal pager sqltype schema btree
-                mvcc lock engine catalog lexer parser)
+                mvcc lock engine catalog lexer parser exec)
   foreach(t ${TDB_TESTS})
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_${t}.c")
       add_executable(test_${t} "tests/test_${t}.c")

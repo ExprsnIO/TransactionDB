@@ -329,6 +329,27 @@ static void test_nested_savepoints(void) {
   tdb_close(db);
 }
 
+static void test_temporal(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER) WITH SYSTEM VERSIONING");
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t (id, v) VALUES (1, 10)"), TDB_OK);
+  int64_t v1 = scalar(db, "SELECT current_version()");   /* system time after insert */
+  exec(db, "UPDATE t SET v = 20 WHERE id = 1");
+  exec(db, "INSERT INTO t (id, v) VALUES (2, 99)");       /* didn't exist at v1 */
+
+  /* current state */
+  TDB_CHECK_EQ(scalar(db, "SELECT v FROM t WHERE id = 1"), 20);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 2);
+
+  /* AS OF v1: the row's old value, and row 2 absent */
+  char sql[160];
+  snprintf(sql, sizeof(sql), "SELECT v FROM t FOR SYSTEM_TIME AS OF %lld WHERE id = 1", (long long)v1);
+  TDB_CHECK_EQ(scalar(db, sql), 10);
+  snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM t FOR SYSTEM_TIME AS OF %lld", (long long)v1);
+  TDB_CHECK_EQ(scalar(db, sql), 1);
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"ddl_dml_select", test_ddl_dml_select},
   {"derived_and_view", test_derived_and_view},
@@ -337,6 +358,7 @@ static tdb_test_case cases[] = {
   {"index_persist", test_index_persist},
   {"savepoints", test_savepoints},
   {"nested_savepoints", test_nested_savepoints},
+  {"temporal", test_temporal},
   {"like_distinct", test_like_distinct},
   {"builtins", test_builtins},
   {"subqueries", test_subqueries},

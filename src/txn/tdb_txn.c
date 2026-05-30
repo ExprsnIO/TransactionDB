@@ -212,3 +212,12 @@ int tdb_txn_rollback(tdb_txn *t) {
 int tdb_txn_visible(tdb_txn *t, tdb_txnid xmin, tdb_txnid xmax) {
   return tdb_mvcc_visible(tdb_txnmgr_state, t->mgr, &t->snap, xmin, xmax);
 }
+
+int tdb_txn_visible_asof(tdb_txn *t, tdb_txnid xmin, tdb_txnid xmax, tdb_txnid asof) {
+  if (tdb_txnmgr_state(t->mgr, xmin) != TDB_XACT_COMMITTED) return 0;
+  if (xmin > asof) return 0;                       /* created after the as-of time */
+  if (xmax == 0) return 1;                         /* still current */
+  if (tdb_txnmgr_state(t->mgr, xmax) == TDB_XACT_COMMITTED && xmax <= asof)
+    return 0;                                      /* superseded by/at the as-of time */
+  return 1;
+}

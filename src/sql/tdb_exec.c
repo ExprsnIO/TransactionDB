@@ -75,10 +75,10 @@ static tdb_value *row_alloc(int ncol) {
 /* Materialize the rows of `t` visible to txn into `rs` (deep copies). If
 ** `idx` is non-NULL the scan is index-driven over `range`. */
 static int mat_table(tdb_db *db, tdb_table *t, tdb_index *idx,
-                     const tdb_keyrange *range, rowset *rs) {
+                     const tdb_keyrange *range, tdb_txnid as_of, rowset *rs) {
   rowset_init(rs, t->ncol);
   tdb_scan *sc;
-  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, idx, range, &sc);
+  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, idx, range, as_of, &sc);
   if (rc) return rc;
   tdb_rowid rid; const uint8_t *rec; int reclen;
   while ((rc = db->engine->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {
@@ -401,6 +401,8 @@ static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     if (!s || !sub) tdb_value_set_int(out, 0);
     else { const char *hit = strstr(s, sub); tdb_value_set_int(out, hit ? (int64_t)(hit - s) + 1 : 0); }
     tdb_value_clear(&v);
+  } else if (!strcasecmp(fn, "current_version") && argc == 0) {
+    tdb_value_set_int(out, (int64_t)tdb_pager_max_txnid(db->pager)); /* system-time clock */
   } else {
 #ifdef TDB_HAVE_LUA
     if (db->lua && tdb_catalog_find_routine(db->cat, fn)) {

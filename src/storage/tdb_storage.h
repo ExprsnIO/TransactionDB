@@ -52,7 +52,8 @@ typedef struct tdb_storage_vtab {
   ** when non-NULL, `range` (may be NULL) bounds the index's leading column.
   ** scan_next yields MVCC-visible rows only. */
   int  (*scan_open)(tdb_storage *s, tdb_txn *txn, tdb_table *t,
-                    tdb_index *use_idx, const tdb_keyrange *range, tdb_scan **out);
+                    tdb_index *use_idx, const tdb_keyrange *range,
+                    tdb_txnid as_of, tdb_scan **out);
   int  (*scan_next)(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec, int *reclen);
   void (*scan_close)(tdb_scan *sc);
 

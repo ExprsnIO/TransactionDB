@@ -73,8 +73,10 @@ static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *ta
     db->engine->vtab->next_rowid(db->engine, t, &rowid);
     if (pkc >= 0) tdb_value_set_int(&full[pkc], (int64_t)rowid);
   }
-  if (t->versioning == TDB_VERSIONING_SYSTEM && t->row_start_col >= 0)
-    tdb_value_set_int(&full[t->row_start_col], (int64_t)db->txn->id);
+  if (t->versioning == TDB_VERSIONING_SYSTEM) {
+    if (t->row_start_col >= 0) tdb_value_set_int(&full[t->row_start_col], (int64_t)db->txn->id);
+    if (t->row_end_col >= 0)   tdb_value_set_int(&full[t->row_end_col], INT64_MAX); /* open */
+  }
 
   int rc = finalize_row(db, st, t, full);
   if (!rc) {
@@ -149,7 +151,7 @@ typedef struct { tdb_rowid *rids; tdb_value **rows; int n, cap, ncol; } rrowset;
 static int mat_rid(tdb_db *db, tdb_table *t, rrowset *rr) {
   memset(rr, 0, sizeof(*rr)); rr->ncol = t->ncol;
   tdb_scan *sc;
-  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, &sc);
+  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, 0, &sc);
   if (rc) return rc;
   tdb_rowid rid; const uint8_t *rec; int reclen;
   while ((rc = db->engine->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {

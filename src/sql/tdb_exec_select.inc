@@ -156,7 +156,18 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
   tdb_select *sub = s->subquery;
   if (!sub && s->table) {
     tdb_table *t = tdb_catalog_find_table(db->cat, s->table);
-    if (t) { qs->tbl = t; qs->ncol = t->ncol; return mat_table(db, t, use_idx, range, set); }
+    if (t) {
+      qs->tbl = t; qs->ncol = t->ncol;
+      tdb_txnid as_of = 0;
+      if (s->as_of) {
+        ectx ec = { NULL, 0, NULL, 0, st };
+        tdb_value v; tdb_value_init(&v);
+        eval(db, &ec, s->as_of, &v);
+        as_of = (tdb_txnid)tdb_value_as_int(&v);
+        tdb_value_clear(&v);
+      }
+      return mat_table(db, t, use_idx, range, as_of, set);
+    }
     tdb_view *v = tdb_catalog_find_view(db->cat, s->table);
     if (!v) { tdb_db_seterr(db, "no such table: %s", s->table); return TDB_ERROR; }
     if (!qs->alias) qs->alias = v->name;

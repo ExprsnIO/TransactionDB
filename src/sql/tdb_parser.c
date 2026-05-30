@@ -290,7 +290,16 @@ static tdb_src *parse_src_item(P *p) {
   } else {
     s->table = dup_tok(p, &p->cur);
     expect(p, TK_ID, "expected table name");
-    s->alias = opt_alias(p);
+    /* FOR SYSTEM_TIME AS OF <expr> (temporal) — checked before an alias */
+    if (p->cur.kind == TK_FOR) {
+      advance(p);
+      expect(p, TK_ID, "expected SYSTEM_TIME");   /* SYSTEM_TIME is one identifier */
+      accept(p, TK_AS);
+      if (p->cur.kind == TK_ID) advance(p);        /* the word OF */
+      s->as_of = parse_expr(p, 0);
+    } else {
+      s->alias = opt_alias(p);
+    }
   }
   return s;
 }

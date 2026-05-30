@@ -68,6 +68,7 @@ typedef struct tdb_src {
   tdb_select    *subquery;  /* derived table */
   tdb_join_kind  join;      /* join to the PRECEDING source */
   tdb_expr      *on;        /* ON condition */
+  tdb_expr      *as_of;     /* FOR SYSTEM_TIME AS OF <expr>, or NULL */
   struct tdb_src *next;
 } tdb_src;
 

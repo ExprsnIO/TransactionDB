@@ -54,6 +54,11 @@ void tdb_txn_refresh_snapshot(tdb_txn *t);
 /* Test a row version's visibility under this transaction's snapshot. */
 int  tdb_txn_visible(tdb_txn *t, tdb_txnid xmin, tdb_txnid xmax);
 
+/* Test visibility as of system-version `asof` (FOR SYSTEM_TIME AS OF): the
+** version current at txn-time `asof` — xmin committed and <= asof, not yet
+** superseded by a committed txn <= asof. */
+int  tdb_txn_visible_asof(tdb_txn *t, tdb_txnid xmin, tdb_txnid xmax, tdb_txnid asof);
+
 /* Named savepoints (write transactions). RELEASE discards a savepoint and any
 ** nested inside it; ROLLBACK TO reverts to it (and keeps it). */
 int  tdb_txn_savepoint(tdb_txn *t, const char *name);

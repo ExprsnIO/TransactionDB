@@ -26,7 +26,15 @@
 
 #define MAXSRC 8
 
-typedef struct { tdb_table *tbl; const char *alias; int base; } qsrc;
+typedef struct {
+  tdb_table   *tbl;       /* base table, or NULL for a derived table / view */
+  const char  *alias;
+  int          base;      /* offset of this source's columns in the combined row */
+  int          ncol;
+  char       **colnames;  /* column names for a derived/view source (else NULL) */
+  int          join;      /* tdb_join_kind: join to the preceding source */
+  tdb_expr    *on;        /* ON condition (resolved), or NULL */
+} qsrc;
 typedef struct {
   qsrc      src[MAXSRC];
   int       nsrc;
@@ -92,11 +100,18 @@ static int resolve_column(tdb_db *db, qctx *q, tdb_expr *e) {
   for (int s = 0; s < q->nsrc; s++) {
     qsrc *src = &q->src[s];
     if (e->table) {
-      const char *nm = src->alias ? src->alias : src->tbl->name;
-      if (strcasecmp(nm, e->table) != 0) continue;
+      const char *nm = src->alias ? src->alias : (src->tbl ? src->tbl->name : NULL);
+      if (!nm || strcasecmp(nm, e->table) != 0) continue;
     }
-    int ci = tdb_table_find_column(src->tbl, e->name);
-    if (ci >= 0) { e->col_index = src->base + ci; return TDB_OK; }
+    if (src->tbl) {
+      int ci = tdb_table_find_column(src->tbl, e->name);
+      if (ci >= 0) { e->col_index = src->base + ci; return TDB_OK; }
+    } else {
+      for (int k = 0; k < src->ncol; k++)
+        if (src->colnames[k] && strcasecmp(src->colnames[k], e->name) == 0) {
+          e->col_index = src->base + k; return TDB_OK;
+        }
+    }
   }
   tdb_db_seterr(db, "no such column: %s", e->name);
   q->err = 1;
@@ -225,6 +240,16 @@ static int eval_binary(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     int m = like_match(p ? p : "", s ? s : "");
     if (e->negated) m = !m;
     tdb_value_set_int(out, m);
+    goto done;
+  }
+
+  if (op == TK_IS) {  /* NULL-aware: NULL IS NULL is true */
+    int eq;
+    if (l.type == TDB_VAL_NULL && r.type == TDB_VAL_NULL) eq = 1;
+    else if (l.type == TDB_VAL_NULL || r.type == TDB_VAL_NULL) eq = 0;
+    else eq = (tdb_value_compare(&l, &r, TDB_COLL_BINARY) == 0);
+    if (e->negated) eq = !eq;
+    tdb_value_set_int(out, eq);
     goto done;
   }
 
@@ -510,50 +535,90 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
   }
 }
 
-/* --------------------------- cross product ---------------------------- */
+/* ------------------------- left-deep nested join ---------------------- */
 
-/* recursively build the combined row across sources; emit when complete */
-typedef struct {
-  tdb_db *db; qctx *q; rowset *sets; tdb_value *combined; int ncol;
-  rowset *out; tdb_expr *filter; tdb_stmt *stmt;
-} combine_ctx;
+/* Fold the per-source row sets left-to-right into combined rows, applying each
+** source's join kind + ON, then the WHERE predicate. Supports INNER/CROSS and
+** LEFT/RIGHT/FULL outer joins (unmatched sides get NULL-padded). */
+static int join_build(tdb_db *db, tdb_stmt *st, qctx *q, rowset *sets,
+                      tdb_expr *where, rowset *out) {
+  int total = q->totalcols;
+  rowset acc; rowset_init(&acc, total);
 
-static int combine_rec(combine_ctx *cc, int level) {
-  if (level == cc->q->nsrc) {
-    if (cc->filter) {
-      ectx ec = { cc->combined, cc->ncol, NULL, 0, cc->stmt };
-      tdb_value v; tdb_value_init(&v);
-      eval(cc->db, &ec, cc->filter, &v);
-      int ok = val_true(&v);
-      tdb_value_clear(&v);
-      if (!ok) return TDB_OK;
+  for (int i = 0; i < sets[0].n; i++) {
+    tdb_value *row = row_alloc(total);
+    for (int k = 0; k < q->src[0].ncol; k++)
+      tdb_value_copy(&row[q->src[0].base + k], &sets[0].rows[i][k]);
+    rowset_add(&acc, row);
+  }
+
+  for (int s = 1; s < q->nsrc; s++) {
+    qsrc *src = &q->src[s];
+    int rn = sets[s].n;
+    char *rmatched = (char *)tdb_calloc((size_t)(rn ? rn : 1));
+    rowset next; rowset_init(&next, total);
+
+    for (int li = 0; li < acc.n; li++) {
+      int lmatched = 0;
+      for (int ri = 0; ri < rn; ri++) {
+        tdb_value *cand = acc.rows[li];
+        for (int k = 0; k < src->ncol; k++)
+          tdb_value_copy(&cand[src->base + k], &sets[s].rows[ri][k]);
+        int ok = 1;
+        if (src->on) {
+          ectx ec = { cand, total, NULL, 0, st };
+          tdb_value v; tdb_value_init(&v);
+          eval(db, &ec, src->on, &v);
+          ok = val_true(&v);
+          tdb_value_clear(&v);
+        }
+        if (ok) {
+          tdb_value *nr = row_alloc(total);
+          for (int k = 0; k < total; k++) tdb_value_copy(&nr[k], &cand[k]);
+          rowset_add(&next, nr);
+          lmatched = 1; rmatched[ri] = 1;
+        }
+      }
+      for (int k = 0; k < src->ncol; k++) tdb_value_set_null(&acc.rows[li][src->base + k]);
+      if (!lmatched && (src->join == JOIN_LEFT || src->join == JOIN_FULL)) {
+        tdb_value *nr = row_alloc(total);
+        for (int k = 0; k < total; k++) tdb_value_copy(&nr[k], &acc.rows[li][k]);
+        rowset_add(&next, nr);
+      }
     }
-    tdb_value *row = row_alloc(cc->ncol);
-    for (int i = 0; i < cc->ncol; i++) tdb_value_copy(&row[i], &cc->combined[i]);
-    rowset_add(cc->out, row);
-    return TDB_OK;
+    if (src->join == JOIN_RIGHT || src->join == JOIN_FULL) {
+      for (int ri = 0; ri < rn; ri++) if (!rmatched[ri]) {
+        tdb_value *nr = row_alloc(total);
+        for (int k = 0; k < src->ncol; k++)
+          tdb_value_copy(&nr[src->base + k], &sets[s].rows[ri][k]);
+        rowset_add(&next, nr);
+      }
+    }
+    tdb_mfree(rmatched);
+    rowset_free(&acc);
+    acc = next;
   }
-  qsrc *src = &cc->q->src[level];
-  rowset *rs = &cc->sets[level];
-  for (int i = 0; i < rs->n; i++) {
-    for (int k = 0; k < src->tbl->ncol; k++)
-      tdb_value_copy(&cc->combined[src->base + k], &rs->rows[i][k]);
-    int rc = combine_rec(cc, level + 1);
-    if (rc) return rc;
+
+  for (int i = 0; i < acc.n; i++) {
+    int ok = 1;
+    if (where) {
+      ectx ec = { acc.rows[i], total, NULL, 0, st };
+      tdb_value v; tdb_value_init(&v);
+      eval(db, &ec, where, &v);
+      ok = val_true(&v);
+      tdb_value_clear(&v);
+    }
+    if (ok) {
+      tdb_value *nr = row_alloc(total);
+      for (int k = 0; k < total; k++) tdb_value_copy(&nr[k], &acc.rows[i][k]);
+      rowset_add(out, nr);
+    }
   }
+  rowset_free(&acc);
   return TDB_OK;
 }
 
 /* ------------------------------ SELECT -------------------------------- */
-
-/* combine all ON conditions of inner joins + WHERE into one predicate list */
-static tdb_expr *and_join(tdb_arena *a, tdb_expr *x, tdb_expr *y) {
-  if (!x) return y;
-  if (!y) return x;
-  tdb_expr *e = tdb_expr_new(a, EX_BINARY);
-  e->op = TK_AND; e->left = x; e->right = y;
-  return e;
-}
 
 static void add_result_row(tdb_stmt *st, tdb_value *vals) {
   if (st->nrows == st->caprows) {

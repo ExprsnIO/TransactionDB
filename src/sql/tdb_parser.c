@@ -254,7 +254,8 @@ static tdb_expr *parse_expr(P *p, int minprec) {
       advance(p);
       int isnot = accept(p, TK_NOT);
       tdb_expr *e = tdb_expr_new(p->a, EX_BINARY);
-      e->op = isnot ? TK_NE : TK_EQ;
+      e->op = TK_IS;               /* NULL-aware equality (handled in eval) */
+      e->negated = isnot;
       e->left = left;
       e->right = parse_unary(p);   /* IS [NOT] NULL / value */
       left = e; continue;

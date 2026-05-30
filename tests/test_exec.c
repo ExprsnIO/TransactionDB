@@ -397,10 +397,51 @@ static void test_columnar_temporal_persist(void) {
   remove(path); remove("test_col.db-wal");
 }
 
+static void test_setops(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE a (x INTEGER PRIMARY KEY)");
+  exec(db, "CREATE TABLE b (x INTEGER PRIMARY KEY)");
+  exec(db, "INSERT INTO a VALUES (1),(2),(3)");
+  exec(db, "INSERT INTO b VALUES (2),(3),(4)");
+
+  /* via a derived table so we can count rows */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM (SELECT x FROM a UNION SELECT x FROM b) u"), 4);       /* 1,2,3,4 */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM (SELECT x FROM a UNION ALL SELECT x FROM b) u"), 6);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM (SELECT x FROM a INTERSECT SELECT x FROM b) u"), 2);   /* 2,3 */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM (SELECT x FROM a EXCEPT SELECT x FROM b) u"), 1);      /* 1 */
+
+  /* trailing ORDER BY/LIMIT binds to the whole union */
+  tdb_stmt *s;
+  tdb_prepare_v2(db, "SELECT x FROM a UNION SELECT x FROM b ORDER BY x DESC LIMIT 2", -1, &s, NULL);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW); TDB_CHECK_EQ(tdb_column_int(s, 0), 4);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW); TDB_CHECK_EQ(tdb_column_int(s, 0), 3);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+  tdb_close(db);
+}
+
+static void test_explain_vacuum(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)");
+  exec(db, "CREATE INDEX ia ON t(age)");
+  /* EXPLAIN returns a 'plan' result set */
+  tdb_stmt *s;
+  tdb_prepare_v2(db, "EXPLAIN SELECT * FROM t WHERE age = 5", -1, &s, NULL);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_STR(tdb_column_name(s, 0), "plan");
+  TDB_CHECK(strstr(tdb_column_text(s, 0), "INDEX") != NULL);  /* should choose ia */
+  tdb_finalize(s);
+  /* VACUUM runs (force checkpoint) */
+  TDB_CHECK_EQ(exec(db, "VACUUM"), TDB_OK);
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"ddl_dml_select", test_ddl_dml_select},
   {"derived_and_view", test_derived_and_view},
   {"outer_joins", test_outer_joins},
+  {"setops", test_setops},
+  {"explain_vacuum", test_explain_vacuum},
   {"index_scan", test_index_scan},
   {"index_persist", test_index_persist},
   {"savepoints", test_savepoints},

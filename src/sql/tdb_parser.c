@@ -366,6 +366,13 @@ static tdb_select *parse_select(P *p) {
     if (accept(p, TK_OFFSET)) s->offset = parse_expr(p, 0);
     else if (accept(p, TK_COMMA)) { s->offset = s->limit; s->limit = parse_expr(p, 0); }
   }
+  /* set operation: UNION [ALL|DISTINCT] / EXCEPT / INTERSECT */
+  if (p->cur.kind == TK_UNION || p->cur.kind == TK_EXCEPT || p->cur.kind == TK_INTERSECT) {
+    s->setop = p->cur.kind;
+    advance(p);
+    if (s->setop == TK_UNION) { if (accept(p, TK_ALL)) s->setop_all = 1; else accept(p, TK_DISTINCT); }
+    s->setop_next = parse_select(p);
+  }
   return s;
 }
 
@@ -789,6 +796,14 @@ static tdb_ast_stmt *parse_stmt(P *p) {
     case TK_PREPARE:return parse_prepare(p);
     case TK_BEGIN: case TK_COMMIT: case TK_ROLLBACK:
     case TK_SAVEPOINT: case TK_RELEASE: return parse_txn(p);
+    case TK_VACUUM: advance(p); return new_stmt(p, ST_VACUUM);
+    case TK_EXPLAIN: {
+      advance(p);
+      tdb_ast_stmt *inner = parse_stmt(p);
+      tdb_ast_stmt *s = new_stmt(p, ST_EXPLAIN);
+      s->u.explain.inner = inner;
+      return s;
+    }
     default: set_err(p, "unrecognized statement"); return NULL;
   }
 }

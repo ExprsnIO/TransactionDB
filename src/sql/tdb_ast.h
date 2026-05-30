@@ -89,6 +89,11 @@ struct tdb_select {
   int           has_limit;
   tdb_expr     *limit;
   tdb_expr     *offset;
+  /* set operation combining this SELECT with `setop_next` (TK_UNION /
+  ** TK_EXCEPT / TK_INTERSECT, 0 = none); setop_all = UNION ALL */
+  int           setop;
+  int           setop_all;
+  struct tdb_select *setop_next;
 };
 
 /* --------------------------- DDL: column defs ------------------------- */
@@ -135,7 +140,7 @@ typedef enum tdb_stmt_kind {
   ST_CREATE_TABLE, ST_DROP_TABLE, ST_CREATE_INDEX, ST_DROP_INDEX,
   ST_CREATE_VIEW, ST_DROP_VIEW, ST_CREATE_ROUTINE, ST_DROP_ROUTINE, ST_CALL,
   ST_BEGIN, ST_COMMIT, ST_ROLLBACK, ST_SAVEPOINT, ST_RELEASE, ST_ROLLBACK_TO,
-  ST_PREPARE, ST_ALTER_TABLE
+  ST_PREPARE, ST_ALTER_TABLE, ST_EXPLAIN, ST_VACUUM
 } tdb_stmt_kind;
 
 typedef struct tdb_ast_stmt {
@@ -181,6 +186,7 @@ typedef struct tdb_ast_stmt {
     struct { char *name; char *sql; } prepare;
 
     struct { char *table; int action; char *col; char *newname; tdb_coldef *add; } alter;
+    struct { struct tdb_ast_stmt *inner; } explain;
   } u;
 } tdb_ast_stmt;
 

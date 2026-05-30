@@ -21,6 +21,13 @@
 typedef struct tdb_storage tdb_storage;
 typedef struct tdb_scan    tdb_scan;
 
+/* Bounds on an index's leading column for an index-driven scan. */
+typedef struct tdb_keyrange {
+  int       has_lo, has_hi;   /* whether a lower / upper bound is present */
+  int       lo_incl, hi_incl; /* bound inclusivity */
+  tdb_value lo, hi;           /* bound values (compared to the leading column) */
+} tdb_keyrange;
+
 typedef struct tdb_storage_vtab {
   const char *name;
 
@@ -41,10 +48,11 @@ typedef struct tdb_storage_vtab {
   /* Allocate the next rowid for a table. */
   int (*next_rowid)(tdb_storage *s, tdb_table *t, tdb_rowid *out);
 
-  /* Scans — a volcano-style source. `use_idx` may be NULL (full table scan).
+  /* Scans — a volcano-style source. `use_idx` may be NULL (full table scan);
+  ** when non-NULL, `range` (may be NULL) bounds the index's leading column.
   ** scan_next yields MVCC-visible rows only. */
   int  (*scan_open)(tdb_storage *s, tdb_txn *txn, tdb_table *t,
-                    tdb_index *use_idx, tdb_scan **out);
+                    tdb_index *use_idx, const tdb_keyrange *range, tdb_scan **out);
   int  (*scan_next)(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec, int *reclen);
   void (*scan_close)(tdb_scan *sc);
 

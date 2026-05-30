@@ -38,6 +38,9 @@ static void test_persist_schema(void) {
     /* add a secondary index on amount */
     tdb_txn *d; tdb_txn_begin(tm, TDB_ISO_SNAPSHOT, 1, &d);
     s->vtab->create_table(s, d, t);
+    /* persist the table FIRST (no indexes yet) ... */
+    tdb_catalog_add_table(cat, t);
+    /* ... then add an index and rewrite the catalog row via update_table */
     tdb_index ix; memset(&ix, 0, sizeof(ix));
     ix.name = tdb_strdup("idx_amount");
     ix.ncol = 1;
@@ -45,8 +48,7 @@ static void test_persist_schema(void) {
     s->vtab->create_index(s, d, t, &ix);
     tdb_index *grown = (tdb_index *)tdb_realloc(t->indexes, sizeof(tdb_index));
     t->indexes = grown; t->indexes[0] = ix; t->nindex = 1;
-
-    tdb_catalog_add_table(cat, t);
+    tdb_catalog_update_table(cat, t);
     tdb_txn_commit(d);
 
     tdb_storage_close(s);

@@ -243,10 +243,49 @@ static void test_outer_joins(void) {
   tdb_close(db);
 }
 
+static void test_index_scan(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER, name TEXT)");
+  exec(db, "CREATE INDEX idx_age ON t(age)");
+  char sql[128];
+  for (int i = 1; i <= 50; i++) {
+    snprintf(sql, sizeof(sql), "INSERT INTO t VALUES (%d, %d, 'n')", i, i % 10);
+    exec(db, sql);
+  }
+  /* equality via index */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE age = 3"), 5);
+  /* range via index */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE age >= 8"), 10);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE age >= 3 AND age <= 4"), 10);
+  /* MVCC recheck: a stale index entry must not produce a wrong row */
+  exec(db, "UPDATE t SET age = 100 WHERE id = 3");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE age = 3"), 4);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE age = 100"), 1);
+  tdb_close(db);
+}
+
+static void test_index_persist(void) {
+  const char *path = "test_idx.db";
+  remove(path); remove("test_idx.db-wal");
+  tdb_db *db; tdb_open(path, &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)");
+  exec(db, "CREATE INDEX idx_age ON t(age)");   /* added after table creation */
+  exec(db, "INSERT INTO t VALUES (1,5),(2,5),(3,9)");
+  tdb_close(db);
+  /* reopen: index definition must have been persisted (catalog row rewrite) */
+  tdb_open(path, &db);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE age = 5"), 2);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE age = 9"), 1);
+  tdb_close(db);
+  remove(path); remove("test_idx.db-wal");
+}
+
 static tdb_test_case cases[] = {
   {"ddl_dml_select", test_ddl_dml_select},
   {"derived_and_view", test_derived_and_view},
   {"outer_joins", test_outer_joins},
+  {"index_scan", test_index_scan},
+  {"index_persist", test_index_persist},
   {"like_distinct", test_like_distinct},
   {"builtins", test_builtins},
   {"subqueries", test_subqueries},

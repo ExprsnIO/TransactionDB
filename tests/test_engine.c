@@ -40,7 +40,7 @@ static tdb_table *make_table(void) {
 }
 
 static int count_visible(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
-  tdb_scan *sc; s->vtab->scan_open(s, txn, t, NULL, &sc);
+  tdb_scan *sc; s->vtab->scan_open(s, txn, t, NULL, NULL, &sc);
   tdb_rowid rid; const uint8_t *rec; int n; int count = 0;
   while (s->vtab->scan_next(sc, &rid, &rec, &n) == TDB_ROW) count++;
   s->vtab->scan_close(sc);

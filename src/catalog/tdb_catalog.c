@@ -342,6 +342,40 @@ tdb_table *tdb_catalog_table_at(tdb_catalog *c, int i) { return c->tables[i]; }
 int tdb_catalog_routine_count(tdb_catalog *c) { return c->nroutine; }
 tdb_routine *tdb_catalog_routine_at(tdb_catalog *c, int i) { return c->routines[i]; }
 
+int tdb_catalog_update_table(tdb_catalog *c, tdb_table *t) {
+  tdb_btree *bt;
+  int rc = tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt);
+  if (rc) return rc;
+  tdb_cursor *cur;
+  rc = tdb_cursor_open(bt, &cur);
+  if (rc) { tdb_btree_close(bt); return rc; }
+
+  tdb_rowid target = 0; int found = 0;
+  for (tdb_cursor_first(cur); !tdb_cursor_eof(cur); tdb_cursor_next(cur)) {
+    const uint8_t *v; int n;
+    if (tdb_cursor_data(cur, &v, &n)) break;
+    if (n >= 1 && v[0] == CAT_TABLE) {
+      rd r = { v, n, 0, 0 };
+      r_u8(&r);
+      char *name = r_str(&r);
+      if (name && strcasecmp(name, t->name) == 0) {
+        tdb_cursor_rowid(cur, &target); found = 1; tdb_mfree(name); break;
+      }
+      tdb_mfree(name);
+    }
+  }
+  tdb_cursor_close(cur);
+
+  if (found) {
+    tdb_buf b; tdb_buf_init(&b);
+    ser_table(t, &b);
+    rc = tdb_btree_put(bt, target, b.data, (int)b.len);
+    tdb_buf_free(&b);
+  } else rc = TDB_NOTFOUND;
+  tdb_btree_close(bt);
+  return rc;
+}
+
 void tdb_catalog_drop_table(tdb_catalog *c, const char *name) {
   for (int i = 0; i < c->ntable; i++) {
     if (strcasecmp(c->tables[i]->name, name) == 0) {

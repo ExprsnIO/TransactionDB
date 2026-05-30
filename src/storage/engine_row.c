@@ -31,9 +31,18 @@ struct tdb_scan {
   tdb_table   *t;
   tdb_btree   *tbl;
   tdb_btree   *hist;
-  tdb_cursor  *cur;
+  tdb_cursor  *cur;        /* table cursor (full scan) or index cursor */
   tdb_buf      rec;   /* resolved record for the current row */
   tdb_buf      work;  /* working buffer for chain walking */
+
+  /* index-driven scan state (idx != NULL) */
+  tdb_index   *idx;
+  tdb_btree   *ixbt;
+  tdb_keyinfo  ki;
+  tdb_collation coll[34];
+  uint8_t      desc[34];
+  tdb_keyrange range;
+  int          has_range;
 };
 
 /* --------------------------- row header codec ------------------------- */
@@ -159,7 +168,7 @@ static int eng_create_index(tdb_storage *s, tdb_txn *txn, tdb_table *t,
   if (rc) return rc;
   /* Populate from currently-visible rows. */
   tdb_scan *sc;
-  rc = s->vtab->scan_open(s, txn, t, NULL, &sc);
+  rc = s->vtab->scan_open(s, txn, t, NULL, NULL, &sc);
   if (rc) return rc;
   tdb_rowid rid; const uint8_t *rec; int reclen;
   while ((rc = s->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {
@@ -247,8 +256,9 @@ static int eng_update(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_rowid rowi
     if (!rc) rc = tdb_btree_put(hist, vid, hbuf.data, (int)hbuf.len);
     tdb_buf_free(&hbuf);
   }
-  /* delete old index entries (built from the old record) */
-  if (!rc) rc = index_apply(e, t, orec, orl, rowid, 0);
+  /* Indexes are insert-only (the old key is retained): an MVCC reader on an
+  ** older snapshot may still need it. The index scan re-checks each fetched
+  ** row's visible version, so stale keys are filtered. (Reclaimed by vacuum.) */
 
   /* write the new live version */
   if (!rc) {
@@ -353,8 +363,8 @@ static int eng_seek_rowid(tdb_storage *s, tdb_txn *txn, tdb_table *t,
 }
 
 static int eng_scan_open(tdb_storage *s, tdb_txn *txn, tdb_table *t,
-                         tdb_index *use_idx, tdb_scan **out) {
-  TDB_UNUSED(use_idx); /* index-driven scans land with the planner (Phase 7) */
+                         tdb_index *use_idx, const tdb_keyrange *range,
+                         tdb_scan **out) {
   row_engine *e = (row_engine *)s->impl;
   tdb_scan *sc = (tdb_scan *)tdb_calloc(sizeof(*sc));
   if (!sc) return TDB_NOMEM;
@@ -362,15 +372,80 @@ static int eng_scan_open(tdb_storage *s, tdb_txn *txn, tdb_table *t,
   tdb_buf_init(&sc->rec); tdb_buf_init(&sc->work);
   int rc = tdb_btree_open(e->pager, t->root, TDB_BT_TABLE, NULL, &sc->tbl);
   if (!rc) rc = tdb_btree_open(e->pager, t->history_root, TDB_BT_TABLE, NULL, &sc->hist);
-  if (!rc) rc = tdb_cursor_open(sc->tbl, &sc->cur);
-  if (!rc) rc = tdb_cursor_first(sc->cur);
   if (rc) { s->vtab->scan_close(sc); return rc; }
+
+  if (use_idx) {
+    sc->idx = use_idx;
+    build_keyinfo(t, use_idx, &sc->ki, sc->coll, sc->desc);
+    rc = tdb_btree_open(e->pager, use_idx->root, TDB_BT_INDEX, &sc->ki, &sc->ixbt);
+    if (!rc) rc = tdb_cursor_open(sc->ixbt, &sc->cur);
+    if (rc) { s->vtab->scan_close(sc); return rc; }
+    if (range) { sc->range = *range; sc->has_range = 1; }
+    if (sc->has_range && sc->range.has_lo) {
+      tdb_buf kb; tdb_buf_init(&kb);
+      tdb_record_encode(&sc->range.lo, 1, &kb);
+      int cmp;
+      tdb_cursor_seek(sc->cur, kb.data, (int)kb.len, &cmp);
+      tdb_buf_free(&kb);
+    } else {
+      tdb_cursor_first(sc->cur);
+    }
+  } else {
+    rc = tdb_cursor_open(sc->tbl, &sc->cur);
+    if (!rc) rc = tdb_cursor_first(sc->cur);
+    if (rc) { s->vtab->scan_close(sc); return rc; }
+  }
   *out = sc;
   return TDB_OK;
 }
 
+/* index-driven scan: walk index entries in key order, fetch + MVCC-verify */
+static int scan_next_index(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec,
+                           int *reclen) {
+  row_engine *e = (row_engine *)sc->s->impl;
+  while (!tdb_cursor_eof(sc->cur)) {
+    const uint8_t *k; int kl;
+    if (tdb_cursor_key(sc->cur, &k, &kl)) break;
+    tdb_value cols[34]; int nc = 0;
+    if (tdb_record_decode(k, (size_t)kl, cols, 34, &nc) || nc < 1) { tdb_cursor_next(sc->cur); continue; }
+
+    int stop = 0, skip = 0;
+    if (sc->has_range && sc->range.has_hi) {
+      int c = tdb_value_compare(&cols[0], &sc->range.hi, TDB_COLL_BINARY);
+      if (c > 0 || (c == 0 && !sc->range.hi_incl)) stop = 1;
+    }
+    if (!stop && sc->has_range && sc->range.has_lo) {
+      int c = tdb_value_compare(&cols[0], &sc->range.lo, TDB_COLL_BINARY);
+      if (c < 0 || (c == 0 && !sc->range.lo_incl)) skip = 1;
+    }
+    tdb_rowid rid = (nc >= 1) ? (tdb_rowid)tdb_value_as_int(&cols[nc - 1]) : 0;
+    for (int i = 0; i < nc; i++) tdb_value_clear(&cols[i]);
+    if (stop) return TDB_DONE;
+    tdb_cursor_next(sc->cur);
+    if (skip) continue;
+
+    tdb_buf mainv; tdb_buf_init(&mainv);
+    int f = 0;
+    int rc = fetch_main(e, sc->tbl, rid, &mainv, &f);
+    if (!rc && f) {
+      int found = 0;
+      rc = resolve_visible(e, sc->txn, sc->tbl, sc->hist, mainv.data, (int)mainv.len,
+                           &sc->work, &sc->rec, &found);
+      if (!rc && found) {
+        tdb_buf_free(&mainv);
+        *rowid = rid; *rec = sc->rec.data; *reclen = (int)sc->rec.len;
+        return TDB_ROW;
+      }
+    }
+    tdb_buf_free(&mainv);
+    if (rc) return rc;
+  }
+  return TDB_DONE;
+}
+
 static int eng_scan_next(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec,
                          int *reclen) {
+  if (sc->idx) return scan_next_index(sc, rowid, rec, reclen);
   row_engine *e = (row_engine *)sc->s->impl;
   while (!tdb_cursor_eof(sc->cur)) {
     const uint8_t *v; int n;
@@ -394,6 +469,7 @@ static int eng_scan_next(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec,
 static void eng_scan_close(tdb_scan *sc) {
   if (!sc) return;
   if (sc->cur) tdb_cursor_close(sc->cur);
+  if (sc->ixbt) tdb_btree_close(sc->ixbt);
   if (sc->tbl) tdb_btree_close(sc->tbl);
   if (sc->hist) tdb_btree_close(sc->hist);
   tdb_buf_free(&sc->rec);

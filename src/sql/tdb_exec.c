@@ -10,6 +10,9 @@
 #include "../api/tdb_db.h"
 #include "tdb_analyze.h"
 #include "tdb_parser.h"
+#ifdef TDB_HAVE_LUA
+#include "../lua/tdb_lua.h"
+#endif
 #include "../common/tdb_mem.h"
 #include "../value/tdb_record.h"
 #include "../value/tdb_sqltype.h"
@@ -267,6 +270,19 @@ static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     }
     if (!found) tdb_value_set_null(out);
   } else {
+#ifdef TDB_HAVE_LUA
+    if (db->lua && tdb_catalog_find_routine(db->cat, fn)) {
+      tdb_value *args = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(argc ? argc : 1));
+      for (int i = 0; i < argc; i++) { tdb_value_init(&args[i]); eval(db, c, e->args->items[i], &args[i]); }
+      char *lerr = NULL;
+      int rc = tdb_lua_call_scalar(db->lua, fn, args, argc, out, &lerr);
+      for (int i = 0; i < argc; i++) tdb_value_clear(&args[i]);
+      tdb_mfree(args);
+      tdb_value_clear(&a0);
+      if (rc) { tdb_db_seterr(db, "%s", lerr ? lerr : "lua error"); tdb_mfree(lerr); return TDB_ERROR; }
+      return TDB_OK;
+    }
+#endif
     tdb_db_seterr(db, "no such function: %s", fn);
     tdb_value_clear(&a0);
     return TDB_ERROR;
@@ -473,6 +489,8 @@ int tdb_stmt_execute(tdb_stmt *st) {
     case ST_CREATE_INDEX: rc = exec_create_index(db, st, a); break;
     case ST_DROP_TABLE: case ST_DROP_INDEX: case ST_DROP_VIEW: rc = exec_drop(db, st, a); break;
     case ST_CREATE_VIEW: rc = exec_create_view(db, st, a); break;
+    case ST_CREATE_ROUTINE: rc = exec_create_routine(db, st, a); break;
+    case ST_CALL: rc = exec_call(db, st, a); break;
     default:
       tdb_db_seterr(db, "statement type not yet executable");
       rc = TDB_UNSUPPORTED;

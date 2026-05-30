@@ -339,6 +339,8 @@ tdb_routine *tdb_catalog_find_routine(tdb_catalog *c, const char *name) {
 }
 int tdb_catalog_table_count(tdb_catalog *c) { return c->ntable; }
 tdb_table *tdb_catalog_table_at(tdb_catalog *c, int i) { return c->tables[i]; }
+int tdb_catalog_routine_count(tdb_catalog *c) { return c->nroutine; }
+tdb_routine *tdb_catalog_routine_at(tdb_catalog *c, int i) { return c->routines[i]; }
 
 void tdb_catalog_drop_table(tdb_catalog *c, const char *name) {
   for (int i = 0; i < c->ntable; i++) {

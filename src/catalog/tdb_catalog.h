@@ -34,8 +34,10 @@ tdb_table   *tdb_catalog_find_table(tdb_catalog *c, const char *name);
 tdb_view    *tdb_catalog_find_view(tdb_catalog *c, const char *name);
 tdb_routine *tdb_catalog_find_routine(tdb_catalog *c, const char *name);
 
-int        tdb_catalog_table_count(tdb_catalog *c);
-tdb_table *tdb_catalog_table_at(tdb_catalog *c, int i);
+int          tdb_catalog_table_count(tdb_catalog *c);
+tdb_table   *tdb_catalog_table_at(tdb_catalog *c, int i);
+int          tdb_catalog_routine_count(tdb_catalog *c);
+tdb_routine *tdb_catalog_routine_at(tdb_catalog *c, int i);
 
 /* Remove a table from the in-memory cache (session-scoped; on-disk catalog
 ** row reclamation is left to a future vacuum/rewrite). */

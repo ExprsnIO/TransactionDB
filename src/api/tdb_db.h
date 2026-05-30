@@ -25,6 +25,7 @@ struct tdb_db {
   tdb_lockmgr *lm;
   tdb_txnmgr  *tm;
   tdb_storage *engine;
+  tdb_lua     *lua;        /* embedded Lua state (NULL if built without Lua) */
   tdb_txn     *txn;        /* the current transaction (auto or explicit) */
   int          autocommit; /* 1 = no explicit BEGIN in effect */
   int          flags;

@@ -104,4 +104,13 @@ if(TDB_BUILD_TESTS)
   target_include_directories(test_cpp PRIVATE
     "${CMAKE_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/tests")
   add_test(NAME cpp COMMAND test_cpp)
+
+  # Lua integration test (only when Lua is built in)
+  if(TDB_BUILD_LUA)
+    add_executable(test_lua tests/test_lua.c)
+    target_link_libraries(test_lua PRIVATE transactiondb)
+    target_include_directories(test_lua PRIVATE
+      "${CMAKE_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/tests")
+    add_test(NAME lua COMMAND test_lua)
+  endif()
 endif()

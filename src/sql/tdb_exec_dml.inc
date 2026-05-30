@@ -301,6 +301,66 @@ static int exec_create_view(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   return tdb_catalog_add_view(db->cat, v);
 }
 
+static int exec_create_routine(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st);
+#ifdef TDB_HAVE_LUA
+  /* wrap the body as a function value: function(<params>) <body> end */
+  tdb_buf w; tdb_buf_init(&w);
+  tdb_buf_append(&w, "function(", 9);
+  for (int i = 0; i < a->u.create_routine.nparams; i++) {
+    if (i) tdb_buf_putc(&w, ',');
+    tdb_buf_append(&w, a->u.create_routine.params[i], strlen(a->u.create_routine.params[i]));
+  }
+  tdb_buf_append(&w, ") ", 2);
+  const char *body = a->u.create_routine.lua_src ? a->u.create_routine.lua_src : "";
+  tdb_buf_append(&w, body, strlen(body));
+  tdb_buf_append(&w, " end", 4);
+  tdb_buf_putc(&w, '\0');
+
+  char *err = NULL;
+  int rc = tdb_lua_define(db->lua, a->u.create_routine.name, (char *)w.data, &err);
+  if (rc) { tdb_db_seterr(db, "%s", err ? err : "lua error"); tdb_mfree(err); tdb_buf_free(&w); return TDB_ERROR; }
+
+  tdb_routine *rt = (tdb_routine *)tdb_calloc(sizeof(*rt));
+  rt->name = tdb_strdup(a->u.create_routine.name);
+  rt->lua_src = tdb_strdup((char *)w.data);
+  rt->is_function = a->u.create_routine.is_function;
+  rt->nargs = a->u.create_routine.nparams;
+  tdb_buf_free(&w);
+  return tdb_catalog_add_routine(db->cat, rt);
+#else
+  TDB_UNUSED(a);
+  tdb_db_seterr(db, "Lua is not enabled in this build");
+  return TDB_UNSUPPORTED;
+#endif
+}
+
+static int exec_call(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+#ifdef TDB_HAVE_LUA
+  if (!tdb_catalog_find_routine(db->cat, a->u.call.name)) {
+    tdb_db_seterr(db, "no such routine: %s", a->u.call.name);
+    return TDB_ERROR;
+  }
+  qctx q; memset(&q, 0, sizeof(q));
+  int argc = a->u.call.args ? a->u.call.args->n : 0;
+  for (int i = 0; i < argc; i++)
+    if (resolve_expr(db, &q, a->u.call.args->items[i])) return TDB_ERROR;
+  tdb_value *args = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(argc ? argc : 1));
+  ectx ec = { NULL, 0, NULL, 0, st };
+  for (int i = 0; i < argc; i++) { tdb_value_init(&args[i]); eval(db, &ec, a->u.call.args->items[i], &args[i]); }
+  char *err = NULL;
+  int rc = tdb_lua_call_proc(db->lua, a->u.call.name, args, argc, &err);
+  for (int i = 0; i < argc; i++) tdb_value_clear(&args[i]);
+  tdb_mfree(args);
+  if (rc) { tdb_db_seterr(db, "%s", err ? err : "lua error"); tdb_mfree(err); return TDB_ERROR; }
+  return TDB_OK;
+#else
+  TDB_UNUSED(st); TDB_UNUSED(a);
+  tdb_db_seterr(db, "Lua is not enabled in this build");
+  return TDB_UNSUPPORTED;
+#endif
+}
+
 static int exec_txn(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
   int rc = TDB_OK;

@@ -99,10 +99,12 @@ void tdb_view_free(tdb_view *v) {
   if (!v) return;
   tdb_mfree(v->name);
   tdb_mfree(v->select_sql);
+  tdb_mfree(v);
 }
 
 void tdb_routine_free(tdb_routine *r) {
   if (!r) return;
   tdb_mfree(r->name);
   tdb_mfree(r->lua_src);
+  tdb_mfree(r);
 }

@@ -8,6 +8,9 @@
 #include "tdb_db.h"
 #include "../sql/tdb_parser.h"
 #include "../common/tdb_mem.h"
+#ifdef TDB_HAVE_LUA
+#include "../lua/tdb_lua.h"
+#endif
 
 #include <string.h>
 #include <stdio.h>
@@ -45,6 +48,16 @@ int tdb_open_v2(const char *filename, tdb_db **ppDb, int flags) {
   rc = tdb_engine_row_open(db->pager, &db->engine);
   if (rc) goto fail;
 
+#ifdef TDB_HAVE_LUA
+  rc = tdb_lua_open(db, &db->lua);
+  if (rc) goto fail;
+  /* re-register persisted routines */
+  for (int i = 0; i < tdb_catalog_routine_count(db->cat); i++) {
+    tdb_routine *rt = tdb_catalog_routine_at(db->cat, i);
+    tdb_lua_define(db->lua, rt->name, rt->lua_src, NULL);
+  }
+#endif
+
   *ppDb = db;
   return TDB_OK;
 fail:
@@ -55,6 +68,9 @@ fail:
 int tdb_close(tdb_db *db) {
   if (!db) return TDB_OK;
   if (db->txn) tdb_txn_rollback(db->txn);
+#ifdef TDB_HAVE_LUA
+  if (db->lua) tdb_lua_close(db->lua);
+#endif
   if (db->engine) tdb_storage_close(db->engine);
   if (db->tm) tdb_txnmgr_close(db->tm);
   if (db->lm) tdb_lockmgr_free(db->lm);

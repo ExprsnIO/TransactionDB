@@ -350,6 +350,53 @@ static void test_temporal(void) {
   tdb_close(db);
 }
 
+static void test_columnar(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  /* a columnar table behaves identically through SQL */
+  exec(db, "CREATE TABLE c (id INTEGER PRIMARY KEY, name TEXT, age INTEGER) WITH COLUMNAR");
+  exec(db, "INSERT INTO c VALUES (1,'alice',30),(2,'bob',25),(3,'carol',40)");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM c"), 3);
+  TDB_CHECK_EQ(scalar(db, "SELECT SUM(age) FROM c"), 95);
+  TDB_CHECK_EQ(scalar(db, "SELECT age FROM c WHERE name = 'bob'"), 25);
+  check_text(db, "SELECT name FROM c WHERE id = 3", "carol");
+
+  exec(db, "UPDATE c SET age = 31 WHERE id = 1");
+  TDB_CHECK_EQ(scalar(db, "SELECT age FROM c WHERE id = 1"), 31);
+  exec(db, "DELETE FROM c WHERE age < 30");           /* bob removed */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM c"), 2);
+
+  /* secondary index on a columnar table */
+  exec(db, "CREATE INDEX cage ON c(age)");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM c WHERE age = 40"), 1);
+
+  /* join a columnar table with a row table */
+  exec(db, "CREATE TABLE r (id INTEGER PRIMARY KEY, tag TEXT)");
+  exec(db, "INSERT INTO r VALUES (1,'X'),(3,'Y')");
+  check_text(db, "SELECT r.tag FROM c JOIN r ON c.id = r.id WHERE c.id = 3", "Y");
+  tdb_close(db);
+}
+
+static void test_columnar_temporal_persist(void) {
+  const char *path = "test_col.db";
+  remove(path); remove("test_col.db-wal");
+  tdb_db *db; tdb_open(path, &db);
+  exec(db, "CREATE TABLE cv (id INTEGER PRIMARY KEY, v INTEGER) WITH SYSTEM VERSIONING WITH COLUMNAR");
+  exec(db, "INSERT INTO cv (id, v) VALUES (1, 10)");
+  int64_t v1 = scalar(db, "SELECT current_version()");
+  exec(db, "UPDATE cv SET v = 20 WHERE id = 1");
+  TDB_CHECK_EQ(scalar(db, "SELECT v FROM cv WHERE id = 1"), 20);
+  char sql[160];
+  snprintf(sql, sizeof(sql), "SELECT v FROM cv FOR SYSTEM_TIME AS OF %lld WHERE id = 1", (long long)v1);
+  TDB_CHECK_EQ(scalar(db, sql), 10);                  /* columnar history via AS OF */
+  tdb_close(db);
+
+  /* reopen: columnar layout (col_roots) must persist */
+  tdb_open(path, &db);
+  TDB_CHECK_EQ(scalar(db, "SELECT v FROM cv WHERE id = 1"), 20);
+  tdb_close(db);
+  remove(path); remove("test_col.db-wal");
+}
+
 static tdb_test_case cases[] = {
   {"ddl_dml_select", test_ddl_dml_select},
   {"derived_and_view", test_derived_and_view},
@@ -359,6 +406,8 @@ static tdb_test_case cases[] = {
   {"savepoints", test_savepoints},
   {"nested_savepoints", test_nested_savepoints},
   {"temporal", test_temporal},
+  {"columnar", test_columnar},
+  {"columnar_temporal_persist", test_columnar_temporal_persist},
   {"like_distinct", test_like_distinct},
   {"builtins", test_builtins},
   {"subqueries", test_subqueries},

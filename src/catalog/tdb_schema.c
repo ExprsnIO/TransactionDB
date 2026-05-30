@@ -87,6 +87,7 @@ void tdb_table_free(tdb_table *t) {
   tdb_mfree(t->fkeys);
   for (int i = 0; i < t->nhistory; i++) layout_free(&t->history[i]);
   tdb_mfree(t->history);
+  tdb_mfree(t->col_roots);
   tdb_mfree(t->check_sql);
   tdb_mfree(t->before_insert_lua);
   tdb_mfree(t->before_update_lua);

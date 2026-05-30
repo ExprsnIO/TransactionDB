@@ -45,7 +45,7 @@ int tdb_open_v2(const char *filename, tdb_db **ppDb, int flags) {
   db->lm = tdb_lockmgr_new();
   rc = tdb_txnmgr_open(db->pager, db->lm, &db->tm);
   if (rc) goto fail;
-  rc = tdb_engine_row_open(db->pager, &db->engine);
+  rc = tdb_engine_open(db->pager, &db->engine);   /* row + columnar dispatcher */
   if (rc) goto fail;
 
 #ifdef TDB_HAVE_LUA

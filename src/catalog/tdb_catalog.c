@@ -103,6 +103,11 @@ static void ser_table(const tdb_table *t, tdb_buf *b) {
       w_u8(b, ix->desc ? ix->desc[j] : 0);
     }
   }
+
+  /* storage engine + columnar per-column b-tree roots */
+  w_u8(b, (uint8_t)t->columnar);
+  w_var(b, (uint64_t)t->ncol_roots);
+  for (int i = 0; i < t->ncol_roots; i++) w_u32(b, t->col_roots[i]);
 }
 
 static tdb_table *deser_table(rd *r) {
@@ -164,6 +169,13 @@ static tdb_table *deser_table(rd *r) {
     tdb_index *grown = (tdb_index *)tdb_realloc(t->indexes,
         sizeof(tdb_index) * (size_t)(t->nindex + 1));
     if (grown) { t->indexes = grown; t->indexes[t->nindex++] = ix; }
+  }
+
+  t->columnar = r_u8(r);
+  t->ncol_roots = (int)r_var(r);
+  if (t->ncol_roots > 0) {
+    t->col_roots = (tdb_pgno *)tdb_malloc(sizeof(tdb_pgno) * (size_t)t->ncol_roots);
+    for (int i = 0; i < t->ncol_roots; i++) t->col_roots[i] = r_u32(r);
   }
   return t;
 }

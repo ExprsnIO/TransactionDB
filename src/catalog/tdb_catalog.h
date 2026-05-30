@@ -43,4 +43,8 @@ tdb_routine *tdb_catalog_routine_at(tdb_catalog *c, int i);
 ** row reclamation is left to a future vacuum/rewrite). */
 void       tdb_catalog_drop_table(tdb_catalog *c, const char *name);
 
+/* Rewrite a table's persisted catalog row (e.g. after CREATE INDEX adds an
+** index to an existing table). */
+int        tdb_catalog_update_table(tdb_catalog *c, tdb_table *t);
+
 #endif /* TDB_CATALOG_H */

@@ -76,10 +76,79 @@ static void accum_result(const accum *ac, tdb_expr *agg, tdb_value *out) {
   } else tdb_value_set_null(out);
 }
 
+/* ----------------------- rule-based index selection ------------------- */
+
+static int expr_is_const(const tdb_expr *e) {
+  return e && (e->kind == EX_LITERAL || e->kind == EX_NULL || e->kind == EX_PARAM);
+}
+static int flip_op(int op) {
+  switch (op) {
+    case TK_LT: return TK_GT; case TK_LE: return TK_GE;
+    case TK_GT: return TK_LT; case TK_GE: return TK_LE;
+    default: return op;
+  }
+}
+
+/* Examine a predicate (descending top-level ANDs) for `lead OP const` and fold
+** the bound into the range; sets *got when any usable bound is found. */
+static void apply_pred(tdb_db *db, tdb_stmt *st, const char *lead, tdb_expr *p,
+                       tdb_keyrange *r, int *got) {
+  if (!p) return;
+  if (p->kind == EX_BINARY && p->op == TK_AND) {
+    apply_pred(db, st, lead, p->left, r, got);
+    apply_pred(db, st, lead, p->right, r, got);
+    return;
+  }
+  if (p->kind != EX_BINARY) return;
+  int op = p->op;
+  tdb_expr *L = p->left, *R = p->right, *val = NULL;
+  if (L && L->kind == EX_COLUMN && !L->table && L->name && !strcasecmp(L->name, lead) && expr_is_const(R)) {
+    val = R;
+  } else if (R && R->kind == EX_COLUMN && !R->table && R->name && !strcasecmp(R->name, lead) && expr_is_const(L)) {
+    val = L; op = flip_op(op);
+  } else return;
+
+  tdb_value v; tdb_value_init(&v);
+  ectx ec = { NULL, 0, NULL, 0, st };
+  eval(db, &ec, val, &v);
+  if (v.type == TDB_VAL_NULL) { tdb_value_clear(&v); return; }
+  switch (op) {
+    case TK_EQ:
+      tdb_value_clear(&r->lo); tdb_value_copy(&r->lo, &v); r->has_lo = 1; r->lo_incl = 1;
+      tdb_value_clear(&r->hi); tdb_value_copy(&r->hi, &v); r->has_hi = 1; r->hi_incl = 1; *got = 1; break;
+    case TK_GT: tdb_value_clear(&r->lo); tdb_value_copy(&r->lo, &v); r->has_lo = 1; r->lo_incl = 0; *got = 1; break;
+    case TK_GE: tdb_value_clear(&r->lo); tdb_value_copy(&r->lo, &v); r->has_lo = 1; r->lo_incl = 1; *got = 1; break;
+    case TK_LT: tdb_value_clear(&r->hi); tdb_value_copy(&r->hi, &v); r->has_hi = 1; r->hi_incl = 0; *got = 1; break;
+    case TK_LE: tdb_value_clear(&r->hi); tdb_value_copy(&r->hi, &v); r->has_hi = 1; r->hi_incl = 1; *got = 1; break;
+    default: break;
+  }
+  tdb_value_clear(&v);
+}
+
+/* Choose an index whose leading column has an equality/range predicate in
+** WHERE. Returns 1 and fills *out_idx / *out_range on success. */
+static int pick_index(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_expr *where,
+                      tdb_index **out_idx, tdb_keyrange *out_range) {
+  if (!where) return 0;
+  for (int xi = 0; xi < t->nindex; xi++) {
+    tdb_index *ix = &t->indexes[xi];
+    if (ix->ncol < 1) continue;
+    const char *lead = t->cols[ix->col_idx[0]].name;
+    tdb_keyrange r; memset(&r, 0, sizeof(r));
+    tdb_value_init(&r.lo); tdb_value_init(&r.hi);
+    int got = 0;
+    apply_pred(db, st, lead, where, &r, &got);
+    if (got) { *out_idx = ix; *out_range = r; return 1; }
+    tdb_value_clear(&r.lo); tdb_value_clear(&r.hi);
+  }
+  return 0;
+}
+
 /* Resolve a FROM item (base table / derived table / view) and materialize its
 ** rows into `set`, filling Q->src[idx] (caller advances totalcols/nsrc). */
 static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
-                              tdb_src *s, rowset *set) {
+                              tdb_src *s, tdb_index *use_idx,
+                              const tdb_keyrange *range, rowset *set) {
   qsrc *qs = &Q->src[idx];
   memset(qs, 0, sizeof(*qs));
   qs->alias = s->alias; qs->base = Q->totalcols; qs->join = s->join; qs->on = s->on;
@@ -87,7 +156,7 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
   tdb_select *sub = s->subquery;
   if (!sub && s->table) {
     tdb_table *t = tdb_catalog_find_table(db->cat, s->table);
-    if (t) { qs->tbl = t; qs->ncol = t->ncol; return mat_table(db, t, set); }
+    if (t) { qs->tbl = t; qs->ncol = t->ncol; return mat_table(db, t, use_idx, range, set); }
     tdb_view *v = tdb_catalog_find_view(db->cat, s->table);
     if (!v) { tdb_db_seterr(db, "no such table: %s", s->table); return TDB_ERROR; }
     if (!qs->alias) qs->alias = v->name;
@@ -123,22 +192,36 @@ static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   qctx Q; memset(&Q, 0, sizeof(Q));
   rowset sets[MAXSRC];
 
+  /* rule-based index pick: a lone base table with an indexable WHERE */
+  tdb_index *use_idx = NULL; tdb_keyrange krange; int have_idx = 0;
+  tdb_value_init(&krange.lo); tdb_value_init(&krange.hi);
+  if (q->from && !q->from->next && !q->from->subquery && q->from->table) {
+    tdb_table *bt = tdb_catalog_find_table(db->cat, q->from->table);
+    if (bt && bt->nindex > 0 && pick_index(db, st, bt, q->where, &use_idx, &krange))
+      have_idx = 1;
+  }
+
   /* 1. sources: base table / derived table / view — materialize each */
   for (tdb_src *s = q->from; s; s = s->next) {
     if (Q.nsrc >= MAXSRC) {
       tdb_db_seterr(db, "too many tables in FROM");
       for (int j = 0; j < Q.nsrc; j++) rowset_free(&sets[j]);
+      tdb_value_clear(&krange.lo); tdb_value_clear(&krange.hi);
       return TDB_ERROR;
     }
     int idx = Q.nsrc;
-    int rc = materialize_source(db, st, &Q, idx, s, &sets[idx]);
-    if (rc) { for (int j = 0; j < Q.nsrc; j++) rowset_free(&sets[j]); return rc; }
+    tdb_index *si = (idx == 0 && have_idx) ? use_idx : NULL;
+    const tdb_keyrange *sr = (idx == 0 && have_idx) ? &krange : NULL;
+    int rc = materialize_source(db, st, &Q, idx, s, si, sr, &sets[idx]);
+    if (rc) { for (int j = 0; j < Q.nsrc; j++) rowset_free(&sets[j]);
+              tdb_value_clear(&krange.lo); tdb_value_clear(&krange.hi); return rc; }
     Q.totalcols += Q.src[idx].ncol;
     Q.nsrc++;
   }
 
   /* 2. resolve ON conditions + clauses (collect aggregates) */
-  #define FAIL_SETS do { for (int j = 0; j < Q.nsrc; j++) rowset_free(&sets[j]); } while (0)
+  #define FAIL_SETS do { for (int j = 0; j < Q.nsrc; j++) rowset_free(&sets[j]); \
+    tdb_value_clear(&krange.lo); tdb_value_clear(&krange.hi); } while (0)
   for (int s = 0; s < Q.nsrc; s++)
     if (Q.src[s].on && resolve_expr(db, &Q, Q.src[s].on)) { FAIL_SETS; return TDB_ERROR; }
   if (q->where && resolve_expr(db, &Q, q->where)) { FAIL_SETS; return TDB_ERROR; }
@@ -325,6 +408,7 @@ static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   }
   tdb_mfree(outrows); tdb_mfree(outkeys);
   tdb_mfree(oexpr);
+  tdb_value_clear(&krange.lo); tdb_value_clear(&krange.hi);
   st->cur = -1;
   return rc;
   #undef ADD_OUT

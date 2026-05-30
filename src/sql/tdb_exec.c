@@ -72,11 +72,13 @@ static tdb_value *row_alloc(int ncol) {
 
 /* ---------------------------- materialize ----------------------------- */
 
-/* Materialize all rows of `t` visible to txn into `rs` (deep copies). */
-static int mat_table(tdb_db *db, tdb_table *t, rowset *rs) {
+/* Materialize the rows of `t` visible to txn into `rs` (deep copies). If
+** `idx` is non-NULL the scan is index-driven over `range`. */
+static int mat_table(tdb_db *db, tdb_table *t, tdb_index *idx,
+                     const tdb_keyrange *range, rowset *rs) {
   rowset_init(rs, t->ncol);
   tdb_scan *sc;
-  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, &sc);
+  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, idx, range, &sc);
   if (rc) return rc;
   tdb_rowid rid; const uint8_t *rec; int reclen;
   while ((rc = db->engine->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {

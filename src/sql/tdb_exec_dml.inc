@@ -149,7 +149,7 @@ typedef struct { tdb_rowid *rids; tdb_value **rows; int n, cap, ncol; } rrowset;
 static int mat_rid(tdb_db *db, tdb_table *t, rrowset *rr) {
   memset(rr, 0, sizeof(*rr)); rr->ncol = t->ncol;
   tdb_scan *sc;
-  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, &sc);
+  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, &sc);
   if (rc) return rc;
   tdb_rowid rid; const uint8_t *rec; int reclen;
   while ((rc = db->engine->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {
@@ -287,6 +287,8 @@ static int exec_create_index(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   t->indexes[t->nindex] = ix;
   t->nindex++;
   int rc = db->engine->vtab->create_index(db->engine, db->txn, t, &t->indexes[t->nindex - 1]);
+  /* persist the new index by rewriting the table's catalog row */
+  if (!rc) rc = tdb_catalog_update_table(db->cat, t);
   return rc;
 }
 

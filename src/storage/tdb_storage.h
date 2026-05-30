@@ -51,9 +51,11 @@ typedef struct tdb_storage_vtab {
   /* Scans — a volcano-style source. `use_idx` may be NULL (full table scan);
   ** when non-NULL, `range` (may be NULL) bounds the index's leading column.
   ** scan_next yields MVCC-visible rows only. */
+  /* `colmask` (may be NULL = all) is a per-column needed-flag for projection
+  ** pushdown; the columnar engine reads only the marked columns. */
   int  (*scan_open)(tdb_storage *s, tdb_txn *txn, tdb_table *t,
                     tdb_index *use_idx, const tdb_keyrange *range,
-                    tdb_txnid as_of, tdb_scan **out);
+                    tdb_txnid as_of, const uint8_t *colmask, tdb_scan **out);
   int  (*scan_next)(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec, int *reclen);
   void (*scan_close)(tdb_scan *sc);
 

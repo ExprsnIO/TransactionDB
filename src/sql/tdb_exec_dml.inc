@@ -151,7 +151,7 @@ typedef struct { tdb_rowid *rids; tdb_value **rows; int n, cap, ncol; } rrowset;
 static int mat_rid(tdb_db *db, tdb_table *t, rrowset *rr) {
   memset(rr, 0, sizeof(*rr)); rr->ncol = t->ncol;
   tdb_scan *sc;
-  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, 0, &sc);
+  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, 0, NULL, &sc);
   if (rc) return rc;
   tdb_rowid rid; const uint8_t *rec; int reclen;
   while ((rc = db->engine->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {

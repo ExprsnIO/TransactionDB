@@ -169,7 +169,7 @@ static int eng_create_index(tdb_storage *s, tdb_txn *txn, tdb_table *t,
   if (rc) return rc;
   /* Populate from currently-visible rows. */
   tdb_scan *sc;
-  rc = s->vtab->scan_open(s, txn, t, NULL, NULL, 0, &sc);
+  rc = s->vtab->scan_open(s, txn, t, NULL, NULL, 0, NULL, &sc);
   if (rc) return rc;
   tdb_rowid rid; const uint8_t *rec; int reclen;
   while ((rc = s->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {
@@ -367,7 +367,8 @@ static int eng_seek_rowid(tdb_storage *s, tdb_txn *txn, tdb_table *t,
 
 static int eng_scan_open(tdb_storage *s, tdb_txn *txn, tdb_table *t,
                          tdb_index *use_idx, const tdb_keyrange *range,
-                         tdb_txnid as_of, tdb_scan **out) {
+                         tdb_txnid as_of, const uint8_t *colmask, tdb_scan **out) {
+  TDB_UNUSED(colmask); /* row engine stores whole rows; pushdown is a no-op */
   row_engine *e = (row_engine *)s->impl;
   tdb_scan *sc = (tdb_scan *)tdb_calloc(sizeof(*sc));
   if (!sc) return TDB_NOMEM;

@@ -32,6 +32,7 @@ struct tdb_scan {
   tdb_cursor  *cur;
   tdb_buf      rec, work;
   tdb_txnid    as_of;
+  const uint8_t *colmask;   /* projection pushdown: NULL = all columns */
 };
 
 /* ----------------------- header codec (row-format) -------------------- */
@@ -91,12 +92,17 @@ static void col_get(col_engine *e, tdb_pgno root, tdb_rowid rowid, tdb_value *ou
   tdb_btree_close(bt);
 }
 
-/* reassemble the current row record from the per-column b-trees */
-static int reassemble(col_engine *e, tdb_table *t, tdb_rowid rowid, tdb_buf *out) {
+/* reassemble the current row record from the per-column b-trees; if `colmask`
+** is non-NULL, only the marked columns are read (others left NULL) */
+static int reassemble(col_engine *e, tdb_table *t, tdb_rowid rowid,
+                      const uint8_t *colmask, tdb_buf *out) {
   int nc = t->ncol < t->ncol_roots ? t->ncol : t->ncol_roots;
   tdb_value vals[64];
   if (nc > 64) nc = 64;
-  for (int i = 0; i < nc; i++) col_get(e, t->col_roots[i], rowid, &vals[i]);
+  for (int i = 0; i < nc; i++) {
+    if (colmask && !colmask[i]) tdb_value_init(&vals[i]);   /* pruned -> NULL */
+    else col_get(e, t->col_roots[i], rowid, &vals[i]);
+  }
   tdb_buf_reset(out);
   int rc = tdb_record_encode(vals, nc, out);
   for (int i = 0; i < nc; i++) tdb_value_clear(&vals[i]);
@@ -150,13 +156,13 @@ static int index_insert(col_engine *e, tdb_table *t, const uint8_t *rec, int rec
 /* resolve the version of `rowid` visible to txn/as_of into `out` */
 static int resolve_col(col_engine *e, tdb_txn *txn, tdb_table *t, tdb_rowid rowid,
                        const uint8_t *metaval, int metalen, tdb_buf *out,
-                       int *found, tdb_txnid as_of) {
+                       int *found, tdb_txnid as_of, const uint8_t *colmask) {
   *found = 0;
   tdb_txnid xmin, xmax; uint64_t prev; int rl;
   get_hdr(metaval, metalen, &xmin, &xmax, &prev, &rl);
   int vis = as_of ? tdb_txn_visible_asof(txn, xmin, xmax, as_of)
                   : tdb_txn_visible(txn, xmin, xmax);
-  if (vis) { *found = 1; return reassemble(e, t, rowid, out); }
+  if (vis) { *found = 1; return reassemble(e, t, rowid, colmask, out); }
   if (prev == 0) return TDB_OK;
 
   /* walk the history chain (full records) */
@@ -275,9 +281,9 @@ static int ceng_update(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_rowid row
   get_hdr(meta.data, (int)meta.len, &oxmin, &oxmax, &oprev, &orl);
   tdb_buf_free(&meta);
 
-  /* push the old full version to history */
+  /* push the old full version to history (all columns) */
   tdb_buf old; tdb_buf_init(&old);
-  rc = reassemble(e, t, rowid, &old);
+  rc = reassemble(e, t, rowid, NULL, &old);
   tdb_btree *hist; if (!rc) rc = tdb_btree_open(e->pager, t->history_root, TDB_BT_TABLE, NULL, &hist);
   if (rc) { tdb_buf_free(&old); return rc; }
   tdb_rowid vid = 0; tdb_btree_max_rowid(hist, &vid); vid += 1;
@@ -323,7 +329,7 @@ static int ceng_seek_rowid(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_rowid
   tdb_buf meta; tdb_buf_init(&meta); int mf = 0;
   int rc = meta_get(e, t, rowid, &meta, &mf);
   if (!rc && mf) {
-    rc = resolve_col(e, txn, t, rowid, meta.data, (int)meta.len, &e->scratch, found, 0);
+    rc = resolve_col(e, txn, t, rowid, meta.data, (int)meta.len, &e->scratch, found, 0, NULL);
     if (!rc && *found) { *rec = e->scratch.data; *reclen = (int)e->scratch.len; }
   }
   tdb_buf_free(&meta);
@@ -332,12 +338,12 @@ static int ceng_seek_rowid(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_rowid
 
 static int ceng_scan_open(tdb_storage *s, tdb_txn *txn, tdb_table *t,
                           tdb_index *use_idx, const tdb_keyrange *range,
-                          tdb_txnid as_of, tdb_scan **out) {
+                          tdb_txnid as_of, const uint8_t *colmask, tdb_scan **out) {
   TDB_UNUSED(use_idx); TDB_UNUSED(range); /* columnar index scans: future */
   col_engine *e = (col_engine *)s->impl;
   tdb_scan *sc = (tdb_scan *)tdb_calloc(sizeof(*sc));
   if (!sc) return TDB_NOMEM;
-  sc->s = s; sc->txn = txn; sc->t = t; sc->as_of = as_of;
+  sc->s = s; sc->txn = txn; sc->t = t; sc->as_of = as_of; sc->colmask = colmask;
   tdb_buf_init(&sc->rec); tdb_buf_init(&sc->work);
   int rc = tdb_btree_open(e->pager, t->root, TDB_BT_TABLE, NULL, &sc->meta);
   if (!rc) rc = tdb_cursor_open(sc->meta, &sc->cur);
@@ -359,7 +365,7 @@ static int ceng_scan_next(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec, i
     tdb_cursor_next(sc->cur);
     int found = 0;
     int rc = resolve_col(e, sc->txn, sc->t, rid, sc->work.data, (int)sc->work.len,
-                         &sc->rec, &found, sc->as_of);
+                         &sc->rec, &found, sc->as_of, sc->colmask);
     if (rc) return rc;
     if (found) { *rowid = rid; *rec = sc->rec.data; *reclen = (int)sc->rec.len; return TDB_ROW; }
   }
@@ -378,7 +384,7 @@ static int ceng_create_index(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_ind
   col_engine *e = (col_engine *)s->impl;
   int rc = tdb_btree_create(e->pager, TDB_BT_INDEX, &ix->root);
   if (rc) return rc;
-  tdb_scan *sc; rc = s->vtab->scan_open(s, txn, t, NULL, NULL, 0, &sc);
+  tdb_scan *sc; rc = s->vtab->scan_open(s, txn, t, NULL, NULL, 0, NULL, &sc);
   if (rc) return rc;
   tdb_rowid rid; const uint8_t *rec; int reclen;
   while ((rc = s->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW)

@@ -436,12 +436,26 @@ static void test_explain_vacuum(void) {
   tdb_close(db);
 }
 
+static void test_projection_pushdown(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  /* columnar: queries that touch a subset of columns read only those column
+  ** b-trees (projection pushdown); results must remain correct */
+  exec(db, "CREATE TABLE c (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, note TEXT) WITH COLUMNAR");
+  exec(db, "INSERT INTO c VALUES (1,10,100,'x'),(2,20,200,'y'),(3,30,300,'z')");
+  TDB_CHECK_EQ(scalar(db, "SELECT SUM(a) FROM c"), 60);              /* only column a */
+  TDB_CHECK_EQ(scalar(db, "SELECT b FROM c WHERE a = 20"), 200);     /* columns a,b */
+  check_text(db, "SELECT note FROM c WHERE id = 3", "z");            /* columns id,note */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM c"), 3);             /* no columns */
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"ddl_dml_select", test_ddl_dml_select},
   {"derived_and_view", test_derived_and_view},
   {"outer_joins", test_outer_joins},
   {"setops", test_setops},
   {"explain_vacuum", test_explain_vacuum},
+  {"projection_pushdown", test_projection_pushdown},
   {"index_scan", test_index_scan},
   {"index_persist", test_index_persist},
   {"savepoints", test_savepoints},

@@ -65,7 +65,9 @@ static void test_record_roundtrip(void) {
   TDB_CHECK_EQ(ncols, 5);
   TDB_CHECK_EQ(tdb_value_as_int(&out[0]), -1000000);
   TDB_CHECK(tdb_value_as_real(&out[1]) > 3.14 && tdb_value_as_real(&out[1]) < 3.15);
-  TDB_CHECK_STR(tdb_value_as_text(&out[2]), "transaction");
+  /* decoded text is borrowed (not NUL-terminated): compare by length */
+  TDB_CHECK_EQ(out[2].u.s.n, 11);
+  TDB_CHECK(memcmp(out[2].u.s.p, "transaction", 11) == 0);
   TDB_CHECK_EQ(out[3].type, TDB_VAL_NULL);
   TDB_CHECK_EQ(tdb_value_as_int(&out[4]), 1);
 

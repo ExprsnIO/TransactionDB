@@ -146,12 +146,43 @@ typedef struct {
 } ectx;
 
 static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out);
+static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q);
+
+/* Run an (uncorrelated) subquery into a throwaway statement. The caller reads
+** tmp->rows / nrows / ncol, then calls tdb_stmt_clear_results(tmp). The arena
+** and bound params are shared with the parent (not freed here). */
+static int run_subselect(tdb_db *db, tdb_stmt *parent, tdb_select *q, tdb_stmt *tmp) {
+  memset(tmp, 0, sizeof(*tmp));
+  tmp->db = db; tmp->arena = parent->arena;
+  tmp->params = parent->params; tmp->nparams = parent->nparams;
+  tmp->cur = -1; tmp->is_select = 1;
+  return exec_select(db, tmp, q);
+}
 
 static int val_true(const tdb_value *v) {
   if (v->type == TDB_VAL_NULL) return 0;
   if (v->type == TDB_VAL_INT) return v->u.i != 0;
   if (v->type == TDB_VAL_REAL) return v->u.r != 0;
   return v->u.s.n != 0;
+}
+
+/* SQL LIKE: '%' matches any run, '_' matches one char (case-insensitive). */
+static int like_match(const char *pat, const char *str) {
+  while (*pat) {
+    if (*pat == '%') {
+      while (*pat == '%') pat++;
+      if (!*pat) return 1;
+      for (; *str; str++) if (like_match(pat, str)) return 1;
+      return 0;
+    } else if (*pat == '_') {
+      if (!*str) return 0;
+      pat++; str++;
+    } else {
+      if (tolower((unsigned char)*pat) != tolower((unsigned char)*str)) return 0;
+      pat++; str++;
+    }
+  }
+  return *str == 0;
 }
 
 static int eval_binary(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
@@ -185,6 +216,15 @@ static int eval_binary(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
       tdb_value_set_text(out, buf, (int)(na + nb), 1);
       tdb_mfree(buf);
     }
+    goto done;
+  }
+
+  if (op == TK_LIKE) {
+    if (l.type == TDB_VAL_NULL || r.type == TDB_VAL_NULL) { tdb_value_set_null(out); goto done; }
+    const char *s = tdb_value_as_text(&l), *p = tdb_value_as_text(&r);
+    int m = like_match(p ? p : "", s ? s : "");
+    if (e->negated) m = !m;
+    tdb_value_set_int(out, m);
     goto done;
   }
 
@@ -269,6 +309,71 @@ static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
       tdb_value_clear(&v);
     }
     if (!found) tdb_value_set_null(out);
+  } else if (!strcasecmp(fn, "ifnull") && argc == 2) {
+    if (a0.type != TDB_VAL_NULL) tdb_value_copy(out, &a0);
+    else { tdb_value v; tdb_value_init(&v); eval(db, c, e->args->items[1], &v); tdb_value_copy(out, &v); tdb_value_clear(&v); }
+  } else if (!strcasecmp(fn, "nullif") && argc == 2) {
+    tdb_value v; tdb_value_init(&v); eval(db, c, e->args->items[1], &v);
+    if (a0.type != TDB_VAL_NULL && v.type != TDB_VAL_NULL && tdb_value_compare(&a0, &v, TDB_COLL_BINARY) == 0) tdb_value_set_null(out);
+    else tdb_value_copy(out, &a0);
+    tdb_value_clear(&v);
+  } else if (!strcasecmp(fn, "typeof") && argc == 1) {
+    const char *t = a0.type == TDB_VAL_NULL ? "null" : a0.type == TDB_VAL_INT ? "integer"
+                  : a0.type == TDB_VAL_REAL ? "real" : a0.type == TDB_VAL_BLOB ? "blob" : "text";
+    tdb_value_set_text(out, t, -1, 1);
+  } else if (!strcasecmp(fn, "round") && (argc == 1 || argc == 2)) {
+    double x = tdb_value_as_real(&a0); int nd = 0;
+    if (argc == 2) { tdb_value v; tdb_value_init(&v); eval(db, c, e->args->items[1], &v); nd = (int)tdb_value_as_int(&v); tdb_value_clear(&v); }
+    double p = pow(10.0, (double)nd);
+    tdb_value_set_real(out, round(x * p) / p);
+  } else if (!strcasecmp(fn, "substr") && (argc == 2 || argc == 3)) {
+    const char *s = tdb_value_as_text(&a0);
+    if (!s) tdb_value_set_null(out);
+    else {
+      int slen = (int)strlen(s);
+      tdb_value v1; tdb_value_init(&v1); eval(db, c, e->args->items[1], &v1);
+      int start = (int)tdb_value_as_int(&v1); tdb_value_clear(&v1);
+      int len = slen;
+      if (argc == 3) { tdb_value v2; tdb_value_init(&v2); eval(db, c, e->args->items[2], &v2); len = (int)tdb_value_as_int(&v2); tdb_value_clear(&v2); }
+      if (start < 0) start = slen + start + 1;
+      if (start < 1) start = 1;
+      int begin = start - 1; if (begin > slen) begin = slen;
+      int avail = slen - begin; if (len < 0) len = 0; if (len > avail) len = avail;
+      tdb_value_set_text(out, s + begin, len, 1);
+    }
+  } else if (!strcasecmp(fn, "replace") && argc == 3) {
+    const char *s = tdb_value_as_text(&a0);
+    tdb_value vf, vt; tdb_value_init(&vf); tdb_value_init(&vt);
+    eval(db, c, e->args->items[1], &vf); eval(db, c, e->args->items[2], &vt);
+    const char *from = tdb_value_as_text(&vf), *to = tdb_value_as_text(&vt);
+    if (!s || !from || !*from) { if (s) tdb_value_set_text(out, s, -1, 1); else tdb_value_set_null(out); }
+    else {
+      tdb_buf b; tdb_buf_init(&b);
+      size_t fl = strlen(from);
+      for (const char *p = s; *p; ) {
+        if (strncmp(p, from, fl) == 0) { if (to) tdb_buf_append(&b, to, strlen(to)); p += fl; }
+        else { tdb_buf_putc(&b, (uint8_t)*p); p++; }
+      }
+      tdb_value_set_text(out, (const char *)b.data, (int)b.len, 1);
+      tdb_buf_free(&b);
+    }
+    tdb_value_clear(&vf); tdb_value_clear(&vt);
+  } else if ((!strcasecmp(fn, "trim") || !strcasecmp(fn, "ltrim") || !strcasecmp(fn, "rtrim")) && argc == 1) {
+    const char *s = tdb_value_as_text(&a0);
+    if (!s) tdb_value_set_null(out);
+    else {
+      int n = (int)strlen(s), i = 0, j = n;
+      if (strcasecmp(fn, "rtrim")) while (i < j && isspace((unsigned char)s[i])) i++;
+      if (strcasecmp(fn, "ltrim")) while (j > i && isspace((unsigned char)s[j - 1])) j--;
+      tdb_value_set_text(out, s + i, j - i, 1);
+    }
+  } else if (!strcasecmp(fn, "instr") && argc == 2) {
+    const char *s = tdb_value_as_text(&a0);
+    tdb_value v; tdb_value_init(&v); eval(db, c, e->args->items[1], &v);
+    const char *sub = tdb_value_as_text(&v);
+    if (!s || !sub) tdb_value_set_int(out, 0);
+    else { const char *hit = strstr(s, sub); tdb_value_set_int(out, hit ? (int64_t)(hit - s) + 1 : 0); }
+    tdb_value_clear(&v);
   } else {
 #ifdef TDB_HAVE_LUA
     if (db->lua && tdb_catalog_find_routine(db->cat, fn)) {
@@ -346,7 +451,15 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     case EX_IN: {
       tdb_value x; tdb_value_init(&x); eval(db, c, e->left, &x);
       int res = 0;
-      if (e->args) for (int i = 0; i < e->args->n; i++) {
+      if (e->subquery) {
+        tdb_stmt tmp;
+        if (run_subselect(db, c->stmt, e->subquery, &tmp) == TDB_OK) {
+          for (int i = 0; i < tmp.nrows && !res; i++)
+            if (x.type != TDB_VAL_NULL && tmp.ncol > 0 && tmp.rows[i][0].type != TDB_VAL_NULL &&
+                tdb_value_compare(&x, &tmp.rows[i][0], TDB_COLL_BINARY) == 0) res = 1;
+        }
+        tdb_stmt_clear_results(&tmp);
+      } else if (e->args) for (int i = 0; i < e->args->n; i++) {
         tdb_value v; tdb_value_init(&v); eval(db, c, e->args->items[i], &v);
         if (x.type != TDB_VAL_NULL && v.type != TDB_VAL_NULL &&
             tdb_value_compare(&x, &v, TDB_COLL_BINARY) == 0) res = 1;
@@ -356,6 +469,22 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
       if (e->negated) res = !res;
       tdb_value_set_int(out, res);
       tdb_value_clear(&x);
+      return TDB_OK;
+    }
+    case EX_SUBQUERY: {
+      tdb_stmt tmp;
+      if (run_subselect(db, c->stmt, e->subquery, &tmp) == TDB_OK && tmp.nrows > 0 && tmp.ncol > 0)
+        tdb_value_copy(out, &tmp.rows[0][0]);
+      else tdb_value_set_null(out);
+      tdb_stmt_clear_results(&tmp);
+      return TDB_OK;
+    }
+    case EX_EXISTS: {
+      tdb_stmt tmp;
+      int ex = 0;
+      if (run_subselect(db, c->stmt, e->subquery, &tmp) == TDB_OK) ex = (tmp.nrows > 0);
+      tdb_stmt_clear_results(&tmp);
+      tdb_value_set_int(out, ex);
       return TDB_OK;
     }
     case EX_CASE: {

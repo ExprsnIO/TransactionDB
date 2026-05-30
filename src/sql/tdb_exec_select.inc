@@ -8,6 +8,8 @@ typedef struct {
   int64_t  isum;
   tdb_value mn, mx;
   int      has;
+  tdb_value *seen;          /* DISTINCT: values already counted */
+  int       nseen, capseen;
 } accum;
 
 typedef struct {
@@ -33,6 +35,17 @@ static void accum_update(accum *ac, tdb_expr *agg, tdb_db *db, ectx *ec) {
   tdb_value v; tdb_value_init(&v);
   eval(db, ec, agg->args->items[0], &v);
   if (v.type != TDB_VAL_NULL) {
+    if (agg->distinct) {
+      for (int i = 0; i < ac->nseen; i++)
+        if (tdb_value_compare(&v, &ac->seen[i], TDB_COLL_BINARY) == 0) { tdb_value_clear(&v); return; }
+      if (ac->nseen == ac->capseen) {
+        ac->capseen = ac->capseen ? ac->capseen * 2 : 8;
+        ac->seen = (tdb_value *)tdb_realloc(ac->seen, sizeof(tdb_value) * (size_t)ac->capseen);
+      }
+      tdb_value_init(&ac->seen[ac->nseen]);
+      tdb_value_copy(&ac->seen[ac->nseen], &v);
+      ac->nseen++;
+    }
     ac->count++;
     if (v.type == TDB_VAL_INT) { ac->isum += v.u.i; } else ac->sum_is_int = 0;
     ac->sum += tdb_value_as_real(&v);
@@ -217,13 +230,34 @@ static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
       if (aggvals) free_row(aggvals, Q.nagg);
       /* free group */
       if (groups[g].key) { for (int i = 0; i < ngroup; i++) tdb_value_clear(&groups[g].key[i]); tdb_mfree(groups[g].key); }
-      for (int j = 0; j < Q.nagg; j++) { tdb_value_clear(&groups[g].acc[j].mn); tdb_value_clear(&groups[g].acc[j].mx); }
+      for (int j = 0; j < Q.nagg; j++) {
+        tdb_value_clear(&groups[g].acc[j].mn); tdb_value_clear(&groups[g].acc[j].mx);
+        for (int k = 0; k < groups[g].acc[j].nseen; k++) tdb_value_clear(&groups[g].acc[j].seen[k]);
+        tdb_mfree(groups[g].acc[j].seen);
+      }
       tdb_mfree(groups[g].acc);
     }
     tdb_mfree(groups);
   }
 
   rowset_free(&in);
+
+  /* 4b. DISTINCT — drop duplicate output rows (NULLs compare equal) */
+  if (q->distinct && nout > 0 && non > 1) {
+    for (int i = 0; i < non; i++) {
+      for (int j = i + 1; j < non; ) {
+        int same = 1;
+        for (int k = 0; k < nout; k++)
+          if (tdb_value_compare(&outrows[i][k], &outrows[j][k], TDB_COLL_BINARY) != 0) { same = 0; break; }
+        if (same) {
+          free_row(outrows[j], nout);
+          if (outkeys[j]) free_row(outkeys[j], norder);
+          for (int m = j; m < non - 1; m++) { outrows[m] = outrows[m + 1]; outkeys[m] = outkeys[m + 1]; }
+          non--;
+        } else j++;
+      }
+    }
+  }
 
   /* 5. ORDER BY */
   if (norder > 0 && non > 1) {

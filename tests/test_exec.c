@@ -144,8 +144,77 @@ static void test_bind_params(void) {
   tdb_close(db);
 }
 
+static int rowcount(tdb_db *db, const char *sql) {
+  tdb_stmt *s = NULL;
+  if (tdb_prepare_v2(db, sql, -1, &s, NULL) != TDB_OK) return -1;
+  int n = 0;
+  while (tdb_step(s) == TDB_ROW) n++;
+  tdb_finalize(s);
+  return n;
+}
+static void check_text(tdb_db *db, const char *sql, const char *expect) {
+  tdb_stmt *s = NULL;
+  if (tdb_prepare_v2(db, sql, -1, &s, NULL) != TDB_OK) { TDB_CHECK(0); return; }
+  if (tdb_step(s) == TDB_ROW) { const char *t = tdb_column_text(s, 0); TDB_CHECK_STR(t ? t : "(null)", expect); }
+  else TDB_CHECK(0);
+  tdb_finalize(s);
+}
+
+static void test_like_distinct(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, cat TEXT)");
+  exec(db, "INSERT INTO t VALUES (1,'apple','fruit'),(2,'apricot','fruit'),"
+           "(3,'beet','veg'),(4,'banana','fruit')");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE name LIKE 'ap%'"), 2);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE name LIKE '_eet'"), 1);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE name NOT LIKE 'b%'"), 2);
+  TDB_CHECK_EQ(rowcount(db, "SELECT DISTINCT cat FROM t"), 2);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(DISTINCT cat) FROM t"), 2);
+  tdb_close(db);
+}
+
+static void test_builtins(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  check_text(db, "SELECT upper('ab') || substr('hello', 2, 3)", "ABell");
+  TDB_CHECK_EQ(scalar(db, "SELECT length(trim('  hi  '))"), 2);
+  TDB_CHECK_EQ(scalar(db, "SELECT ifnull(NULL, 5)"), 5);
+  check_text(db, "SELECT typeof(1)", "integer");
+  check_text(db, "SELECT typeof('x')", "text");
+  check_text(db, "SELECT replace('aXbXc', 'X', '-')", "a-b-c");
+  TDB_CHECK_EQ(scalar(db, "SELECT instr('hello', 'll')"), 3);
+  TDB_CHECK_EQ(scalar(db, "SELECT round(3.14159, 2) = 3.14"), 1);
+  tdb_close(db);
+}
+
+static void test_subqueries(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT)");
+  exec(db, "INSERT INTO t VALUES (1,'fruit'),(2,'fruit'),(3,'veg'),(4,'fruit')");
+  TDB_CHECK_EQ(scalar(db, "SELECT (SELECT COUNT(*) FROM t)"), 4);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE id IN (SELECT id FROM t WHERE cat='fruit')"), 3);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE id NOT IN (SELECT id FROM t WHERE cat='fruit')"), 1);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM t WHERE cat='veg')"), 4);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM t WHERE cat='nope')"), 0);
+  tdb_close(db);
+}
+
+static void test_insert_select(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, cat TEXT)");
+  exec(db, "INSERT INTO src VALUES (1,'a','x'),(2,'b','y'),(3,'c','x')");
+  exec(db, "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT)");
+  TDB_CHECK_EQ(exec(db, "INSERT INTO dst (id, name) SELECT id, name FROM src WHERE cat='x'"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM dst"), 2);
+  check_text(db, "SELECT name FROM dst WHERE id = 3", "c");
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"ddl_dml_select", test_ddl_dml_select},
+  {"like_distinct", test_like_distinct},
+  {"builtins", test_builtins},
+  {"subqueries", test_subqueries},
+  {"insert_select", test_insert_select},
   {"strict_typing", test_strict_typing},
   {"generated_column", test_generated_column},
   {"join_and_group", test_join_and_group},

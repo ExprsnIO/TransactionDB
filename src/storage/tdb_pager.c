@@ -453,8 +453,8 @@ int tdb_pager_open(const tdb_vfs *vfs, const char *path, int flags,
     /* brand-new database */
     memset(&p->hdr, 0, sizeof(p->hdr));
     p->hdr.page_size = p->page_size;
-    p->hdr.db_size = 1;            /* page 1 = catalog/header */
-    p->hdr.catalog_root = TDB_CATALOG_PGNO;
+    p->hdr.db_size = 1;            /* page 1 = header only */
+    p->hdr.catalog_root = 0;       /* catalog b-tree created on first open */
     p->hdr.schema_cookie = 0;
     p->hdr.text_encoding = TDB_TEXT_ENC_UTF8;
     p->hdr.max_txnid = 0;

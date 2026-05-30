@@ -663,7 +663,8 @@ int tdb_stmt_execute(tdb_stmt *st) {
   if (!a) return TDB_OK;
 
   /* transaction-control statements manage db->txn directly */
-  if (a->kind == ST_BEGIN || a->kind == ST_COMMIT || a->kind == ST_ROLLBACK)
+  if (a->kind == ST_BEGIN || a->kind == ST_COMMIT || a->kind == ST_ROLLBACK ||
+      a->kind == ST_SAVEPOINT || a->kind == ST_RELEASE || a->kind == ST_ROLLBACK_TO)
     return exec_txn(db, st, a);
 
   /* otherwise run inside the explicit txn, or an auto txn we open/close here */

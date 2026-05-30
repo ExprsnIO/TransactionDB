@@ -399,6 +399,24 @@ static int exec_txn(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       if (db->txn) { rc = tdb_txn_rollback(db->txn); db->txn = NULL; }
       db->autocommit = 1;
       break;
+    case ST_SAVEPOINT:
+      if (!db->txn) {  /* implicitly start a transaction, like SQLite */
+        rc = tdb_txn_begin(db->tm, TDB_ISO_SNAPSHOT, 1, &db->txn);
+        db->autocommit = 0;
+        if (rc) break;
+      }
+      rc = tdb_txn_savepoint(db->txn, a->u.savepoint.name);
+      break;
+    case ST_RELEASE:
+      if (!db->txn) { tdb_db_seterr(db, "no such savepoint: %s", a->u.savepoint.name); rc = TDB_ERROR; break; }
+      rc = tdb_txn_release(db->txn, a->u.savepoint.name);
+      if (rc == TDB_NOTFOUND) tdb_db_seterr(db, "no such savepoint: %s", a->u.savepoint.name);
+      break;
+    case ST_ROLLBACK_TO:
+      if (!db->txn) { tdb_db_seterr(db, "no such savepoint: %s", a->u.savepoint.name); rc = TDB_ERROR; break; }
+      rc = tdb_txn_rollback_to(db->txn, a->u.savepoint.name);
+      if (rc == TDB_NOTFOUND) tdb_db_seterr(db, "no such savepoint: %s", a->u.savepoint.name);
+      break;
     default: break;
   }
   return rc;

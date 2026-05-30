@@ -47,6 +47,13 @@ int  tdb_pager_commit(tdb_pager *p);    /* atomically flush to WAL + fsync */
 int  tdb_pager_rollback(tdb_pager *p);  /* discard buffered changes */
 int  tdb_pager_checkpoint(tdb_pager *p);
 
+/* Statement-level savepoints (within a write transaction). tdb_pager_savepoint
+** returns a level index; release discards a savepoint (keeping its changes);
+** rollback reverts to it. */
+int  tdb_pager_savepoint(tdb_pager *p);
+int  tdb_pager_savepoint_release(tdb_pager *p, int level);
+int  tdb_pager_savepoint_rollback(tdb_pager *p, int level);
+
 /* Header metadata accessors (persisted in page 1). */
 uint64_t tdb_pager_max_txnid(tdb_pager *p);
 void     tdb_pager_set_max_txnid(tdb_pager *p, uint64_t v);

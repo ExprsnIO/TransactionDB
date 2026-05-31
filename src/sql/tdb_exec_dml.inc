@@ -643,11 +643,19 @@ static int exec_txn(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       db->autocommit = 0;
       break;
     case ST_COMMIT:
-      if (db->txn) { rc = tdb_txn_commit(db->txn); db->txn = NULL; }
+      if (db->txn) {
+        tdb_txnid wid = db->txn->id;
+        rc = tdb_txn_commit(db->txn); db->txn = NULL;
+        if (db->env) tdb_env_release_writer(db->env, wid);
+      }
       db->autocommit = 1;
       break;
     case ST_ROLLBACK:
-      if (db->txn) { rc = tdb_txn_rollback(db->txn); db->txn = NULL; }
+      if (db->txn) {
+        tdb_txnid wid = db->txn->id;
+        rc = tdb_txn_rollback(db->txn); db->txn = NULL;
+        if (db->env) tdb_env_release_writer(db->env, wid);
+      }
       db->autocommit = 1;
       break;
     case ST_SAVEPOINT:

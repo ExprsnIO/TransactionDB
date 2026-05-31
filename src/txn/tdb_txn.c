@@ -41,6 +41,16 @@ void tdb_txnmgr_close(tdb_txnmgr *m) {
 
 tdb_lockmgr *tdb_txnmgr_locks(tdb_txnmgr *m) { return m->locks; }
 
+/* The id tdb_txn_begin will assign next. Used to claim the env writer slot
+** before actually beginning the transaction (so a losing writer never touches
+** the shared single-writer pager). */
+tdb_txnid tdb_txnmgr_peek_next(tdb_txnmgr *m) {
+  tdb_mutex_lock(m->mu);
+  tdb_txnid n = m->next;
+  tdb_mutex_unlock(m->mu);
+  return n;
+}
+
 static void set_state(tdb_txnmgr *m, tdb_txnid id, tdb_xstate st) {
   for (int i = 0; i < m->nrec; i++) {
     if (m->recs[i].id == id) { m->recs[i].state = st; return; }

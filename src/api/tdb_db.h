@@ -20,14 +20,21 @@
 #include "../value/tdb_value.h"
 #include "../common/tdb_mutex.h"
 
+struct tdb_env;            /* shared environment (tdb_env.h) */
+
 struct tdb_db {
+  struct tdb_env *env;     /* shared resources (pager/catalog/locks/txn/engine) */
+
+  /* Borrowed from `env` (not owned): kept as direct fields so the executor and
+  ** the rest of the engine reach them unchanged. */
   tdb_pager   *pager;
   tdb_catalog *cat;
   tdb_lockmgr *lm;
   tdb_txnmgr  *tm;
   tdb_storage *engine;
-  tdb_lua     *lua;        /* embedded Lua state (NULL if built without Lua) */
-  tdb_txn     *txn;        /* the current transaction (auto or explicit) */
+
+  tdb_lua     *lua;        /* embedded Lua state (NULL if built without Lua); per-connection */
+  tdb_txn     *txn;        /* the current transaction (auto or explicit); per-connection */
   int          autocommit; /* 1 = no explicit BEGIN in effect */
   int          flags;
   char        *path;

@@ -6,6 +6,7 @@
 ** executor (which currently materializes result sets).
 */
 #include "tdb_db.h"
+#include "tdb_env.h"
 #include "../sql/tdb_parser.h"
 #include "../common/tdb_mem.h"
 #ifdef TDB_HAVE_LUA
@@ -46,15 +47,14 @@ int tdb_open_v2(const char *filename, tdb_db **ppDb, int flags) {
   db->mu = tdb_mutex_new_recursive();
   if (!db->mu) { tdb_close(db); return TDB_NOMEM; }
 
-  int rc = tdb_pager_open(NULL, filename, flags, &db->pager);
+  /* attach to (or create) the shared environment for this path */
+  int rc = tdb_env_acquire(filename, flags, &db->env);
   if (rc) goto fail;
-  rc = tdb_catalog_open(db->pager, &db->cat);
-  if (rc) goto fail;
-  db->lm = tdb_lockmgr_new();
-  rc = tdb_txnmgr_open(db->pager, db->lm, &db->tm);
-  if (rc) goto fail;
-  rc = tdb_engine_open(db->pager, &db->engine);   /* row + columnar dispatcher */
-  if (rc) goto fail;
+  db->pager  = db->env->pager;     /* borrowed: owned by the env */
+  db->cat    = db->env->cat;
+  db->lm     = db->env->lm;
+  db->tm     = db->env->tm;
+  db->engine = db->env->engine;
 
 #ifdef TDB_HAVE_LUA
   rc = tdb_lua_open(db, &db->lua);
@@ -79,11 +79,8 @@ int tdb_close(tdb_db *db) {
 #ifdef TDB_HAVE_LUA
   if (db->lua) tdb_lua_close(db->lua);
 #endif
-  if (db->engine) tdb_storage_close(db->engine);
-  if (db->tm) tdb_txnmgr_close(db->tm);
-  if (db->lm) tdb_lockmgr_free(db->lm);
-  if (db->cat) tdb_catalog_close(db->cat);
-  if (db->pager) tdb_pager_close(db->pager);
+  /* the pager/catalog/locks/txn/engine are owned by the shared env */
+  if (db->env) tdb_env_release(db->env);
   if (db->mu) tdb_mutex_free(db->mu);
   tdb_mfree(db->path);
   tdb_mfree(db);

@@ -539,8 +539,71 @@ static void test_upsert(void) {
   tdb_close(db);
 }
 
+static void test_returning(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, hits INTEGER)");
+
+  /* INSERT ... RETURNING: a single-row projection with an expression + alias */
+  tdb_stmt *s;
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "INSERT INTO t VALUES (1,'a',10) RETURNING id, hits + 1 AS next", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_count(s), 2);
+  TDB_CHECK_STR(tdb_column_name(s, 0), "id");
+  TDB_CHECK_STR(tdb_column_name(s, 1), "next");
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 1);
+  TDB_CHECK_EQ(tdb_column_int(s, 1), 11);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+
+  /* multi-row INSERT ... RETURNING * yields one row per inserted row */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "INSERT INTO t VALUES (2,'b',20),(3,'c',30) RETURNING *", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_count(s), 3);
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 2);
+  TDB_CHECK_STR(tdb_column_text(s, 1), "b");
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 3);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+
+  /* the rows really landed */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 3);
+
+  /* UPDATE ... RETURNING reflects the NEW row values */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "UPDATE t SET hits = hits + 100 WHERE id = 1 RETURNING id, hits", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 1);
+  TDB_CHECK_EQ(tdb_column_int(s, 1), 110);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+
+  /* DELETE ... RETURNING reflects the row as it was before removal */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "DELETE FROM t WHERE id = 3 RETURNING name", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_STR(tdb_column_text(s, 0), "c");
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 2);
+
+  /* INSERT OR REPLACE ... RETURNING surfaces the replacement row */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "INSERT OR REPLACE INTO t VALUES (1,'a2',5) RETURNING name, hits", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_STR(tdb_column_text(s, 0), "a2");
+  TDB_CHECK_EQ(tdb_column_int(s, 1), 5);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"upsert", test_upsert},
+  {"returning", test_returning},
   {"ddl_dml_select", test_ddl_dml_select},
   {"derived_and_view", test_derived_and_view},
   {"outer_joins", test_outer_joins},

@@ -145,6 +145,7 @@ typedef enum tdb_stmt_kind {
 
 typedef struct tdb_ast_stmt {
   tdb_stmt_kind kind;
+  tdb_exprlist *returning;   /* RETURNING projection for INSERT/UPDATE/DELETE, or NULL */
   union {
     tdb_select *select;
 

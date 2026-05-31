@@ -407,6 +407,20 @@ static char **parse_name_list(P *p, int *count) {
   return names;
 }
 
+/* Optional `RETURNING expr [[AS] alias], ... | RETURNING *` trailing a DML
+** statement. Mirrors the SELECT projection list (EX_STAR for *). */
+static void parse_returning(P *p, tdb_ast_stmt *s) {
+  if (!accept(p, TK_RETURNING)) return;
+  s->returning = tdb_exprlist_new(p->a);
+  do {
+    tdb_expr *e = parse_expr(p, 0);
+    char *alias = NULL;
+    if (accept(p, TK_AS)) { alias = dup_tok(p, &p->cur); expect(p, TK_ID, "expected alias"); }
+    else if (p->cur.kind == TK_ID) { alias = dup_tok(p, &p->cur); advance(p); }
+    tdb_exprlist_add(p->a, s->returning, e, alias);
+  } while (accept(p, TK_COMMA) && !p->err);
+}
+
 static tdb_ast_stmt *parse_insert(P *p) {
   advance(p); /* INSERT */
   tdb_ast_stmt *s = new_stmt(p, ST_INSERT);
@@ -470,6 +484,7 @@ static tdb_ast_stmt *parse_insert(P *p) {
       if (accept(p, TK_WHERE)) s->u.insert.up_where = parse_expr(p, 0);
     } else set_err(p, "expected NOTHING or UPDATE");
   }
+  parse_returning(p, s);
   return s;
 }
 
@@ -495,6 +510,7 @@ static tdb_ast_stmt *parse_update(P *p) {
     s->u.update.nset++;
   } while (accept(p, TK_COMMA) && !p->err);
   if (accept(p, TK_WHERE)) s->u.update.where = parse_expr(p, 0);
+  parse_returning(p, s);
   return s;
 }
 
@@ -505,6 +521,7 @@ static tdb_ast_stmt *parse_delete(P *p) {
   s->u.del.table = dup_tok(p, &p->cur);
   expect(p, TK_ID, "expected table name");
   if (accept(p, TK_WHERE)) s->u.del.where = parse_expr(p, 0);
+  parse_returning(p, s);
   return s;
 }
 

@@ -40,6 +40,7 @@ static const kw k_keywords[] = {
   {"ADD",TK_ADD},{"COLUMN",TK_COLUMN},{"RENAME",TK_RENAME},
   {"UNION",TK_UNION},{"EXCEPT",TK_EXCEPT},{"INTERSECT",TK_INTERSECT},
   {"EXPLAIN",TK_EXPLAIN},{"VACUUM",TK_VACUUM},{"RETURNING",TK_RETURNING},
+  {"GLOB",TK_GLOB},{"ESCAPE",TK_ESCAPE},
 };
 
 tdb_token_kind tdb_keyword_lookup(const char *z, int n) {

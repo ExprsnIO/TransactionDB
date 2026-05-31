@@ -1328,6 +1328,75 @@ static void test_stream_sort(void) {
   tdb_close(db);
 }
 
+static void test_stream_join(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER)");
+  exec(db, "INSERT INTO emp VALUES (1,'a',10),(2,'b',20),(3,'c',10),(4,'d',99)");
+  exec(db, "CREATE TABLE dept (id INTEGER PRIMARY KEY, dname TEXT)");
+  exec(db, "INSERT INTO dept VALUES (10,'eng'),(20,'sales'),(30,'hr')");
+  int ids[64], n;
+
+  /* INNER JOIN ... ON: dept 99 has no match -> 3 rows */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp e JOIN dept d ON e.dept = d.id"), 3);
+  n = collect_ints(db,
+    "SELECT e.id FROM emp e JOIN dept d ON e.dept = d.id ORDER BY e.id", ids, 64);
+  TDB_CHECK_EQ(n, 3);
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 2); TDB_CHECK_EQ(ids[2], 3);
+
+  /* projected column from the inner table + ORDER BY across the join */
+  check_text(db,
+    "SELECT d.dname FROM emp e JOIN dept d ON e.dept = d.id ORDER BY e.id", "eng");
+
+  /* comma join + WHERE acting as the join predicate, with an extra filter */
+  n = collect_ints(db,
+    "SELECT e.id FROM emp e, dept d WHERE e.dept = d.id AND d.dname = 'eng' ORDER BY e.id", ids, 64);
+  TDB_CHECK_EQ(n, 2);   /* a (id1) and c (id3), both dept 10 */
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 3);
+
+  /* CROSS JOIN: full cross product 4 x 3 = 12 */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp CROSS JOIN dept"), 12);
+
+  /* join + LIMIT streams with early termination */
+  n = collect_ints(db,
+    "SELECT e.id FROM emp e JOIN dept d ON e.dept = d.id ORDER BY e.id LIMIT 2", ids, 64);
+  TDB_CHECK_EQ(n, 2);
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 2);
+
+  /* SELECT * across both tables yields all columns of both */
+  {
+    tdb_stmt *s = NULL;
+    tdb_prepare_v2(db, "SELECT * FROM emp e JOIN dept d ON e.dept = d.id WHERE e.id = 1", -1, &s, NULL);
+    TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+    TDB_CHECK_EQ(tdb_column_count(s), 5);            /* emp(3) + dept(2) */
+    TDB_CHECK_EQ(tdb_column_int(s, 0), 1);           /* emp.id */
+    TDB_CHECK_STR(tdb_column_text(s, 1), "a");       /* emp.name */
+    TDB_CHECK_EQ(tdb_column_int(s, 3), 10);          /* dept.id */
+    TDB_CHECK_STR(tdb_column_text(s, 4), "eng");     /* dept.dname */
+    TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+    tdb_finalize(s);
+  }
+
+  /* three-table left-deep join: a(10),c(10) each match p1,p2 (4 rows);
+  ** b(20) matches p3 (1 row) -> 5 total */
+  exec(db, "CREATE TABLE proj (dept INTEGER, pname TEXT)");
+  exec(db, "INSERT INTO proj VALUES (10,'p1'),(10,'p2'),(20,'p3')");
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM emp e JOIN dept d ON e.dept = d.id "
+    "JOIN proj p ON p.dept = d.id"), 5);
+
+  /* snapshot isolation holds across a paused join stream */
+  tdb_stmt *s = NULL;
+  tdb_prepare_v2(db, "SELECT e.id FROM emp e JOIN dept d ON e.dept = d.id ORDER BY e.id", -1, &s, NULL);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 1);
+  exec(db, "INSERT INTO dept VALUES (99,'late')");   /* would make emp 4 match */
+  int more = 0; while (tdb_step(s) == TDB_ROW) more++;
+  TDB_CHECK_EQ(more, 2);   /* still only 2,3 — the late dept is invisible */
+  tdb_finalize(s);
+
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"geospatial", test_geospatial},
   {"spatial_index", test_spatial_index},
@@ -1335,6 +1404,7 @@ static tdb_test_case cases[] = {
   {"streaming", test_streaming},
   {"stream_snapshot", test_stream_snapshot},
   {"stream_sort", test_stream_sort},
+  {"stream_join", test_stream_join},
   {"upsert", test_upsert},
   {"returning", test_returning},
   {"cte", test_cte},

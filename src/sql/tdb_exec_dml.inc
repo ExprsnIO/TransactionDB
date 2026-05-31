@@ -51,11 +51,26 @@ static int finalize_row(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_value *full)
   return TDB_OK;
 }
 
+static int store_full(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_value *row,
+                      tdb_rowid rowid, tdb_buf *rec, int is_update) {
+  int rc = finalize_row(db, st, t, row);
+  if (rc) return rc;
+  tdb_buf_reset(rec);
+  tdb_record_encode(row, t->ncol, rec);
+  return is_update ? db->engine->vtab->update(db->engine, db->txn, t, rowid, rec->data, (int)rec->len)
+                   : db->engine->vtab->insert(db->engine, db->txn, t, rowid, rec->data, (int)rec->len);
+}
+
 /* Insert one row: place src[0..nsrc) into the target columns, fill DEFAULTs,
 ** assign the rowid (INTEGER PRIMARY KEY aliasing), stamp the temporal period,
-** run generated columns / type coercion / NOT NULL, then store. */
+** run generated columns / type coercion / NOT NULL, then store. Handles PK
+** conflicts per the INSERT's OR-action / ON CONFLICT clause. *applied reports
+** whether a row was actually written (0 when an IGNORE/DO NOTHING skipped). */
 static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *target,
-                           int ntarget, tdb_value *src, int nsrc, int pkc, tdb_buf *rec) {
+                           int ntarget, tdb_value *src, int nsrc, int pkc,
+                           tdb_ast_stmt *a, const int *up_setidx, tdb_buf *rec,
+                           int *applied) {
+  *applied = 0;
   tdb_value *full = row_alloc(t->ncol);
   for (int i = 0; i < t->ncol; i++) {
     if (t->cols[i].default_sql) {
@@ -75,16 +90,53 @@ static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *ta
   }
   if (t->versioning == TDB_VERSIONING_SYSTEM) {
     if (t->row_start_col >= 0) tdb_value_set_int(&full[t->row_start_col], (int64_t)db->txn->id);
-    if (t->row_end_col >= 0)   tdb_value_set_int(&full[t->row_end_col], INT64_MAX); /* open */
+    if (t->row_end_col >= 0)   tdb_value_set_int(&full[t->row_end_col], INT64_MAX);
   }
 
-  int rc = finalize_row(db, st, t, full);
-  if (!rc) {
-    tdb_buf_reset(rec);
-    tdb_record_encode(full, t->ncol, rec);
-    rc = db->engine->vtab->insert(db->engine, db->txn, t, rowid, rec->data, (int)rec->len);
+  /* PK conflict resolution (only user-supplied integer PKs can collide) */
+  if (pkc >= 0) {
+    const uint8_t *ex; int exn, found = 0;
+    db->engine->vtab->seek_rowid(db->engine, db->txn, t, rowid, &ex, &exn, &found);
+    if (found) {
+      if (a->u.insert.or_action == TDB_OR_IGNORE ||
+          (a->u.insert.has_upsert && a->u.insert.upsert_nothing)) {
+        free_row(full, t->ncol); return TDB_OK;          /* skip */
+      }
+      if (a->u.insert.or_action == TDB_OR_REPLACE) {
+        int rc = store_full(db, st, t, full, rowid, rec, 1);
+        free_row(full, t->ncol); if (!rc) *applied = 1; return rc;
+      }
+      if (a->u.insert.has_upsert) {                       /* DO UPDATE SET ... */
+        tdb_value exd[64]; int enc = 0;
+        tdb_record_decode(ex, (size_t)exn, exd, 64, &enc);
+        tdb_value *urow = row_alloc(t->ncol);
+        for (int i = 0; i < t->ncol && i < enc; i++) tdb_value_copy(&urow[i], &exd[i]);
+        for (int i = 0; i < enc; i++) tdb_value_clear(&exd[i]);
+        ectx ec = { urow, t->ncol, NULL, 0, st };
+        int doit = 1;
+        if (a->u.insert.up_where) { tdb_value w; tdb_value_init(&w); eval(db, &ec, a->u.insert.up_where, &w); doit = val_true(&w); tdb_value_clear(&w); }
+        int rc = TDB_OK;
+        if (doit) {
+          for (int i = 0; i < a->u.insert.up_nset; i++) {
+            tdb_value v; tdb_value_init(&v);
+            eval(db, &ec, a->u.insert.up_vals[i], &v);
+            tdb_value_clear(&urow[up_setidx[i]]); urow[up_setidx[i]] = v;
+          }
+          rc = store_full(db, st, t, urow, rowid, rec, 1);
+          if (!rc) *applied = 1;
+        }
+        free_row(urow, t->ncol); free_row(full, t->ncol);
+        return rc;
+      }
+      tdb_db_seterr(db, "UNIQUE constraint failed: %s primary key", t->name);
+      free_row(full, t->ncol);
+      return TDB_CONSTRAINT;
+    }
   }
+
+  int rc = store_full(db, st, t, full, rowid, rec, 0);
   free_row(full, t->ncol);
+  if (!rc) *applied = 1;
   return rc;
 }
 
@@ -110,14 +162,31 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   tdb_buf rec; tdb_buf_init(&rec);
   int rc = TDB_OK;
 
+  /* Resolve ON CONFLICT DO UPDATE SET targets/expressions against the table.
+  ** up_setidx maps each up_cols[i] to its column slot; up_vals and up_where
+  ** are resolved as single-source (the conflict row) expressions. */
+  int up_setidx[64];
+  if (a->u.insert.has_upsert && a->u.insert.up_nset > 0) {
+    if (a->u.insert.up_nset > 64) { tdb_db_seterr(db, "too many SET clauses"); tdb_buf_free(&rec); return TDB_ERROR; }
+    qctx uq; memset(&uq, 0, sizeof(uq));
+    uq.src[0].tbl = t; uq.src[0].base = 0; uq.nsrc = 1; uq.totalcols = t->ncol;
+    for (int i = 0; i < a->u.insert.up_nset; i++) {
+      up_setidx[i] = tdb_table_find_column(t, a->u.insert.up_cols[i]);
+      if (up_setidx[i] < 0) { tdb_db_seterr(db, "no such column: %s", a->u.insert.up_cols[i]); tdb_buf_free(&rec); return TDB_ERROR; }
+      if (resolve_expr(db, &uq, a->u.insert.up_vals[i])) { tdb_buf_free(&rec); return TDB_ERROR; }
+    }
+    if (a->u.insert.up_where && resolve_expr(db, &uq, a->u.insert.up_where)) { tdb_buf_free(&rec); return TDB_ERROR; }
+  }
+
   if (a->u.insert.select) {
     /* INSERT ... SELECT */
     tdb_stmt tmp;
     rc = run_subselect(db, st, a->u.insert.select, &tmp);
     if (!rc) {
       for (int r = 0; r < tmp.nrows && !rc; r++) {
-        rc = insert_row_vals(db, st, t, target, ntarget, tmp.rows[r], tmp.ncol, pkc, &rec);
-        if (!rc) st->changes++;
+        int applied = 0;
+        rc = insert_row_vals(db, st, t, target, ntarget, tmp.rows[r], tmp.ncol, pkc, a, up_setidx, &rec, &applied);
+        if (!rc && applied) st->changes++;
       }
     }
     tdb_stmt_clear_results(&tmp);
@@ -138,9 +207,10 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     tdb_value *src = row_alloc(row->n ? row->n : 1);
     ectx ec0 = { NULL, 0, NULL, 0, st };
     for (int i = 0; i < row->n; i++) eval(db, &ec0, row->items[i], &src[i]);
-    rc = insert_row_vals(db, st, t, target, ntarget, src, row->n, pkc, &rec);
+    int applied = 0;
+    rc = insert_row_vals(db, st, t, target, ntarget, src, row->n, pkc, a, up_setidx, &rec, &applied);
     free_row(src, row->n ? row->n : 1);
-    if (!rc) st->changes++;
+    if (!rc && applied) st->changes++;
   }
   tdb_buf_free(&rec);
   return rc;

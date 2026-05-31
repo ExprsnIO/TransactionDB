@@ -35,6 +35,11 @@ int  tdb_btree_open(tdb_pager *p, tdb_pgno root, tdb_btree_kind kind,
                     const tdb_keyinfo *ki, tdb_btree **out);
 void tdb_btree_close(tdb_btree *bt);
 
+/* Free every page of the b-tree rooted at `root` (interior + leaf pages and
+** any leaf overflow chains) back to the pager freelist. Used by DROP to
+** reclaim space; the root becomes invalid afterward. */
+int  tdb_btree_destroy(tdb_pager *p, tdb_pgno root, tdb_btree_kind kind);
+
 tdb_pgno tdb_btree_root(tdb_btree *bt);
 
 /* Table helpers (key = rowid). put replaces an existing rowid. */

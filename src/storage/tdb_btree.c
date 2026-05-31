@@ -627,6 +627,43 @@ int tdb_btree_open(tdb_pager *p, tdb_pgno root, tdb_btree_kind kind,
 void tdb_btree_close(tdb_btree *bt) { tdb_mfree(bt); }
 tdb_pgno tdb_btree_root(tdb_btree *bt) { return bt->root; }
 
+/* Recursively free a subtree: leaf overflow chains + interior children, then
+** the page itself. Children pointers are read into a local array before the
+** page is released so the recursion holds at most one page pinned per level. */
+static int free_subtree(tdb_btree *bt, tdb_pgno pgno) {
+  tdb_page *pg;
+  int rc = tdb_pager_get(bt->p, pgno, &pg);
+  if (rc) return rc;
+  int n = pg_ncell(pg);
+  if (pg_is_leaf(pg)) {
+    for (int i = 0; i < n; i++) {
+      leafcell lc; read_leafcell(bt, pg, i, &lc);
+      if (lc.ovfl) overflow_free(bt, lc.ovfl);
+    }
+    tdb_pager_unref(bt->p, pg);
+    return tdb_pager_free(bt->p, pgno);
+  }
+  tdb_pgno *kids = (tdb_pgno *)tdb_malloc(sizeof(tdb_pgno) * (size_t)(n + 1));
+  if (!kids) { tdb_pager_unref(bt->p, pg); return TDB_NOMEM; }
+  for (int i = 0; i < n; i++) kids[i] = intcell_child(pg, i);
+  kids[n] = pg_right(pg);
+  tdb_pager_unref(bt->p, pg);
+  for (int i = 0; i <= n && !rc; i++)
+    if (kids[i]) rc = free_subtree(bt, kids[i]);
+  tdb_mfree(kids);
+  if (!rc) rc = tdb_pager_free(bt->p, pgno);
+  return rc;
+}
+
+int tdb_btree_destroy(tdb_pager *p, tdb_pgno root, tdb_btree_kind kind) {
+  if (root == 0) return TDB_OK;
+  tdb_btree *bt; int rc = tdb_btree_open(p, root, kind, NULL, &bt);
+  if (rc) return rc;
+  rc = free_subtree(bt, root);
+  tdb_btree_close(bt);
+  return rc;
+}
+
 /* ----------------------------- table API ------------------------------ */
 
 int tdb_btree_put(tdb_btree *bt, tdb_rowid rowid, const void *val, int n) {

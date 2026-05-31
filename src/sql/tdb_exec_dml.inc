@@ -451,6 +451,8 @@ static int exec_drop(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       tdb_db_seterr(db, "no such table: %s", a->u.drop.name);
       return TDB_ERROR;
     }
+    int rc = db->engine->vtab->drop_table(db->engine, db->txn, t);  /* reclaim pages */
+    if (rc) return rc;
     tdb_catalog_drop_table(db->cat, a->u.drop.name);
     return TDB_OK;
   }

@@ -191,6 +191,7 @@ int tdb_pager_write(tdb_pager *p, tdb_page *pg) {
 
 uint32_t tdb_pager_page_size(tdb_pager *p) { return p->page_size; }
 tdb_pgno tdb_pager_db_size(tdb_pager *p) { return p->hdr.db_size; }
+tdb_pgno tdb_pager_freelist_count(tdb_pager *p) { return p->hdr.freelist_count; }
 int tdb_pager_is_readonly(tdb_pager *p) { return p->readonly; }
 
 uint64_t tdb_pager_max_txnid(tdb_pager *p) { return p->hdr.max_txnid; }

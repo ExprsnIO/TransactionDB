@@ -211,8 +211,14 @@ static int ceng_create_table(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
 }
 
 static int ceng_drop_table(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
-  TDB_UNUSED(s); TDB_UNUSED(txn); TDB_UNUSED(t);
-  return TDB_OK; /* page reclamation: future vacuum */
+  TDB_UNUSED(txn);
+  col_engine *e = (col_engine *)s->impl;
+  int rc = tdb_btree_destroy(e->pager, t->root, TDB_BT_TABLE);   /* per-rowid meta */
+  for (int i = 0; i < t->ncol_roots && !rc; i++)
+    rc = tdb_btree_destroy(e->pager, t->col_roots[i], TDB_BT_TABLE);
+  for (int i = 0; i < t->nindex && !rc; i++)
+    rc = tdb_btree_destroy(e->pager, t->indexes[i].root, TDB_BT_INDEX);
+  return rc;
 }
 
 static int ceng_next_rowid(tdb_storage *s, tdb_table *t, tdb_rowid *out) {
@@ -416,14 +422,16 @@ static int ceng_add_column(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
 /* Drop column `ci`'s value b-tree by removing its root from the array and
 ** shifting the rest down. The b-tree's pages are orphaned until VACUUM. */
 static int ceng_drop_column(tdb_storage *s, tdb_txn *txn, tdb_table *t, int ci) {
-  TDB_UNUSED(s); TDB_UNUSED(txn);
+  TDB_UNUSED(txn);
+  col_engine *e = (col_engine *)s->impl;
   if (ci < 0 || ci >= t->ncol_roots) {
     if (t->ncol_roots > 0) t->ncol_roots--;   /* no separate store; just shrink */
     return TDB_OK;
   }
+  int rc = tdb_btree_destroy(e->pager, t->col_roots[ci], TDB_BT_TABLE);  /* reclaim pages */
   for (int i = ci; i < t->ncol_roots - 1; i++) t->col_roots[i] = t->col_roots[i + 1];
   t->ncol_roots--;
-  return TDB_OK;
+  return rc;
 }
 
 static const tdb_storage_vtab g_col_vtab = {

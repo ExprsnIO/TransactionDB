@@ -26,6 +26,7 @@ int  tdb_pager_close(tdb_pager *p);
 
 uint32_t tdb_pager_page_size(tdb_pager *p);
 tdb_pgno tdb_pager_db_size(tdb_pager *p);
+tdb_pgno tdb_pager_freelist_count(tdb_pager *p);
 int      tdb_pager_is_readonly(tdb_pager *p);
 
 /* Pin and fetch a page (read from cache/WAL/file). Release with unref. */

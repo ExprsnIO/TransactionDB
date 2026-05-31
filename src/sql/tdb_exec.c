@@ -861,6 +861,10 @@ static int run_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
 
 #include "tdb_exec_dml.inc"
 
+/* ----------------------- streaming (volcano) path --------------------- */
+
+#include "tdb_exec_stream.inc"
+
 /* ------------------------------- EXPLAIN ------------------------------ */
 
 static void explain_line(tdb_stmt *st, const char *text) {
@@ -976,7 +980,11 @@ static int stmt_execute_locked(tdb_stmt *st) {
 
   int rc;
   switch (a->kind) {
-    case ST_SELECT: st->is_select = 1; rc = run_select(db, st, a->u.select); break;
+    case ST_SELECT:
+      st->is_select = 1;
+      if (!try_stream_select(db, st, a->u.select, &rc))
+        rc = run_select(db, st, a->u.select);
+      break;
     case ST_INSERT: rc = exec_insert(db, st, a); break;
     case ST_UPDATE: rc = exec_update(db, st, a); break;
     case ST_DELETE: rc = exec_delete(db, st, a); break;

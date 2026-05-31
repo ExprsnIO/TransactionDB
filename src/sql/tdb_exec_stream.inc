@@ -1,0 +1,301 @@
+/* tdb_exec_stream.inc — pull-based (volcano) operator tree.
+**
+** Included by tdb_exec.c after the materializing executor, this introduces a
+** small family of demand-driven operators — Scan, Filter, Project, Limit —
+** wired child-to-parent so each next() pulls one row from below. A SELECT that
+** is a single base-table scan with an optional WHERE / projection / LIMIT is
+** compiled into such a tree; the row at a time pull means a LIMIT stops the
+** scan early instead of materializing the whole table first.
+**
+** Stage 1 drains the tree to completion inside statement execution (the result
+** is still collected into st->rows), so the transaction lifetime is unchanged;
+** the win here is lazy evaluation with early termination and the operator
+** framework itself. A later stage will let tdb_step() pull through the tree
+** lazily across calls, holding the read snapshot open between rows.
+*/
+
+typedef enum { OP_SCAN, OP_FILTER, OP_PROJECT, OP_LIMIT } op_kind;
+
+typedef struct tdb_op {
+  op_kind        kind;
+  struct tdb_op *child;
+  tdb_db        *db;
+  tdb_stmt      *st;
+
+  /* OP_SCAN */
+  tdb_table     *tbl;
+  tdb_scan      *scan;
+  tdb_value     *scanrow;     /* reused decoded row (tbl->ncol values) */
+  tdb_index     *idx;
+  tdb_keyrange   range;
+  int            has_range;
+  uint8_t        colmask[64];
+  int            has_mask;
+
+  /* OP_FILTER */
+  tdb_expr      *pred;
+
+  /* OP_PROJECT */
+  tdb_expr     **oexpr;
+  int            nout;
+  tdb_value     *outrow;      /* reused projected row (nout values) */
+
+  /* OP_LIMIT */
+  int64_t        limit, offset, emitted, skipped;
+  int            has_limit;
+} tdb_op;
+
+/* ---- eligibility: reject anything the simple operators can't stream ---- */
+
+/* True if `e` contains an aggregate or a subquery (which Stage 1 won't stream). */
+static int expr_blocks_stream(const tdb_expr *e) {
+  if (!e) return 0;
+  switch (e->kind) {
+    case EX_AGG: case EX_SUBQUERY: case EX_EXISTS:
+      return 1;
+    case EX_IN:
+      if (e->subquery) return 1;
+      break;
+    default: break;
+  }
+  if (expr_blocks_stream(e->left) || expr_blocks_stream(e->right)) return 1;
+  if (e->args) for (int i = 0; i < e->args->n; i++)
+    if (expr_blocks_stream(e->args->items[i])) return 1;
+  return 0;
+}
+
+static int select_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_table **out_tbl) {
+  if (q->setop || q->group || q->having || q->distinct || q->order) return 0;
+  if (q->with) return 0;        /* its CTEs (which may shadow a table) aren't in scope here */
+  if (!q->from || q->from->next || q->from->subquery) return 0;
+  if (!q->from->table || q->from->as_of) return 0;
+  if (find_cte(st, q->from->table)) return 0;            /* CTE name shadows a table */
+  tdb_table *t = tdb_catalog_find_table(db->cat, q->from->table);
+  if (!t) return 0;                                      /* view / missing: not here */
+  if (expr_blocks_stream(q->where)) return 0;
+  if (q->cols) for (int i = 0; i < q->cols->n; i++)
+    if (expr_blocks_stream(q->cols->items[i])) return 0;
+  *out_tbl = t;
+  return 1;
+}
+
+/* ------------------------------ next() -------------------------------- */
+
+static int op_next(tdb_op *op, tdb_value **row, int *ncol);
+
+static int scan_next(tdb_op *op, tdb_value **row, int *ncol) {
+  tdb_rowid rid; const uint8_t *rec; int reclen;
+  int rc = op->db->engine->vtab->scan_next(op->scan, &rid, &rec, &reclen);
+  if (rc != TDB_ROW) return rc;                          /* TDB_DONE or error */
+  tdb_value tmp[64]; int nc = 0;
+  if (tdb_record_decode(rec, (size_t)reclen, tmp, 64, &nc)) return TDB_CORRUPT;
+  for (int i = 0; i < op->tbl->ncol; i++) {
+    tdb_value_clear(&op->scanrow[i]);
+    if (i < nc) tdb_value_copy(&op->scanrow[i], &tmp[i]);
+    else tdb_value_init(&op->scanrow[i]);
+  }
+  for (int i = 0; i < nc; i++) tdb_value_clear(&tmp[i]);
+  *row = op->scanrow; *ncol = op->tbl->ncol;
+  return TDB_ROW;
+}
+
+static int filter_next(tdb_op *op, tdb_value **row, int *ncol) {
+  for (;;) {
+    tdb_value *r; int nc;
+    int rc = op_next(op->child, &r, &nc);
+    if (rc != TDB_ROW) return rc;
+    ectx ec = { r, nc, NULL, 0, op->st, NULL, NULL };
+    tdb_value v; tdb_value_init(&v);
+    eval(op->db, &ec, op->pred, &v);
+    int ok = val_true(&v);
+    tdb_value_clear(&v);
+    if (ok) { *row = r; *ncol = nc; return TDB_ROW; }
+  }
+}
+
+static int project_next(tdb_op *op, tdb_value **row, int *ncol) {
+  tdb_value *r; int nc;
+  int rc = op_next(op->child, &r, &nc);
+  if (rc != TDB_ROW) return rc;
+  ectx ec = { r, nc, NULL, 0, op->st, NULL, NULL };
+  for (int i = 0; i < op->nout; i++) {
+    tdb_value_clear(&op->outrow[i]);
+    eval(op->db, &ec, op->oexpr[i], &op->outrow[i]);
+  }
+  *row = op->outrow; *ncol = op->nout;
+  return TDB_ROW;
+}
+
+static int limit_next(tdb_op *op, tdb_value **row, int *ncol) {
+  while (op->skipped < op->offset) {
+    tdb_value *r; int nc;
+    int rc = op_next(op->child, &r, &nc);
+    if (rc != TDB_ROW) return rc;
+    op->skipped++;
+  }
+  if (op->has_limit && op->emitted >= op->limit) return TDB_DONE;
+  tdb_value *r; int nc;
+  int rc = op_next(op->child, &r, &nc);
+  if (rc != TDB_ROW) return rc;
+  op->emitted++;
+  *row = r; *ncol = nc;
+  return TDB_ROW;
+}
+
+static int op_next(tdb_op *op, tdb_value **row, int *ncol) {
+  switch (op->kind) {
+    case OP_SCAN:    return scan_next(op, row, ncol);
+    case OP_FILTER:  return filter_next(op, row, ncol);
+    case OP_PROJECT: return project_next(op, row, ncol);
+    case OP_LIMIT:   return limit_next(op, row, ncol);
+  }
+  return TDB_DONE;
+}
+
+/* ------------------------------ close() ------------------------------- */
+
+static void op_close(tdb_op *op) {
+  if (!op) return;
+  if (op->child) op_close(op->child);
+  if (op->kind == OP_SCAN) {
+    if (op->scan) op->db->engine->vtab->scan_close(op->scan);
+    if (op->scanrow) { for (int i = 0; i < op->tbl->ncol; i++) tdb_value_clear(&op->scanrow[i]); tdb_mfree(op->scanrow); }
+  } else if (op->kind == OP_PROJECT) {
+    if (op->outrow) { for (int i = 0; i < op->nout; i++) tdb_value_clear(&op->outrow[i]); tdb_mfree(op->outrow); }
+    tdb_mfree(op->oexpr);    /* the array (its exprs are arena-owned) */
+  }
+  tdb_mfree(op);
+}
+
+/* ------------------------------ build --------------------------------- */
+
+static tdb_op *op_new(op_kind k, tdb_db *db, tdb_stmt *st) {
+  tdb_op *op = (tdb_op *)tdb_calloc(sizeof(*op));
+  if (op) { op->kind = k; op->db = db; op->st = st; }
+  return op;
+}
+
+/* Build a Scan -> [Filter] -> Project -> [Limit] tree for a streamable SELECT,
+** or return NULL (caller falls back to the materializing executor). On success
+** st->ncol / st->colnames are set and the scan is opened. */
+static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q) {
+  tdb_table *t = NULL;
+  if (!select_streamable(db, st, q, &t)) return NULL;
+
+  /* resolve WHERE + projection against a single-source context */
+  qctx Q; memset(&Q, 0, sizeof(Q));
+  Q.src[0].tbl = t; Q.src[0].base = 0; Q.src[0].ncol = t->ncol;
+  Q.nsrc = 1; Q.totalcols = t->ncol;
+
+  if (q->where && resolve_expr(db, &Q, q->where)) return NULL;
+
+  /* projection: expand '*', resolve exprs, collect output names */
+  tdb_expr **oexpr = NULL; char **onames = NULL; int nout = 0, ocap = 0;
+  #define SADD_OUT(E, NM) do { \
+    if (nout == ocap) { ocap = ocap ? ocap*2 : 8; \
+      oexpr = (tdb_expr**)tdb_realloc(oexpr, sizeof(void*)*(size_t)ocap); \
+      onames = (char**)tdb_realloc(onames, sizeof(void*)*(size_t)ocap); } \
+    oexpr[nout] = (E); onames[nout] = tdb_strdup((NM) ? (NM) : "column"); nout++; \
+  } while (0)
+  #define SFAIL do { for (int _si = 0; _si < nout; _si++) tdb_mfree(onames[_si]); \
+    tdb_mfree(oexpr); tdb_mfree(onames); return NULL; } while (0)
+
+  for (int i = 0; i < q->cols->n; i++) {
+    tdb_expr *item = q->cols->items[i];
+    char *alias = q->cols->aliases[i];
+    if (item->kind == EX_STAR) {
+      if (item->table) {
+        const char *nm = t->name;
+        if (strcasecmp(nm, item->table) != 0) SFAIL;
+      }
+      for (int k = 0; k < t->ncol; k++) {
+        if (t->cols[k].hidden) continue;
+        tdb_expr *col = tdb_expr_new(st->arena, EX_COLUMN);
+        col->name = (char *)t->cols[k].name;
+        col->col_index = k;
+        SADD_OUT(col, t->cols[k].name);
+      }
+    } else {
+      if (resolve_expr(db, &Q, item)) SFAIL;
+      const char *nm = alias ? alias : (item->kind == EX_COLUMN ? item->name : NULL);
+      SADD_OUT(item, nm);
+    }
+  }
+
+  /* index / spatial pick + projection pushdown mask for the scan */
+  tdb_index *idx = NULL; tdb_keyrange kr; int have_idx = 0;
+  tdb_value_init(&kr.lo); tdb_value_init(&kr.hi);
+  if (t->nindex > 0 && pick_index(db, st, t, q->where, &idx, &kr)) have_idx = 1;
+
+  /* The scan op holds the colmask (the columnar engine keeps the pointer and
+  ** dereferences it during the drain — it must outlive this function). */
+  tdb_op *scan = op_new(OP_SCAN, db, st);
+  scan->tbl = t;
+  scan->has_mask = compute_colmask(t, q, scan->colmask);
+
+  tdb_scan *sc = NULL;
+  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, have_idx ? idx : NULL,
+                                       have_idx ? &kr : NULL, 0,
+                                       scan->has_mask ? scan->colmask : NULL, &sc);
+  tdb_value_clear(&kr.lo); tdb_value_clear(&kr.hi);
+  if (rc) { op_close(scan); SFAIL; }
+
+  /* assemble the operator tree */
+  scan->scan = sc;
+  scan->scanrow = row_alloc(t->ncol);
+
+  tdb_op *src = scan;
+  if (q->where) {
+    tdb_op *flt = op_new(OP_FILTER, db, st);
+    flt->child = src; flt->pred = q->where;
+    src = flt;
+  }
+
+  tdb_op *proj = op_new(OP_PROJECT, db, st);
+  proj->child = src; proj->oexpr = oexpr; proj->nout = nout;
+  proj->outrow = row_alloc(nout);
+  src = proj;
+
+  if (q->has_limit || q->offset) {
+    tdb_op *lim = op_new(OP_LIMIT, db, st);
+    lim->child = src;
+    lim->has_limit = q->has_limit;
+    lim->limit = q->has_limit ? const_int(db, st, q->limit, -1) : -1;
+    lim->offset = q->offset ? const_int(db, st, q->offset, 0) : 0;
+    if (lim->limit < 0) lim->has_limit = 0;
+    if (lim->offset < 0) lim->offset = 0;
+    src = lim;
+  }
+
+  st->ncol = nout;
+  st->colnames = onames;     /* ownership transfers to the statement */
+  #undef SADD_OUT
+  #undef SFAIL
+  return src;
+}
+
+/* Drain the operator tree into st->rows (Stage 1: result still materialized). */
+static int drain_stream(tdb_db *db, tdb_stmt *st, tdb_op *root) {
+  TDB_UNUSED(db);
+  int rc;
+  for (;;) {
+    tdb_value *row; int nc;
+    rc = op_next(root, &row, &nc);
+    if (rc == TDB_DONE) { rc = TDB_OK; break; }
+    if (rc != TDB_ROW) break;            /* error */
+    add_result_row(st, dup_row(row, nc));
+  }
+  return rc;
+}
+
+/* Entry point: try to run `q` via the streaming operator tree. Returns 1 if it
+** handled the query (rc in *out_rc), 0 if not streamable (use materialize). */
+static int try_stream_select(tdb_db *db, tdb_stmt *st, tdb_select *q, int *out_rc) {
+  tdb_op *root = build_stream_plan(db, st, q);
+  if (!root) return 0;
+  int rc = drain_stream(db, st, root);
+  op_close(root);
+  st->cur = -1;
+  *out_rc = rc;
+  return 1;
+}

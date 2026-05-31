@@ -53,10 +53,11 @@ static int d_seek_rowid(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_rowid ro
   tdb_storage *e = pick(s, t); return e->vtab->seek_rowid(e, txn, t, rowid, rec, reclen, found);
 }
 static int d_scan_open(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_index *use_idx,
-                       const tdb_keyrange *range, tdb_txnid as_of, tdb_scan **out) {
+                       const tdb_keyrange *range, tdb_txnid as_of,
+                       const uint8_t *colmask, tdb_scan **out) {
   tdb_storage *e = pick(s, t);
   tdb_scan *sub = NULL;
-  int rc = e->vtab->scan_open(e, txn, t, use_idx, range, as_of, &sub);
+  int rc = e->vtab->scan_open(e, txn, t, use_idx, range, as_of, colmask, &sub);
   if (rc) return rc;
   tdb_scan *w = (tdb_scan *)tdb_calloc(sizeof(*w));
   if (!w) { e->vtab->scan_close(sub); return TDB_NOMEM; }

@@ -144,11 +144,46 @@ static int pick_index(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_expr *where,
   return 0;
 }
 
+/* mark columns of `t` referenced by an expression (projection pushdown).
+** Conservative: a subquery marks everything (in case it is correlated). */
+static void mark_cols(tdb_table *t, tdb_expr *e, uint8_t *mask) {
+  if (!e) return;
+  switch (e->kind) {
+    case EX_STAR:
+      for (int i = 0; i < t->ncol; i++) mask[i] = 1;
+      return;
+    case EX_COLUMN:
+      if (e->name) { int ci = tdb_table_find_column(t, e->name); if (ci >= 0) mask[ci] = 1; }
+      return;
+    case EX_SUBQUERY: case EX_EXISTS:
+      for (int i = 0; i < t->ncol; i++) mask[i] = 1;
+      return;
+    default:
+      mark_cols(t, e->left, mask);
+      mark_cols(t, e->right, mask);
+      if (e->args) for (int i = 0; i < e->args->n; i++) mark_cols(t, e->args->items[i], mask);
+      return;
+  }
+}
+
+/* Build a needed-column mask for a lone base table; returns 1 if computed. */
+static int compute_colmask(tdb_table *t, tdb_select *q, uint8_t *mask) {
+  if (t->ncol > 64) return 0;
+  memset(mask, 0, (size_t)t->ncol);
+  if (q->cols) for (int i = 0; i < q->cols->n; i++) mark_cols(t, q->cols->items[i], mask);
+  mark_cols(t, q->where, mask);
+  if (q->group) for (int i = 0; i < q->group->n; i++) mark_cols(t, q->group->items[i], mask);
+  mark_cols(t, q->having, mask);
+  if (q->order) for (int i = 0; i < q->order->n; i++) mark_cols(t, q->order->exprs[i], mask);
+  return 1;
+}
+
 /* Resolve a FROM item (base table / derived table / view) and materialize its
 ** rows into `set`, filling Q->src[idx] (caller advances totalcols/nsrc). */
 static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
                               tdb_src *s, tdb_index *use_idx,
-                              const tdb_keyrange *range, rowset *set) {
+                              const tdb_keyrange *range, const uint8_t *colmask,
+                              rowset *set) {
   qsrc *qs = &Q->src[idx];
   memset(qs, 0, sizeof(*qs));
   qs->alias = s->alias; qs->base = Q->totalcols; qs->join = s->join; qs->on = s->on;
@@ -166,7 +201,7 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
         as_of = (tdb_txnid)tdb_value_as_int(&v);
         tdb_value_clear(&v);
       }
-      return mat_table(db, t, use_idx, range, as_of, set);
+      return mat_table(db, t, use_idx, range, as_of, colmask, set);
     }
     tdb_view *v = tdb_catalog_find_view(db->cat, s->table);
     if (!v) { tdb_db_seterr(db, "no such table: %s", s->table); return TDB_ERROR; }
@@ -210,10 +245,12 @@ static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   /* rule-based index pick: a lone base table with an indexable WHERE */
   tdb_index *use_idx = NULL; tdb_keyrange krange; int have_idx = 0;
   tdb_value_init(&krange.lo); tdb_value_init(&krange.hi);
+  uint8_t colmask[64]; int have_mask = 0;
   if (q->from && !q->from->next && !q->from->subquery && q->from->table) {
     tdb_table *bt = tdb_catalog_find_table(db->cat, q->from->table);
     if (bt && bt->nindex > 0 && pick_index(db, st, bt, q->where, &use_idx, &krange))
       have_idx = 1;
+    if (bt) have_mask = compute_colmask(bt, q, colmask);
   }
 
   /* 1. sources: base table / derived table / view — materialize each */
@@ -227,7 +264,8 @@ static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
     int idx = Q.nsrc;
     tdb_index *si = (idx == 0 && have_idx) ? use_idx : NULL;
     const tdb_keyrange *sr = (idx == 0 && have_idx) ? &krange : NULL;
-    int rc = materialize_source(db, st, &Q, idx, s, si, sr, &sets[idx]);
+    const uint8_t *cm = (idx == 0 && have_mask) ? colmask : NULL;
+    int rc = materialize_source(db, st, &Q, idx, s, si, sr, cm, &sets[idx]);
     if (rc) { for (int j = 0; j < Q.nsrc; j++) rowset_free(&sets[j]);
               tdb_value_clear(&krange.lo); tdb_value_clear(&krange.hi); return rc; }
     Q.totalcols += Q.src[idx].ncol;

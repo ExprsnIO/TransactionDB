@@ -89,7 +89,7 @@ static int binprec(int op) {
     case TK_OR: return 1;
     case TK_AND: return 2;
     case TK_EQ: case TK_NE: case TK_LT: case TK_LE: case TK_GT: case TK_GE:
-    case TK_IS: case TK_IN: case TK_LIKE: case TK_BETWEEN: return 4;
+    case TK_IS: case TK_IN: case TK_LIKE: case TK_GLOB: case TK_BETWEEN: return 4;
     case TK_PLUS: case TK_MINUS: return 6;
     case TK_STAR: case TK_SLASH: case TK_PERCENT: return 7;
     case TK_CONCAT: return 8;
@@ -225,7 +225,8 @@ static tdb_expr *parse_expr(P *p, int minprec) {
     if (op == TK_NOT) {  /* expr NOT IN / NOT LIKE / NOT BETWEEN */
       tdb_lexer save = p->lx; tdb_token savecur = p->cur;
       advance(p);
-      if (p->cur.kind == TK_IN || p->cur.kind == TK_LIKE || p->cur.kind == TK_BETWEEN) {
+      if (p->cur.kind == TK_IN || p->cur.kind == TK_LIKE ||
+          p->cur.kind == TK_GLOB || p->cur.kind == TK_BETWEEN) {
         negated = 1; op = p->cur.kind;
       } else { p->lx = save; p->cur = savecur; break; }
     }
@@ -265,6 +266,18 @@ static tdb_expr *parse_expr(P *p, int minprec) {
       e->negated = isnot;
       e->left = left;
       e->right = parse_unary(p);   /* IS [NOT] NULL / value */
+      left = e; continue;
+    }
+    if (op == TK_LIKE || op == TK_GLOB) {
+      advance(p);
+      tdb_expr *e = tdb_expr_new(p->a, EX_BINARY);
+      e->op = op; e->negated = negated; e->left = left;
+      e->right = parse_expr(p, prec + 1);
+      /* optional ESCAPE clause: LIKE pat ESCAPE 'c' (the escape expr lives in args) */
+      if (accept(p, TK_ESCAPE)) {
+        e->args = tdb_exprlist_new(p->a);
+        tdb_exprlist_add(p->a, e->args, parse_expr(p, prec + 1), NULL);
+      }
       left = e; continue;
     }
 

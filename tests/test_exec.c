@@ -173,6 +173,31 @@ static void test_like_distinct(void) {
   tdb_close(db);
 }
 
+static void test_glob_escape(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)");
+  exec(db, "INSERT INTO t VALUES (1,'Apple'),(2,'banana'),(3,'50% off'),"
+           "(4,'a_b'),(5,'Cherry'),(6,'apple2')");
+
+  /* GLOB is case-sensitive with Unix wildcards */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE s GLOB 'A*'"), 1);     /* Apple */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE s GLOB 'a*'"), 2);     /* a_b, apple2 */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE s GLOB '?pple'"), 1);  /* Apple */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE s GLOB '[a-c]*'"), 3); /* banana, a_b, apple2 */
+  /* char class + negation */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE s GLOB '[A-Z]*'"), 2); /* Apple, Cherry */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE s NOT GLOB '[A-Z]*'"), 4);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE s GLOB '[^A-Z]*'"), 4);
+
+  /* LIKE ... ESCAPE: the escape char makes %/_ literal */
+  check_text(db, "SELECT s FROM t WHERE s LIKE '50!% off' ESCAPE '!'", "50% off");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE s LIKE '%!%%' ESCAPE '!'"), 1); /* contains a % */
+  check_text(db, "SELECT s FROM t WHERE s LIKE 'a!_b' ESCAPE '!'", "a_b");
+  /* without ESCAPE, _ is a wildcard so a_b and (no others of len 3) match */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE s LIKE 'a_b'"), 1);
+  tdb_close(db);
+}
+
 static void test_builtins(void) {
   tdb_db *db; tdb_open(":memory:", &db);
   check_text(db, "SELECT upper('ab') || substr('hello', 2, 3)", "ABell");
@@ -668,6 +693,7 @@ static tdb_test_case cases[] = {
   {"columnar", test_columnar},
   {"columnar_temporal_persist", test_columnar_temporal_persist},
   {"like_distinct", test_like_distinct},
+  {"glob_escape", test_glob_escape},
   {"builtins", test_builtins},
   {"subqueries", test_subqueries},
   {"insert_select", test_insert_select},

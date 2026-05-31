@@ -206,19 +206,62 @@ static int val_true(const tdb_value *v) {
   return v->u.s.n != 0;
 }
 
-/* SQL LIKE: '%' matches any run, '_' matches one char (case-insensitive). */
-static int like_match(const char *pat, const char *str) {
+/* SQL LIKE: '%' matches any run, '_' matches one char (case-insensitive).
+** `esc` (0 = none) makes the following pattern char a literal. */
+static int like_match(const char *pat, const char *str, int esc) {
   while (*pat) {
-    if (*pat == '%') {
+    if (esc && (unsigned char)*pat == esc && pat[1]) {
+      if (tolower((unsigned char)pat[1]) != tolower((unsigned char)*str)) return 0;
+      pat += 2; str++;
+    } else if (*pat == '%') {
       while (*pat == '%') pat++;
       if (!*pat) return 1;
-      for (; *str; str++) if (like_match(pat, str)) return 1;
+      for (; *str; str++) if (like_match(pat, str, esc)) return 1;
       return 0;
     } else if (*pat == '_') {
       if (!*str) return 0;
       pat++; str++;
     } else {
       if (tolower((unsigned char)*pat) != tolower((unsigned char)*str)) return 0;
+      pat++; str++;
+    }
+  }
+  return *str == 0;
+}
+
+/* SQL GLOB: case-sensitive Unix-style wildcards — '*' matches any run, '?'
+** matches one char, and '[...]' a char class ('^' negates, 'a-z' ranges). */
+static int glob_match(const char *pat, const char *str) {
+  while (*pat) {
+    if (*pat == '*') {
+      while (*pat == '*') pat++;
+      if (!*pat) return 1;
+      for (; *str; str++) if (glob_match(pat, str)) return 1;
+      return 0;
+    } else if (*pat == '?') {
+      if (!*str) return 0;
+      pat++; str++;
+    } else if (*pat == '[') {
+      const char *p = pat + 1;
+      int neg = 0;
+      if (*p == '^') { neg = 1; p++; }
+      const char *first = p;
+      int matched = 0;
+      while (*p && (p == first || *p != ']')) {
+        if (p[1] == '-' && p[2] && p[2] != ']') {
+          if ((unsigned char)*str >= (unsigned char)p[0] &&
+              (unsigned char)*str <= (unsigned char)p[2]) matched = 1;
+          p += 3;
+        } else {
+          if (*str == *p) matched = 1;
+          p++;
+        }
+      }
+      if (*p != ']') return 0;              /* unterminated class */
+      if (!*str || matched == neg) return 0;
+      pat = p + 1; str++;
+    } else {
+      if (*pat != *str) return 0;
       pat++; str++;
     }
   }
@@ -259,10 +302,23 @@ static int eval_binary(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     goto done;
   }
 
-  if (op == TK_LIKE) {
+  if (op == TK_LIKE || op == TK_GLOB) {
     if (l.type == TDB_VAL_NULL || r.type == TDB_VAL_NULL) { tdb_value_set_null(out); goto done; }
     const char *s = tdb_value_as_text(&l), *p = tdb_value_as_text(&r);
-    int m = like_match(p ? p : "", s ? s : "");
+    int m;
+    if (op == TK_GLOB) {
+      m = glob_match(p ? p : "", s ? s : "");
+    } else {
+      int esc = 0;
+      if (e->args && e->args->n > 0) {     /* ESCAPE 'c' */
+        tdb_value ev; tdb_value_init(&ev);
+        eval(db, c, e->args->items[0], &ev);
+        const char *es = tdb_value_as_text(&ev);
+        if (es && es[0]) esc = (unsigned char)es[0];
+        tdb_value_clear(&ev);
+      }
+      m = like_match(p ? p : "", s ? s : "", esc);
+    }
     if (e->negated) m = !m;
     tdb_value_set_int(out, m);
     goto done;

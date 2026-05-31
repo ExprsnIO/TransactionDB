@@ -1,5 +1,7 @@
 /* tdb_sqltype.c — strict SQL type parsing, classification, and coercion. */
 #include "tdb_sqltype.h"
+#include "tdb_geom.h"
+#include "../common/tdb_buf.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -32,6 +34,9 @@ static const type_alias k_aliases[] = {
   {"TIME", TDB_T_TIME},
   {"JSON", TDB_T_JSON}, {"JSONB", TDB_T_JSON},
   {"UUID", TDB_T_UUID}, {"GUID", TDB_T_UUID},
+  {"GEOMETRY", TDB_T_GEOMETRY}, {"GEOM", TDB_T_GEOMETRY},
+  {"POINT", TDB_T_POINT},
+  {"GEOGRAPHY", TDB_T_GEOGRAPHY}, {"GEOG", TDB_T_GEOGRAPHY},
 };
 
 const char *tdb_typeid_name(tdb_typeid id) {
@@ -55,6 +60,9 @@ const char *tdb_typeid_name(tdb_typeid id) {
     case TDB_T_TIMESTAMP: return "TIMESTAMP";
     case TDB_T_JSON:      return "JSON";
     case TDB_T_UUID:      return "UUID";
+    case TDB_T_GEOMETRY:  return "GEOMETRY";
+    case TDB_T_POINT:     return "POINT";
+    case TDB_T_GEOGRAPHY: return "GEOGRAPHY";
     default:              return "UNKNOWN";
   }
 }
@@ -109,6 +117,9 @@ tdb_valtype tdb_typespec_storage(const tdb_typespec *ts) {
     case TDB_T_BINARY:
     case TDB_T_VARBINARY:
     case TDB_T_BLOB:
+    case TDB_T_GEOMETRY:
+    case TDB_T_POINT:
+    case TDB_T_GEOGRAPHY:
       return TDB_VAL_BLOB;
     default:
       /* DECIMAL, CHAR/VARCHAR/TEXT, DATE/TIME/TIMESTAMP, JSON, UUID
@@ -279,6 +290,37 @@ int tdb_typespec_coerce(tdb_value *v, const tdb_typespec *ts, const char **why) 
         return TDB_OK;
       }
       if (why) *why = "not a date/time";
+      return TDB_MISMATCH;
+    }
+    case TDB_T_GEOMETRY:
+    case TDB_T_POINT:
+    case TDB_T_GEOGRAPHY: {
+      /* Accept WKT text (parse to binary) or an already-encoded geometry blob. */
+      if (v->type == TDB_VAL_TEXT) {
+        tdb_buf b; tdb_buf_init(&b);
+        const char *gw = NULL;
+        if (tdb_geom_from_wkt(v->u.s.p, &b, &gw) != TDB_OK) {
+          tdb_buf_free(&b);
+          if (why) *why = gw ? gw : "invalid geometry WKT";
+          return TDB_MISMATCH;
+        }
+        if (ts->id == TDB_T_POINT && tdb_geom_type_of(b.data, (int)b.len) != TDB_GEOM_POINT) {
+          tdb_buf_free(&b);
+          if (why) *why = "expected a POINT geometry";
+          return TDB_CONSTRAINT;
+        }
+        tdb_value_set_blob(v, b.data, (int)b.len, 1);
+        tdb_buf_free(&b);
+        return TDB_OK;
+      }
+      if (v->type == TDB_VAL_BLOB) {
+        if (!tdb_geom_valid(v->u.s.p ? (const uint8_t *)v->u.s.p : (const uint8_t *)"", (int)v->u.s.n)) {
+          if (why) *why = "invalid geometry blob";
+          return TDB_MISMATCH;
+        }
+        return TDB_OK;
+      }
+      if (why) *why = "not a geometry";
       return TDB_MISMATCH;
     }
     default:

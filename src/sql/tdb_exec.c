@@ -17,6 +17,7 @@
 #include "../common/tdb_mem.h"
 #include "../value/tdb_record.h"
 #include "../value/tdb_sqltype.h"
+#include "../value/tdb_geom.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -407,6 +408,16 @@ done:
   return rc;
 }
 
+/* representative point of a geometry value (POINT -> itself, else bbox center) */
+static int rep_point_of(const tdb_value *v, double *x, double *y) {
+  const uint8_t *b = (const uint8_t *)v->u.s.p; int n = (int)v->u.s.n;
+  if (tdb_geom_point_xy(b, n, x, y) == TDB_OK) return TDB_OK;
+  tdb_bbox bb;
+  if (tdb_geom_bbox(b, n, &bb) != TDB_OK) return TDB_MISMATCH;
+  *x = (bb.minx + bb.maxx) * 0.5; *y = (bb.miny + bb.maxy) * 0.5;
+  return TDB_OK;
+}
+
 static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
   const char *fn = e->name;
   int argc = e->args ? e->args->n : 0;
@@ -505,6 +516,78 @@ static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     tdb_value_clear(&v);
   } else if (!strcasecmp(fn, "current_version") && argc == 0) {
     tdb_value_set_int(out, (int64_t)tdb_pager_max_txnid(db->pager)); /* system-time clock */
+  } else if ((!strcasecmp(fn, "st_geomfromtext") || !strcasecmp(fn, "st_geometryfromtext") ||
+              !strcasecmp(fn, "geomfromtext")) && argc == 1) {
+    /* WKT text -> geometry blob */
+    const char *s = tdb_value_as_text(&a0);
+    if (!s) { tdb_value_set_null(out); }
+    else {
+      tdb_buf b; tdb_buf_init(&b); const char *gw = NULL;
+      if (tdb_geom_from_wkt(s, &b, &gw)) { tdb_buf_free(&b); tdb_value_clear(&a0);
+        tdb_db_seterr(db, "ST_GeomFromText: %s", gw ? gw : "invalid WKT"); return TDB_ERROR; }
+      tdb_value_set_blob(out, b.data, (int)b.len, 1); tdb_buf_free(&b);
+    }
+  } else if (!strcasecmp(fn, "st_point") && argc == 2) {
+    tdb_value v1; tdb_value_init(&v1); eval(db, c, e->args->items[1], &v1);
+    if (a0.type == TDB_VAL_NULL || v1.type == TDB_VAL_NULL) tdb_value_set_null(out);
+    else {
+      char wkt[96];
+      snprintf(wkt, sizeof(wkt), "POINT(%g %g)", tdb_value_as_real(&a0), tdb_value_as_real(&v1));
+      tdb_buf b; tdb_buf_init(&b); const char *gw = NULL;
+      tdb_geom_from_wkt(wkt, &b, &gw);
+      tdb_value_set_blob(out, b.data, (int)b.len, 1); tdb_buf_free(&b);
+    }
+    tdb_value_clear(&v1);
+  } else if ((!strcasecmp(fn, "st_astext") || !strcasecmp(fn, "astext")) && argc == 1) {
+    if (a0.type != TDB_VAL_BLOB) { tdb_value_set_null(out); }
+    else {
+      tdb_buf b; tdb_buf_init(&b);
+      if (tdb_geom_to_wkt((const uint8_t *)a0.u.s.p, (int)a0.u.s.n, &b)) tdb_value_set_null(out);
+      else tdb_value_set_text(out, (const char *)b.data, (int)b.len, 1);
+      tdb_buf_free(&b);
+    }
+  } else if ((!strcasecmp(fn, "st_x") || !strcasecmp(fn, "st_y")) && argc == 1) {
+    double x, y;
+    if (a0.type != TDB_VAL_BLOB ||
+        tdb_geom_point_xy((const uint8_t *)a0.u.s.p, (int)a0.u.s.n, &x, &y)) tdb_value_set_null(out);
+    else tdb_value_set_real(out, !strcasecmp(fn, "st_x") ? x : y);
+  } else if (!strcasecmp(fn, "st_distance") && argc == 2) {
+    tdb_value v1; tdb_value_init(&v1); eval(db, c, e->args->items[1], &v1);
+    double d;
+    if (a0.type != TDB_VAL_BLOB || v1.type != TDB_VAL_BLOB ||
+        tdb_geom_distance((const uint8_t *)a0.u.s.p, (int)a0.u.s.n,
+                          (const uint8_t *)v1.u.s.p, (int)v1.u.s.n, &d)) tdb_value_set_null(out);
+    else tdb_value_set_real(out, d);
+    tdb_value_clear(&v1);
+  } else if (!strcasecmp(fn, "st_dwithin") && argc == 3) {
+    tdb_value v1, v2; tdb_value_init(&v1); tdb_value_init(&v2);
+    eval(db, c, e->args->items[1], &v1); eval(db, c, e->args->items[2], &v2);
+    double d;
+    if (a0.type != TDB_VAL_BLOB || v1.type != TDB_VAL_BLOB ||
+        tdb_geom_distance((const uint8_t *)a0.u.s.p, (int)a0.u.s.n,
+                          (const uint8_t *)v1.u.s.p, (int)v1.u.s.n, &d)) tdb_value_set_null(out);
+    else tdb_value_set_int(out, d <= tdb_value_as_real(&v2) ? 1 : 0);
+    tdb_value_clear(&v1); tdb_value_clear(&v2);
+  } else if ((!strcasecmp(fn, "st_contains") || !strcasecmp(fn, "st_within")) && argc == 2) {
+    /* ST_Contains(a,b): a polygon contains b's representative point.
+    ** ST_Within(a,b): a's point is within b -> swap operands. */
+    tdb_value v1; tdb_value_init(&v1); eval(db, c, e->args->items[1], &v1);
+    const tdb_value *poly = !strcasecmp(fn, "st_contains") ? &a0 : &v1;
+    const tdb_value *pt   = !strcasecmp(fn, "st_contains") ? &v1 : &a0;
+    double px, py;
+    if (poly->type != TDB_VAL_BLOB || pt->type != TDB_VAL_BLOB ||
+        rep_point_of(pt, &px, &py)) tdb_value_set_null(out);
+    else tdb_value_set_int(out,
+        tdb_geom_contains_point((const uint8_t *)poly->u.s.p, (int)poly->u.s.n, px, py) ? 1 : 0);
+    tdb_value_clear(&v1);
+  } else if (!strcasecmp(fn, "st_intersects") && argc == 2) {
+    tdb_value v1; tdb_value_init(&v1); eval(db, c, e->args->items[1], &v1);
+    tdb_bbox ba, bb;
+    if (a0.type != TDB_VAL_BLOB || v1.type != TDB_VAL_BLOB ||
+        tdb_geom_bbox((const uint8_t *)a0.u.s.p, (int)a0.u.s.n, &ba) ||
+        tdb_geom_bbox((const uint8_t *)v1.u.s.p, (int)v1.u.s.n, &bb)) tdb_value_set_null(out);
+    else tdb_value_set_int(out, tdb_bbox_intersects(&ba, &bb) ? 1 : 0);
+    tdb_value_clear(&v1);
   } else {
 #ifdef TDB_HAVE_LUA
     if (db->lua && tdb_catalog_find_routine(db->cat, fn)) {

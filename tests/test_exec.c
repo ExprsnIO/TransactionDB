@@ -965,7 +965,76 @@ static void test_cte(void) {
   tdb_close(db);
 }
 
+/* scalar SELECT returning one double (rounded compare via the caller) */
+static double scalar_real(tdb_db *db, const char *sql) {
+  tdb_stmt *s = NULL;
+  if (tdb_prepare_v2(db, sql, -1, &s, NULL) != TDB_OK) return -1e300;
+  double v = -1e300;
+  if (tdb_step(s) == TDB_ROW) v = tdb_column_double(s, 0);
+  tdb_finalize(s);
+  return v;
+}
+
+static void test_geospatial(void) {
+  const char *path = "test_geo.db";
+  remove(path); remove("test_geo.db-wal");
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE places (id INTEGER PRIMARY KEY, name TEXT, geom GEOMETRY)"), TDB_OK);
+  exec(db, "INSERT INTO places VALUES (1,'origin','POINT(0 0)')");
+  exec(db, "INSERT INTO places VALUES (2,'far','POINT(3 4)')");
+  exec(db, "INSERT INTO places VALUES (3,'line','LINESTRING(0 0, 2 2, 4 0)')");
+  exec(db, "INSERT INTO places VALUES (4,'sq','POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))')");
+
+  /* WKT round-trips through the binary encoding */
+  check_text(db, "SELECT ST_AsText(geom) FROM places WHERE id=1", "POINT(0 0)");
+  check_text(db, "SELECT ST_AsText(geom) FROM places WHERE id=3", "LINESTRING(0 0, 2 2, 4 0)");
+  check_text(db, "SELECT ST_AsText(geom) FROM places WHERE id=4", "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))");
+
+  /* coordinate accessors */
+  TDB_CHECK_EQ((int)(scalar_real(db, "SELECT ST_X(geom) FROM places WHERE id=2") + 0.5), 3);
+  TDB_CHECK_EQ((int)(scalar_real(db, "SELECT ST_Y(geom) FROM places WHERE id=2") + 0.5), 4);
+
+  /* distance: 3-4-5 right triangle */
+  TDB_CHECK_EQ((int)(scalar_real(db,
+    "SELECT ST_Distance((SELECT geom FROM places WHERE id=1),"
+    "(SELECT geom FROM places WHERE id=2))") + 0.5), 5);
+
+  /* ST_Point constructor + ST_DWithin as a WHERE predicate */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM places WHERE ST_DWithin(geom, ST_Point(0,0), 1.0)"), 1); /* only origin */
+  /* reps: origin(0,0) d=0; far(3,4) d=5; line center(2,1) d~2.24; square
+  ** center(5,5) d~7.07. Within 6.0 -> origin, far, line = 3. */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM places WHERE ST_DWithin(geom, ST_Point(0,0), 6.0)"), 3);
+
+  /* polygon containment */
+  TDB_CHECK_EQ(scalar(db, "SELECT ST_Contains((SELECT geom FROM places WHERE id=4), ST_Point(5,5))"), 1);
+  TDB_CHECK_EQ(scalar(db, "SELECT ST_Contains((SELECT geom FROM places WHERE id=4), ST_Point(50,50))"), 0);
+  /* ST_Within is the inverse argument order */
+  TDB_CHECK_EQ(scalar(db, "SELECT ST_Within(ST_Point(5,5), (SELECT geom FROM places WHERE id=4))"), 1);
+
+  /* bounding-box intersection */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT ST_Intersects((SELECT geom FROM places WHERE id=3),"
+    "(SELECT geom FROM places WHERE id=4))"), 1);
+
+  /* strict typing: a POINT column rejects a non-point and bad WKT */
+  exec(db, "CREATE TABLE pts (id INTEGER PRIMARY KEY, p POINT)");
+  TDB_CHECK_EQ(exec(db, "INSERT INTO pts VALUES (1,'POINT(1 2)')"), TDB_OK);
+  TDB_CHECK(exec(db, "INSERT INTO pts VALUES (2,'LINESTRING(0 0,1 1)')") != TDB_OK);
+  TDB_CHECK(exec(db, "INSERT INTO pts VALUES (3,'POINT(nope)')") != TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM pts"), 1);
+  tdb_close(db);
+
+  /* geometry persists across reopen */
+  tdb_open(path, &db);
+  check_text(db, "SELECT ST_AsText(geom) FROM places WHERE id=2", "POINT(3 4)");
+  TDB_CHECK_EQ((int)(scalar_real(db, "SELECT ST_X(p) FROM pts WHERE id=1") + 0.5), 1);
+  tdb_close(db);
+  remove(path); remove("test_geo.db-wal");
+}
+
 static tdb_test_case cases[] = {
+  {"geospatial", test_geospatial},
   {"upsert", test_upsert},
   {"returning", test_returning},
   {"cte", test_cte},

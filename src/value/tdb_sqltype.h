@@ -40,7 +40,11 @@ typedef enum tdb_typeid {
   TDB_T_TIMESTAMP,
   /* extended common types */
   TDB_T_JSON,
-  TDB_T_UUID
+  TDB_T_UUID,
+  /* geospatial: stored as a binary geometry blob (see tdb_geom.h) */
+  TDB_T_GEOMETRY,
+  TDB_T_POINT,
+  TDB_T_GEOGRAPHY
 } tdb_typeid;
 
 typedef struct tdb_typespec {

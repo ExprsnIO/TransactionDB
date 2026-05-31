@@ -449,6 +449,55 @@ static void test_projection_pushdown(void) {
   tdb_close(db);
 }
 
+static void test_alter(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,10),(2,20)");
+
+  /* ADD COLUMN: existing rows read NULL for it */
+  TDB_CHECK_EQ(exec(db, "ALTER TABLE t ADD COLUMN b TEXT"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE b IS NULL"), 2);
+  exec(db, "INSERT INTO t (id, a, b) VALUES (3, 30, 'hi')");
+  check_text(db, "SELECT b FROM t WHERE id = 3", "hi");
+
+  /* RENAME COLUMN */
+  TDB_CHECK_EQ(exec(db, "ALTER TABLE t RENAME COLUMN a TO age"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT age FROM t WHERE id = 1"), 10);
+  TDB_CHECK(exec(db, "SELECT a FROM t") != TDB_OK);     /* old name gone */
+
+  /* RENAME TABLE */
+  TDB_CHECK_EQ(exec(db, "ALTER TABLE t RENAME TO tt"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM tt"), 3);
+  TDB_CHECK(exec(db, "SELECT * FROM t") != TDB_OK);
+
+  /* ADD COLUMN on a columnar table (provisions a new column b-tree) */
+  exec(db, "CREATE TABLE c (id INTEGER PRIMARY KEY, x INTEGER) WITH COLUMNAR");
+  exec(db, "INSERT INTO c VALUES (1, 100)");
+  TDB_CHECK_EQ(exec(db, "ALTER TABLE c ADD COLUMN y INTEGER"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM c WHERE y IS NULL"), 1);
+  exec(db, "INSERT INTO c (id, x, y) VALUES (2, 200, 222)");
+  TDB_CHECK_EQ(scalar(db, "SELECT y FROM c WHERE id = 2"), 222);
+  tdb_close(db);
+}
+
+static void test_alter_persist(void) {
+  const char *path = "test_alter.db";
+  remove(path); remove("test_alter.db-wal");
+  tdb_db *db; tdb_open(path, &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1, 10)");
+  exec(db, "ALTER TABLE t ADD COLUMN note TEXT");
+  exec(db, "ALTER TABLE t RENAME TO renamed");
+  tdb_close(db);
+  /* reopen: the new column and table rename must have persisted */
+  tdb_open(path, &db);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM renamed"), 1);
+  exec(db, "INSERT INTO renamed (id, a, note) VALUES (2, 20, 'kept')");
+  check_text(db, "SELECT note FROM renamed WHERE id = 2", "kept");
+  tdb_close(db);
+  remove(path); remove("test_alter.db-wal");
+}
+
 static tdb_test_case cases[] = {
   {"ddl_dml_select", test_ddl_dml_select},
   {"derived_and_view", test_derived_and_view},
@@ -456,6 +505,8 @@ static tdb_test_case cases[] = {
   {"setops", test_setops},
   {"explain_vacuum", test_explain_vacuum},
   {"projection_pushdown", test_projection_pushdown},
+  {"alter", test_alter},
+  {"alter_persist", test_alter_persist},
   {"index_scan", test_index_scan},
   {"index_persist", test_index_persist},
   {"savepoints", test_savepoints},

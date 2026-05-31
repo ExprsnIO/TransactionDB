@@ -763,6 +763,7 @@ int tdb_stmt_execute(tdb_stmt *st) {
     case ST_CREATE_VIEW: rc = exec_create_view(db, st, a); break;
     case ST_CREATE_ROUTINE: rc = exec_create_routine(db, st, a); break;
     case ST_CALL: rc = exec_call(db, st, a); break;
+    case ST_ALTER_TABLE: rc = exec_alter(db, st, a); break;
     default:
       tdb_db_seterr(db, "statement type not yet executable");
       rc = TDB_UNSUPPORTED;

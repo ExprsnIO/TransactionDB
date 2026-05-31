@@ -384,6 +384,55 @@ static int exec_call(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 #endif
 }
 
+static int exec_alter(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st);
+  tdb_table *t = tdb_catalog_find_table(db->cat, a->u.alter.table);
+  if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.alter.table); return TDB_ERROR; }
+
+  switch (a->u.alter.action) {
+    case TDB_ALTER_ADD_COLUMN: {
+      tdb_coldef *cd = a->u.alter.add;
+      if (tdb_table_find_column(t, cd->name) >= 0) {
+        tdb_db_seterr(db, "duplicate column name: %s", cd->name); return TDB_ERROR;
+      }
+      tdb_column c;
+      tdb_column_init(&c, cd->name, cd->type);
+      c.coll = cd->coll; c.notnull = cd->notnull; c.unique = cd->unique;
+      c.generated = cd->generated;
+      if (cd->generated_sql) c.generated_sql = tdb_strdup(cd->generated_sql);
+      if (cd->default_sql) c.default_sql = tdb_strdup(cd->default_sql);
+      if (cd->check_sql) c.check_sql = tdb_strdup(cd->check_sql);
+      if (tdb_table_add_column(t, &c) != TDB_OK) return TDB_NOMEM;
+      int rc = db->engine->vtab->add_column(db->engine, db->txn, t);   /* new column store (columnar) */
+      if (rc) return rc;
+      t->schema_version++;
+      return tdb_catalog_update_table(db->cat, t);
+    }
+    case TDB_ALTER_RENAME_COLUMN: {
+      int ci = tdb_table_find_column(t, a->u.alter.col);
+      if (ci < 0) { tdb_db_seterr(db, "no such column: %s", a->u.alter.col); return TDB_ERROR; }
+      tdb_mfree(t->cols[ci].name);
+      t->cols[ci].name = tdb_strdup(a->u.alter.newname);
+      t->schema_version++;
+      return tdb_catalog_update_table(db->cat, t);
+    }
+    case TDB_ALTER_RENAME_TABLE: {
+      if (tdb_catalog_find_table(db->cat, a->u.alter.newname)) {
+        tdb_db_seterr(db, "table %s already exists", a->u.alter.newname); return TDB_ERROR;
+      }
+      char *oldname = tdb_strdup(t->name);
+      tdb_mfree(t->name);
+      t->name = tdb_strdup(a->u.alter.newname);
+      int rc = tdb_catalog_update_table_as(db->cat, oldname, t);
+      tdb_mfree(oldname);
+      return rc;
+    }
+    default:
+      tdb_db_seterr(db, "ALTER TABLE DROP COLUMN not yet supported");
+      return TDB_UNSUPPORTED;
+  }
+}
+
 static int exec_txn(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
   int rc = TDB_OK;

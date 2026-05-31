@@ -1154,10 +1154,78 @@ static void test_correlated(void) {
   tdb_close(db);
 }
 
+static void test_streaming(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, name TEXT)");
+  exec(db, "BEGIN");
+  for (int i = 1; i <= 100; i++) {
+    char sql[96];
+    snprintf(sql, sizeof(sql), "INSERT INTO t VALUES (%d, %d, 'n%d')", i, i * 10, i);
+    exec(db, sql);
+  }
+  exec(db, "COMMIT");
+
+  check_text(db, "SELECT name FROM t WHERE id = 7", "n7");           /* PK index pick, streamed */
+
+  /* expression projection through the project operator */
+  TDB_CHECK_EQ(scalar(db, "SELECT v * 2 FROM t WHERE id = 5"), 100);
+
+  /* LIMIT / OFFSET through the limit operator */
+  {
+    tdb_stmt *s = NULL;
+    TDB_CHECK_EQ(tdb_prepare_v2(db, "SELECT id FROM t WHERE v >= 200 LIMIT 3 OFFSET 2", -1, &s, NULL), TDB_OK);
+    int ids[8], n = 0;
+    while (tdb_step(s) == TDB_ROW && n < 8) ids[n++] = (int)tdb_column_int(s, 0);
+    TDB_CHECK_EQ(n, 3);
+    /* v>=200 -> id>=20; offset 2 -> start at id 22; limit 3 -> 22,23,24 */
+    TDB_CHECK_EQ(ids[0], 22); TDB_CHECK_EQ(ids[1], 23); TDB_CHECK_EQ(ids[2], 24);
+    tdb_finalize(s);
+  }
+
+  /* empty filter result */
+  {
+    tdb_stmt *s = NULL;
+    tdb_prepare_v2(db, "SELECT id FROM t WHERE v > 100000", -1, &s, NULL);
+    TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+    tdb_finalize(s);
+  }
+
+  /* SELECT * streams all columns */
+  {
+    tdb_stmt *s = NULL;
+    tdb_prepare_v2(db, "SELECT * FROM t WHERE id = 42", -1, &s, NULL);
+    TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+    TDB_CHECK_EQ(tdb_column_int(s, 0), 42);
+    TDB_CHECK_EQ(tdb_column_int(s, 1), 420);
+    TDB_CHECK_STR(tdb_column_text(s, 2), "n42");
+    TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+    tdb_finalize(s);
+  }
+
+  /* re-step after reset still works (Stage 1 materializes the streamed output) */
+  {
+    tdb_stmt *s = NULL;
+    tdb_prepare_v2(db, "SELECT id FROM t WHERE id <= 3", -1, &s, NULL);
+    int n1 = 0; while (tdb_step(s) == TDB_ROW) n1++;
+    tdb_reset(s);
+    int n2 = 0; while (tdb_step(s) == TDB_ROW) n2++;
+    TDB_CHECK_EQ(n1, 3); TDB_CHECK_EQ(n2, 3);
+    tdb_finalize(s);
+  }
+
+  /* columnar table streams with projection pushdown */
+  exec(db, "CREATE TABLE cc (id INTEGER PRIMARY KEY, a INTEGER, b TEXT) WITH COLUMNAR");
+  exec(db, "INSERT INTO cc VALUES (1,100,'x'),(2,200,'y'),(3,300,'z')");
+  check_text(db, "SELECT b FROM cc WHERE id = 3", "z");
+
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"geospatial", test_geospatial},
   {"spatial_index", test_spatial_index},
   {"correlated", test_correlated},
+  {"streaming", test_streaming},
   {"upsert", test_upsert},
   {"returning", test_returning},
   {"cte", test_cte},

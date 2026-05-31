@@ -173,6 +173,35 @@ static void test_like_distinct(void) {
   tdb_close(db);
 }
 
+static void test_bitwise(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+
+  TDB_CHECK_EQ(scalar(db, "SELECT 12 & 10"), 8);
+  TDB_CHECK_EQ(scalar(db, "SELECT 12 | 10"), 14);
+  TDB_CHECK_EQ(scalar(db, "SELECT 1 << 4"), 16);
+  TDB_CHECK_EQ(scalar(db, "SELECT 256 >> 2"), 64);
+  TDB_CHECK_EQ(scalar(db, "SELECT ~0"), -1);
+  TDB_CHECK_EQ(scalar(db, "SELECT ~5"), -6);
+
+  /* precedence: '+'/'-' bind tighter than bitwise, which binds tighter than
+  ** comparisons */
+  TDB_CHECK_EQ(scalar(db, "SELECT 6 & 3 + 1"), 4);          /* 6 & (3+1) */
+  TDB_CHECK_EQ(scalar(db, "SELECT (5 & 3) = 1"), 1);
+  TDB_CHECK_EQ(scalar(db, "SELECT 5 & 3 = 1"), 1);          /* 5 & (3=1)? no: (5&3)=1 */
+  TDB_CHECK_EQ(scalar(db, "SELECT 1 | 2 & 3"), 3);          /* left-assoc: (1|2)&3 */
+
+  /* NULL propagates */
+  TDB_CHECK_EQ(rowcount(db, "SELECT 1 WHERE (NULL & 1) IS NULL"), 1);
+
+  /* on stored columns + as a WHERE predicate (bit flags) */
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, flags INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,5),(2,2),(3,7),(4,8)");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE flags & 1"), 2);   /* 5,7 */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE (flags & 2) <> 0"), 2); /* 2,7 */
+  TDB_CHECK_EQ(scalar(db, "SELECT SUM(flags | 1) FROM t"), 5 + 3 + 7 + 9);
+  tdb_close(db);
+}
+
 static void test_glob_escape(void) {
   tdb_db *db; tdb_open(":memory:", &db);
   exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)");
@@ -694,6 +723,7 @@ static tdb_test_case cases[] = {
   {"columnar_temporal_persist", test_columnar_temporal_persist},
   {"like_distinct", test_like_distinct},
   {"glob_escape", test_glob_escape},
+  {"bitwise", test_bitwise},
   {"builtins", test_builtins},
   {"subqueries", test_subqueries},
   {"insert_select", test_insert_select},

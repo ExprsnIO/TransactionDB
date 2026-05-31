@@ -90,6 +90,7 @@ static int binprec(int op) {
     case TK_AND: return 2;
     case TK_EQ: case TK_NE: case TK_LT: case TK_LE: case TK_GT: case TK_GE:
     case TK_IS: case TK_IN: case TK_LIKE: case TK_GLOB: case TK_BETWEEN: return 4;
+    case TK_BITAND: case TK_BITOR: case TK_SHL: case TK_SHR: return 5;
     case TK_PLUS: case TK_MINUS: return 6;
     case TK_STAR: case TK_SLASH: case TK_PERCENT: return 7;
     case TK_CONCAT: return 8;
@@ -201,7 +202,8 @@ static tdb_expr *parse_primary(P *p) {
 }
 
 static tdb_expr *parse_unary(P *p) {
-  if (p->cur.kind == TK_MINUS || p->cur.kind == TK_PLUS) {
+  if (p->cur.kind == TK_MINUS || p->cur.kind == TK_PLUS ||
+      p->cur.kind == TK_BITNOT) {
     int op = p->cur.kind; advance(p);
     tdb_expr *e = tdb_expr_new(p->a, EX_UNARY);
     e->op = op; e->left = parse_unary(p);

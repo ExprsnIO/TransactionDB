@@ -623,6 +623,61 @@ static void test_vacuum_shrinks(void) {
   remove(path); remove("test_vacuum.db-wal");
 }
 
+/* EXPLAIN text helper: does the plan for `sql` mention an INDEX search? */
+static int uses_index(tdb_db *db, const char *sql) {
+  char buf[256];
+  snprintf(buf, sizeof(buf), "EXPLAIN %s", sql);
+  tdb_stmt *s = NULL;
+  if (tdb_prepare_v2(db, buf, -1, &s, NULL) != TDB_OK) return -1;
+  int found = 0;
+  while (tdb_step(s) == TDB_ROW) {
+    const char *t = tdb_column_text(s, 0);
+    if (t && strstr(t, "INDEX")) found = 1;
+  }
+  tdb_finalize(s);
+  return found;
+}
+
+static void test_drop_index(void) {
+  const char *path = "test_dropidx.db";
+  remove(path); remove("test_dropidx.db-wal");
+  tdb_db *db; tdb_open(path, &db);
+
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,30),(2,30),(3,40),(4,30)");
+  exec(db, "CREATE INDEX ia ON t(age)");
+  TDB_CHECK_EQ(uses_index(db, "SELECT * FROM t WHERE age=30"), 1);
+
+  /* drop it: the planner falls back to a scan, results unchanged */
+  TDB_CHECK_EQ(exec(db, "DROP INDEX ia"), TDB_OK);
+  TDB_CHECK_EQ(uses_index(db, "SELECT * FROM t WHERE age=30"), 0);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE age=30"), 3);
+
+  /* error + IF EXISTS handling */
+  TDB_CHECK(exec(db, "DROP INDEX nope") != TDB_OK);
+  TDB_CHECK_EQ(exec(db, "DROP INDEX IF EXISTS nope"), TDB_OK);
+
+  /* recreate and confirm it is used again */
+  exec(db, "CREATE INDEX ia ON t(age)");
+  TDB_CHECK_EQ(uses_index(db, "SELECT * FROM t WHERE age=30"), 1);
+  tdb_close(db);
+
+  /* the dropped/recreated index set persists across reopen */
+  tdb_open(path, &db);
+  TDB_CHECK_EQ(uses_index(db, "SELECT * FROM t WHERE age=40"), 1);
+  TDB_CHECK_EQ(exec(db, "DROP INDEX ia"), TDB_OK);
+  TDB_CHECK_EQ(uses_index(db, "SELECT * FROM t WHERE age=40"), 0);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE age=40"), 1);
+  tdb_close(db);
+
+  /* and the drop persisted too */
+  tdb_open(path, &db);
+  TDB_CHECK_EQ(uses_index(db, "SELECT * FROM t WHERE age=30"), 0);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE age=30"), 3);
+  tdb_close(db);
+  remove(path); remove("test_dropidx.db-wal");
+}
+
 static void test_drop_table_reclaim(void) {
   const char *path = "test_droptab.db";
   remove(path); remove("test_droptab.db-wal");
@@ -866,6 +921,7 @@ static tdb_test_case cases[] = {
   {"alter_persist", test_alter_persist},
   {"drop_column", test_drop_column},
   {"drop_column_persist", test_drop_column_persist},
+  {"drop_index", test_drop_index},
   {"drop_table_reclaim", test_drop_table_reclaim},
   {"vacuum_shrinks", test_vacuum_shrinks},
   {"index_scan", test_index_scan},

@@ -456,7 +456,28 @@ static int exec_drop(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     tdb_catalog_drop_table(db->cat, a->u.drop.name);
     return TDB_OK;
   }
-  /* DROP INDEX / VIEW: in-memory only for now */
+  if (a->kind == ST_DROP_INDEX) {
+    /* index names are unique across the database; find the owning table */
+    tdb_table *owner = NULL; int pos = -1;
+    int nt = tdb_catalog_table_count(db->cat);
+    for (int i = 0; i < nt && !owner; i++) {
+      tdb_table *t = tdb_catalog_table_at(db->cat, i);
+      for (int k = 0; k < t->nindex; k++)
+        if (t->indexes[k].name && strcasecmp(t->indexes[k].name, a->u.drop.name) == 0) {
+          owner = t; pos = k; break;
+        }
+    }
+    if (!owner) {
+      if (a->u.drop.if_exists) return TDB_OK;
+      tdb_db_seterr(db, "no such index: %s", a->u.drop.name);
+      return TDB_ERROR;
+    }
+    int rc = db->engine->vtab->drop_index(db->engine, db->txn, owner, &owner->indexes[pos]);
+    if (rc) return rc;
+    tdb_table_drop_index(owner, pos);
+    return tdb_catalog_update_table(db->cat, owner);  /* persist the smaller index set */
+  }
+  /* DROP VIEW: in-memory only for now */
   return TDB_OK;
 }
 

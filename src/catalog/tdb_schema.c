@@ -69,6 +69,16 @@ int tdb_table_find_column(const tdb_table *t, const char *name) {
   return -1;
 }
 
+static void index_free(tdb_index *ix);
+
+int tdb_table_drop_index(tdb_table *t, int pos) {
+  if (pos < 0 || pos >= t->nindex) return TDB_NOTFOUND;
+  index_free(&t->indexes[pos]);
+  for (int i = pos; i < t->nindex - 1; i++) t->indexes[i] = t->indexes[i + 1];
+  t->nindex--;
+  return TDB_OK;
+}
+
 static void index_free(tdb_index *ix) {
   tdb_mfree(ix->name);
   tdb_mfree(ix->col_idx);

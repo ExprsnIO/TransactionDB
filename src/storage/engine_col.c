@@ -434,12 +434,18 @@ static int ceng_drop_column(tdb_storage *s, tdb_txn *txn, tdb_table *t, int ci) 
   return rc;
 }
 
+static int ceng_drop_index(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_index *ix) {
+  TDB_UNUSED(txn); TDB_UNUSED(t);
+  col_engine *e = (col_engine *)s->impl;
+  return tdb_btree_destroy(e->pager, ix->root, TDB_BT_INDEX);
+}
+
 static const tdb_storage_vtab g_col_vtab = {
   "columnar", ceng_close,
   ceng_create_table, ceng_drop_table, ceng_create_index,
   ceng_insert, ceng_update, ceng_remove, ceng_next_rowid,
   ceng_scan_open, ceng_scan_next, ceng_scan_close, ceng_seek_rowid,
-  ceng_add_column, ceng_drop_column,
+  ceng_add_column, ceng_drop_column, ceng_drop_index,
 };
 
 int tdb_engine_columnar_open(tdb_pager *p, tdb_storage **out) {

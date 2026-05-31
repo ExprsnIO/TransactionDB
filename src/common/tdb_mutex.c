@@ -14,6 +14,8 @@ tdb_mutex *tdb_mutex_new(void) {
   if (m) InitializeCriticalSection(&m->cs);
   return m;
 }
+/* CRITICAL_SECTION is already recursive (re-entrant for its owning thread). */
+tdb_mutex *tdb_mutex_new_recursive(void) { return tdb_mutex_new(); }
 void tdb_mutex_free(tdb_mutex *m) {
   if (!m) return;
   DeleteCriticalSection(&m->cs);
@@ -46,6 +48,17 @@ struct tdb_rwlock { pthread_rwlock_t rw; };
 tdb_mutex *tdb_mutex_new(void) {
   tdb_mutex *m = (tdb_mutex *)tdb_malloc(sizeof(*m));
   if (m) pthread_mutex_init(&m->m, NULL);
+  return m;
+}
+tdb_mutex *tdb_mutex_new_recursive(void) {
+  tdb_mutex *m = (tdb_mutex *)tdb_malloc(sizeof(*m));
+  if (m) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&m->m, &attr);
+    pthread_mutexattr_destroy(&attr);
+  }
   return m;
 }
 void tdb_mutex_free(tdb_mutex *m) {

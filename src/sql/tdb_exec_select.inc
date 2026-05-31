@@ -189,6 +189,11 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
   qs->alias = s->alias; qs->base = Q->totalcols; qs->join = s->join; qs->on = s->on;
 
   tdb_select *sub = s->subquery;
+  tdb_cte    *cte = NULL;
+  if (!sub && s->table) {
+    cte = find_cte(st, s->table);              /* a WITH name shadows a table */
+    if (cte) { sub = cte->select; if (!qs->alias) qs->alias = cte->name; }
+  }
   if (!sub && s->table) {
     tdb_table *t = tdb_catalog_find_table(db->cat, s->table);
     if (t) {
@@ -216,12 +221,16 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
   if (!sub) { tdb_db_seterr(db, "invalid FROM item"); return TDB_ERROR; }
 
   tdb_stmt tmp;
+  if (cte) cte->active = 1;                  /* block self-reference while running */
   int rc = run_subselect(db, st, sub, &tmp);
+  if (cte) cte->active = 0;
   if (rc) { tdb_stmt_clear_results(&tmp); return rc; }
   qs->ncol = tmp.ncol;
   qs->colnames = (char **)tdb_arena_alloc(st->arena, sizeof(char *) * (size_t)(tmp.ncol ? tmp.ncol : 1));
   for (int k = 0; k < tmp.ncol; k++) {
-    const char *nm = (tmp.colnames && tmp.colnames[k]) ? tmp.colnames[k] : "col";
+    /* WITH name(col, ...) column aliases override the body's output names */
+    const char *nm = (cte && k < cte->ncolname) ? cte->colnames[k]
+                   : (tmp.colnames && tmp.colnames[k]) ? tmp.colnames[k] : "col";
     qs->colnames[k] = tdb_arena_strndup(st->arena, nm, strlen(nm));
   }
   rowset_init(set, tmp.ncol ? tmp.ncol : 1);
@@ -235,8 +244,19 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
 }
 
 static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q);
+static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q);
 
+/* Push this SELECT's WITH frame (if any) so its CTEs are visible to the body
+** and any nested subqueries, run the body, then pop the frame. */
 static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
+  cte_scope scope; cte_scope *saved = st->cte_scope;
+  if (q->with) { scope.list = q->with; scope.parent = saved; st->cte_scope = &scope; }
+  int rc = exec_select_body(db, st, q);
+  st->cte_scope = saved;
+  return rc;
+}
+
+static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   if (q->setop) return exec_setop_chain(db, st, q);
 
   qctx Q; memset(&Q, 0, sizeof(Q));
@@ -246,7 +266,8 @@ static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   tdb_index *use_idx = NULL; tdb_keyrange krange; int have_idx = 0;
   tdb_value_init(&krange.lo); tdb_value_init(&krange.hi);
   uint8_t colmask[64]; int have_mask = 0;
-  if (q->from && !q->from->next && !q->from->subquery && q->from->table) {
+  if (q->from && !q->from->next && !q->from->subquery && q->from->table &&
+      !find_cte(st, q->from->table)) {
     tdb_table *bt = tdb_catalog_find_table(db->cat, q->from->table);
     if (bt && bt->nindex > 0 && pick_index(db, st, bt, q->where, &use_idx, &krange))
       have_idx = 1;

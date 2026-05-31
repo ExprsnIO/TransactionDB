@@ -539,8 +539,119 @@ static void test_upsert(void) {
   tdb_close(db);
 }
 
+static void test_returning(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, hits INTEGER)");
+
+  /* INSERT ... RETURNING: a single-row projection with an expression + alias */
+  tdb_stmt *s;
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "INSERT INTO t VALUES (1,'a',10) RETURNING id, hits + 1 AS next", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_count(s), 2);
+  TDB_CHECK_STR(tdb_column_name(s, 0), "id");
+  TDB_CHECK_STR(tdb_column_name(s, 1), "next");
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 1);
+  TDB_CHECK_EQ(tdb_column_int(s, 1), 11);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+
+  /* multi-row INSERT ... RETURNING * yields one row per inserted row */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "INSERT INTO t VALUES (2,'b',20),(3,'c',30) RETURNING *", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_count(s), 3);
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 2);
+  TDB_CHECK_STR(tdb_column_text(s, 1), "b");
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 3);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+
+  /* the rows really landed */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 3);
+
+  /* UPDATE ... RETURNING reflects the NEW row values */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "UPDATE t SET hits = hits + 100 WHERE id = 1 RETURNING id, hits", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 1);
+  TDB_CHECK_EQ(tdb_column_int(s, 1), 110);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+
+  /* DELETE ... RETURNING reflects the row as it was before removal */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "DELETE FROM t WHERE id = 3 RETURNING name", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_STR(tdb_column_text(s, 0), "c");
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 2);
+
+  /* INSERT OR REPLACE ... RETURNING surfaces the replacement row */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "INSERT OR REPLACE INTO t VALUES (1,'a2',5) RETURNING name, hits", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_STR(tdb_column_text(s, 0), "a2");
+  TDB_CHECK_EQ(tdb_column_int(s, 1), 5);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+
+  tdb_close(db);
+}
+
+static void test_cte(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,10),(2,20),(3,30)");
+
+  /* basic single CTE used in FROM */
+  TDB_CHECK_EQ(scalar(db, "WITH big AS (SELECT v FROM t WHERE v >= 20) SELECT COUNT(*) FROM big"), 2);
+  TDB_CHECK_EQ(scalar(db, "WITH big AS (SELECT v FROM t WHERE v >= 20) SELECT SUM(v) FROM big"), 50);
+
+  /* a later CTE may reference an earlier sibling */
+  TDB_CHECK_EQ(scalar(db,
+    "WITH a AS (SELECT v FROM t), b AS (SELECT v*2 AS w FROM a) SELECT SUM(w) FROM b"), 120);
+
+  /* WITH name(col, ...) column aliases */
+  TDB_CHECK_EQ(scalar(db, "WITH r(x,y) AS (SELECT id, v FROM t) SELECT y FROM r WHERE x = 2"), 20);
+
+  /* CTE joined against a base table */
+  TDB_CHECK_EQ(scalar(db,
+    "WITH hi AS (SELECT id FROM t WHERE v >= 20) "
+    "SELECT COUNT(*) FROM t JOIN hi ON t.id = hi.id"), 2);
+
+  /* CTE referenced inside a subquery / IN list */
+  TDB_CHECK_EQ(scalar(db,
+    "WITH hi AS (SELECT id FROM t WHERE v >= 20) "
+    "SELECT COUNT(*) FROM t WHERE id IN (SELECT id FROM hi)"), 2);
+
+  /* the same CTE referenced twice */
+  TDB_CHECK_EQ(scalar(db,
+    "WITH c AS (SELECT v FROM t) "
+    "SELECT (SELECT SUM(v) FROM c) + (SELECT COUNT(*) FROM c)"), 63);
+
+  /* a CTE name shadows a real table of the same name within the query */
+  TDB_CHECK_EQ(scalar(db, "WITH t AS (SELECT 99 AS v) SELECT v FROM t"), 99);
+
+  /* WITH ... SELECT used as a statement start (no surrounding SELECT) */
+  tdb_stmt *s;
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "WITH e AS (SELECT id, v FROM t WHERE v = 30) SELECT id, v FROM e", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 3);
+  TDB_CHECK_EQ(tdb_column_int(s, 1), 30);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"upsert", test_upsert},
+  {"returning", test_returning},
+  {"cte", test_cte},
   {"ddl_dml_select", test_ddl_dml_select},
   {"derived_and_view", test_derived_and_view},
   {"outer_joins", test_outer_joins},

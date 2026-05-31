@@ -73,6 +73,7 @@ static char *decode_string(P *p, const tdb_token *t) {
 static tdb_expr *parse_expr(P *p, int minprec);
 static tdb_expr *parse_unary(P *p);
 static tdb_select *parse_select(P *p);
+static char **parse_name_list(P *p, int *count);
 
 /* ------------------------------ expressions --------------------------- */
 
@@ -333,10 +334,44 @@ static tdb_src *parse_from(P *p) {
   return head;
 }
 
+/* Parse a `WITH [RECURSIVE] name [(cols)] AS (select), ...` prefix. RECURSIVE
+** is accepted but recursion is not yet supported (a self-reference is blocked
+** at execution time). Returns NULL when the current token is not WITH. */
+static tdb_ctelist *parse_with(P *p) {
+  if (!accept(p, TK_WITH)) return NULL;
+  if (id_is(&p->cur, "RECURSIVE")) advance(p);
+  tdb_ctelist *w = (tdb_ctelist *)tdb_arena_alloc(p->a, sizeof(*w));
+  memset(w, 0, sizeof(*w));
+  do {
+    if (w->n == w->cap) {
+      w->cap = w->cap ? w->cap * 2 : 4;
+      tdb_cte *g = (tdb_cte *)tdb_arena_alloc(p->a, sizeof(tdb_cte) * (size_t)w->cap);
+      for (int i = 0; i < w->n; i++) g[i] = w->items[i];
+      w->items = g;
+    }
+    tdb_cte *c = &w->items[w->n];
+    memset(c, 0, sizeof(*c));
+    c->name = dup_tok(p, &p->cur);
+    expect(p, TK_ID, "expected CTE name");
+    if (accept(p, TK_LP)) {
+      c->colnames = parse_name_list(p, &c->ncolname);
+      expect(p, TK_RP, "expected ) after CTE column list");
+    }
+    expect(p, TK_AS, "expected AS in WITH");
+    expect(p, TK_LP, "expected ( before CTE body");
+    c->select = parse_select(p);
+    expect(p, TK_RP, "expected ) after CTE body");
+    w->n++;
+  } while (accept(p, TK_COMMA) && !p->err);
+  return w;
+}
+
 static tdb_select *parse_select(P *p) {
+  tdb_ctelist *with = parse_with(p);
   expect(p, TK_SELECT, "expected SELECT");
   tdb_select *s = (tdb_select *)tdb_arena_alloc(p->a, sizeof(*s));
   memset(s, 0, sizeof(*s));
+  s->with = with;
   if (accept(p, TK_DISTINCT)) s->distinct = 1; else accept(p, TK_ALL);
 
   s->cols = tdb_exprlist_new(p->a);
@@ -407,6 +442,20 @@ static char **parse_name_list(P *p, int *count) {
   return names;
 }
 
+/* Optional `RETURNING expr [[AS] alias], ... | RETURNING *` trailing a DML
+** statement. Mirrors the SELECT projection list (EX_STAR for *). */
+static void parse_returning(P *p, tdb_ast_stmt *s) {
+  if (!accept(p, TK_RETURNING)) return;
+  s->returning = tdb_exprlist_new(p->a);
+  do {
+    tdb_expr *e = parse_expr(p, 0);
+    char *alias = NULL;
+    if (accept(p, TK_AS)) { alias = dup_tok(p, &p->cur); expect(p, TK_ID, "expected alias"); }
+    else if (p->cur.kind == TK_ID) { alias = dup_tok(p, &p->cur); advance(p); }
+    tdb_exprlist_add(p->a, s->returning, e, alias);
+  } while (accept(p, TK_COMMA) && !p->err);
+}
+
 static tdb_ast_stmt *parse_insert(P *p) {
   advance(p); /* INSERT */
   tdb_ast_stmt *s = new_stmt(p, ST_INSERT);
@@ -470,6 +519,7 @@ static tdb_ast_stmt *parse_insert(P *p) {
       if (accept(p, TK_WHERE)) s->u.insert.up_where = parse_expr(p, 0);
     } else set_err(p, "expected NOTHING or UPDATE");
   }
+  parse_returning(p, s);
   return s;
 }
 
@@ -495,6 +545,7 @@ static tdb_ast_stmt *parse_update(P *p) {
     s->u.update.nset++;
   } while (accept(p, TK_COMMA) && !p->err);
   if (accept(p, TK_WHERE)) s->u.update.where = parse_expr(p, 0);
+  parse_returning(p, s);
   return s;
 }
 
@@ -505,6 +556,7 @@ static tdb_ast_stmt *parse_delete(P *p) {
   s->u.del.table = dup_tok(p, &p->cur);
   expect(p, TK_ID, "expected table name");
   if (accept(p, TK_WHERE)) s->u.del.where = parse_expr(p, 0);
+  parse_returning(p, s);
   return s;
 }
 
@@ -824,6 +876,7 @@ static tdb_ast_stmt *parse_prepare(P *p) {
 
 static tdb_ast_stmt *parse_stmt(P *p) {
   switch (p->cur.kind) {
+    case TK_WITH:
     case TK_SELECT: { tdb_ast_stmt *s = new_stmt(p, ST_SELECT); s->u.select = parse_select(p); return s; }
     case TK_INSERT: return parse_insert(p);
     case TK_UPDATE: return parse_update(p);

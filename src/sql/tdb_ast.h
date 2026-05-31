@@ -78,7 +78,24 @@ typedef struct tdb_orderby {
   int        n, cap;
 } tdb_orderby;
 
+/* A single common-table expression: `name [(col, ...)] AS (select)`.
+** `active` is runtime state (set while the body is being materialized) that
+** guards against a CTE referencing itself — non-recursive CTEs only. */
+typedef struct tdb_cte {
+  char       *name;
+  char      **colnames;   /* optional column aliases, or NULL */
+  int         ncolname;
+  tdb_select *select;
+  int         active;
+} tdb_cte;
+
+typedef struct tdb_ctelist {
+  tdb_cte *items;
+  int      n, cap;
+} tdb_ctelist;
+
 struct tdb_select {
+  tdb_ctelist  *with;       /* WITH common table expressions, or NULL */
   tdb_exprlist *cols;       /* projection (EX_STAR for *) */
   int           distinct;
   tdb_src      *from;       /* may be NULL (SELECT <exprs>) */
@@ -145,6 +162,7 @@ typedef enum tdb_stmt_kind {
 
 typedef struct tdb_ast_stmt {
   tdb_stmt_kind kind;
+  tdb_exprlist *returning;   /* RETURNING projection for INSERT/UPDATE/DELETE, or NULL */
   union {
     tdb_select *select;
 

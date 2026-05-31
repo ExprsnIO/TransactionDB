@@ -61,6 +61,69 @@ static int store_full(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_value *row,
                    : db->engine->vtab->insert(db->engine, db->txn, t, rowid, rec->data, (int)rec->len);
 }
 
+/* ---- RETURNING projection support -------------------------------------- */
+typedef struct { tdb_expr **exprs; int n; } ret_proj;
+
+/* Resolve the RETURNING list against table `t`, set up the statement's result
+** columns (is_select/ncol/colnames), and capture the resolved output
+** expressions in `rp`. The expr array is malloc'd; free with ret_proj_free.
+** No-op (rp->exprs = NULL) when the statement carries no RETURNING clause. */
+static int returning_setup(tdb_db *db, tdb_stmt *st, tdb_table *t,
+                           tdb_exprlist *r, ret_proj *rp) {
+  rp->exprs = NULL; rp->n = 0;
+  if (!r) return TDB_OK;
+  qctx q; memset(&q, 0, sizeof(q));
+  q.src[0].tbl = t; q.src[0].base = 0; q.nsrc = 1; q.totalcols = t->ncol;
+
+  tdb_expr **oexpr = NULL; char **onames = NULL; int n = 0, cap = 0;
+  #define RET_ADD(E, NM) do { \
+    if (n == cap) { cap = cap ? cap*2 : 8; \
+      oexpr = (tdb_expr**)tdb_realloc(oexpr, sizeof(void*)*(size_t)cap); \
+      onames = (char**)tdb_realloc(onames, sizeof(void*)*(size_t)cap); } \
+    oexpr[n] = (E); onames[n] = tdb_strdup((NM) ? (NM) : "column"); n++; \
+  } while (0)
+
+  for (int i = 0; i < r->n; i++) {
+    tdb_expr *item = r->items[i];
+    char *alias = r->aliases ? r->aliases[i] : NULL;
+    if (item->kind == EX_STAR) {
+      for (int k = 0; k < t->ncol; k++) {
+        if (t->cols[k].hidden) continue;
+        tdb_expr *col = tdb_expr_new(st->arena, EX_COLUMN);
+        col->name = t->cols[k].name; col->col_index = k;
+        RET_ADD(col, t->cols[k].name);
+      }
+    } else {
+      if (resolve_expr(db, &q, item)) {
+        for (int k = 0; k < n; k++) tdb_mfree(onames[k]);
+        tdb_mfree(oexpr); tdb_mfree(onames);
+        return TDB_ERROR;
+      }
+      const char *nm = alias ? alias : (item->kind == EX_COLUMN ? item->name : NULL);
+      RET_ADD(item, nm);
+    }
+  }
+  #undef RET_ADD
+  st->is_select = 1;
+  st->ncol = n;
+  st->colnames = onames;
+  rp->exprs = oexpr; rp->n = n;
+  return TDB_OK;
+}
+
+static void ret_proj_free(ret_proj *rp) { tdb_mfree(rp->exprs); rp->exprs = NULL; }
+
+/* Evaluate the RETURNING projection against `rowvals` (ncol wide) and append a
+** result row to the statement. No-op when there is no RETURNING. */
+static void returning_emit(tdb_db *db, tdb_stmt *st, ret_proj *rp,
+                           tdb_value *rowvals, int ncol) {
+  if (!rp->exprs) return;
+  ectx ec = { rowvals, ncol, NULL, 0, st };
+  tdb_value *out = row_alloc(rp->n);
+  for (int i = 0; i < rp->n; i++) eval(db, &ec, rp->exprs[i], &out[i]);
+  add_result_row(st, out);
+}
+
 /* Insert one row: place src[0..nsrc) into the target columns, fill DEFAULTs,
 ** assign the rowid (INTEGER PRIMARY KEY aliasing), stamp the temporal period,
 ** run generated columns / type coercion / NOT NULL, then store. Handles PK
@@ -69,7 +132,7 @@ static int store_full(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_value *row,
 static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *target,
                            int ntarget, tdb_value *src, int nsrc, int pkc,
                            tdb_ast_stmt *a, const int *up_setidx, tdb_buf *rec,
-                           int *applied) {
+                           ret_proj *rp, int *applied) {
   *applied = 0;
   tdb_value *full = row_alloc(t->ncol);
   for (int i = 0; i < t->ncol; i++) {
@@ -104,7 +167,8 @@ static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *ta
       }
       if (a->u.insert.or_action == TDB_OR_REPLACE) {
         int rc = store_full(db, st, t, full, rowid, rec, 1);
-        free_row(full, t->ncol); if (!rc) *applied = 1; return rc;
+        if (!rc) { *applied = 1; returning_emit(db, st, rp, full, t->ncol); }
+        free_row(full, t->ncol); return rc;
       }
       if (a->u.insert.has_upsert) {                       /* DO UPDATE SET ... */
         tdb_value exd[64]; int enc = 0;
@@ -123,7 +187,7 @@ static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *ta
             tdb_value_clear(&urow[up_setidx[i]]); urow[up_setidx[i]] = v;
           }
           rc = store_full(db, st, t, urow, rowid, rec, 1);
-          if (!rc) *applied = 1;
+          if (!rc) { *applied = 1; returning_emit(db, st, rp, urow, t->ncol); }
         }
         free_row(urow, t->ncol); free_row(full, t->ncol);
         return rc;
@@ -135,8 +199,8 @@ static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *ta
   }
 
   int rc = store_full(db, st, t, full, rowid, rec, 0);
+  if (!rc) { *applied = 1; returning_emit(db, st, rp, full, t->ncol); }
   free_row(full, t->ncol);
-  if (!rc) *applied = 1;
   return rc;
 }
 
@@ -162,20 +226,23 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   tdb_buf rec; tdb_buf_init(&rec);
   int rc = TDB_OK;
 
+  ret_proj rp;
+  if (returning_setup(db, st, t, a->returning, &rp)) { tdb_buf_free(&rec); return TDB_ERROR; }
+
   /* Resolve ON CONFLICT DO UPDATE SET targets/expressions against the table.
   ** up_setidx maps each up_cols[i] to its column slot; up_vals and up_where
   ** are resolved as single-source (the conflict row) expressions. */
   int up_setidx[64];
   if (a->u.insert.has_upsert && a->u.insert.up_nset > 0) {
-    if (a->u.insert.up_nset > 64) { tdb_db_seterr(db, "too many SET clauses"); tdb_buf_free(&rec); return TDB_ERROR; }
+    if (a->u.insert.up_nset > 64) { tdb_db_seterr(db, "too many SET clauses"); tdb_buf_free(&rec); ret_proj_free(&rp); return TDB_ERROR; }
     qctx uq; memset(&uq, 0, sizeof(uq));
     uq.src[0].tbl = t; uq.src[0].base = 0; uq.nsrc = 1; uq.totalcols = t->ncol;
     for (int i = 0; i < a->u.insert.up_nset; i++) {
       up_setidx[i] = tdb_table_find_column(t, a->u.insert.up_cols[i]);
-      if (up_setidx[i] < 0) { tdb_db_seterr(db, "no such column: %s", a->u.insert.up_cols[i]); tdb_buf_free(&rec); return TDB_ERROR; }
-      if (resolve_expr(db, &uq, a->u.insert.up_vals[i])) { tdb_buf_free(&rec); return TDB_ERROR; }
+      if (up_setidx[i] < 0) { tdb_db_seterr(db, "no such column: %s", a->u.insert.up_cols[i]); tdb_buf_free(&rec); ret_proj_free(&rp); return TDB_ERROR; }
+      if (resolve_expr(db, &uq, a->u.insert.up_vals[i])) { tdb_buf_free(&rec); ret_proj_free(&rp); return TDB_ERROR; }
     }
-    if (a->u.insert.up_where && resolve_expr(db, &uq, a->u.insert.up_where)) { tdb_buf_free(&rec); return TDB_ERROR; }
+    if (a->u.insert.up_where && resolve_expr(db, &uq, a->u.insert.up_where)) { tdb_buf_free(&rec); ret_proj_free(&rp); return TDB_ERROR; }
   }
 
   if (a->u.insert.select) {
@@ -185,12 +252,13 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     if (!rc) {
       for (int r = 0; r < tmp.nrows && !rc; r++) {
         int applied = 0;
-        rc = insert_row_vals(db, st, t, target, ntarget, tmp.rows[r], tmp.ncol, pkc, a, up_setidx, &rec, &applied);
+        rc = insert_row_vals(db, st, t, target, ntarget, tmp.rows[r], tmp.ncol, pkc, a, up_setidx, &rec, &rp, &applied);
         if (!rc && applied) st->changes++;
       }
     }
     tdb_stmt_clear_results(&tmp);
     tdb_buf_free(&rec);
+    ret_proj_free(&rp);
     return rc;
   }
 
@@ -199,7 +267,7 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   for (int r = 0; r < a->u.insert.nrows; r++) {
     tdb_exprlist *row = a->u.insert.rows[r];
     for (int i = 0; i < row->n; i++)
-      if (resolve_expr(db, &pq, row->items[i])) { tdb_buf_free(&rec); return TDB_ERROR; }
+      if (resolve_expr(db, &pq, row->items[i])) { tdb_buf_free(&rec); ret_proj_free(&rp); return TDB_ERROR; }
   }
 
   for (int r = 0; r < a->u.insert.nrows && !rc; r++) {
@@ -208,11 +276,12 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     ectx ec0 = { NULL, 0, NULL, 0, st };
     for (int i = 0; i < row->n; i++) eval(db, &ec0, row->items[i], &src[i]);
     int applied = 0;
-    rc = insert_row_vals(db, st, t, target, ntarget, src, row->n, pkc, a, up_setidx, &rec, &applied);
+    rc = insert_row_vals(db, st, t, target, ntarget, src, row->n, pkc, a, up_setidx, &rec, &rp, &applied);
     free_row(src, row->n ? row->n : 1);
     if (!rc && applied) st->changes++;
   }
   tdb_buf_free(&rec);
+  ret_proj_free(&rp);
   return rc;
 }
 
@@ -259,8 +328,11 @@ static int exec_update(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     if (resolve_expr(db, &q, a->u.update.set_vals[i])) return TDB_ERROR;
   }
 
+  ret_proj rp;
+  if (returning_setup(db, st, t, a->returning, &rp)) return TDB_ERROR;
+
   rrowset rr; int rc = mat_rid(db, t, &rr);
-  if (rc) { rrowset_free(&rr); return rc; }
+  if (rc) { rrowset_free(&rr); ret_proj_free(&rp); return rc; }
   tdb_buf rec; tdb_buf_init(&rec);
   for (int r = 0; r < rr.n; r++) {
     ectx ec = { rr.rows[r], t->ncol, NULL, 0, st };
@@ -281,12 +353,13 @@ static int exec_update(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     tdb_buf_reset(&rec);
     tdb_record_encode(full, t->ncol, &rec);
     rc = db->engine->vtab->update(db->engine, db->txn, t, rr.rids[r], rec.data, (int)rec.len);
+    if (!rc) { st->changes++; returning_emit(db, st, &rp, full, t->ncol); }
     free_row(full, t->ncol);
     if (rc) break;
-    st->changes++;
   }
   tdb_buf_free(&rec);
   rrowset_free(&rr);
+  ret_proj_free(&rp);
   return rc;
 }
 
@@ -297,8 +370,11 @@ static int exec_delete(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   q.src[0].tbl = t; q.src[0].base = 0; q.nsrc = 1; q.totalcols = t->ncol;
   if (a->u.del.where && resolve_expr(db, &q, a->u.del.where)) return TDB_ERROR;
 
+  ret_proj rp;
+  if (returning_setup(db, st, t, a->returning, &rp)) return TDB_ERROR;
+
   rrowset rr; int rc = mat_rid(db, t, &rr);
-  if (rc) { rrowset_free(&rr); return rc; }
+  if (rc) { rrowset_free(&rr); ret_proj_free(&rp); return rc; }
   for (int r = 0; r < rr.n; r++) {
     ectx ec = { rr.rows[r], t->ncol, NULL, 0, st };
     if (a->u.del.where) {
@@ -309,8 +385,10 @@ static int exec_delete(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     rc = db->engine->vtab->remove(db->engine, db->txn, t, rr.rids[r]);
     if (rc) break;
     st->changes++;
+    returning_emit(db, st, &rp, rr.rows[r], t->ncol);  /* RETURNING old row */
   }
   rrowset_free(&rr);
+  ret_proj_free(&rp);
   return rc;
 }
 

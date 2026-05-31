@@ -157,9 +157,13 @@ static int eng_create_table(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
 }
 
 static int eng_drop_table(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
-  TDB_UNUSED(s); TDB_UNUSED(txn); TDB_UNUSED(t);
-  /* Page reclamation for dropped trees is left to a future vacuum. */
-  return TDB_OK;
+  TDB_UNUSED(txn);
+  row_engine *e = (row_engine *)s->impl;
+  int rc = tdb_btree_destroy(e->pager, t->root, TDB_BT_TABLE);
+  if (!rc && t->history_root) rc = tdb_btree_destroy(e->pager, t->history_root, TDB_BT_TABLE);
+  for (int i = 0; i < t->nindex && !rc; i++)
+    rc = tdb_btree_destroy(e->pager, t->indexes[i].root, TDB_BT_INDEX);
+  return rc;
 }
 
 static int eng_create_index(tdb_storage *s, tdb_txn *txn, tdb_table *t,

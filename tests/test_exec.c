@@ -577,6 +577,49 @@ static void test_drop_column(void) {
   tdb_close(db);
 }
 
+static void test_drop_table_reclaim(void) {
+  const char *path = "test_droptab.db";
+  remove(path); remove("test_droptab.db-wal");
+  tdb_db *db; tdb_open(path, &db);
+
+  /* two tables; dropping one must not disturb the other even as its freed
+  ** pages are recycled by subsequent inserts */
+  exec(db, "CREATE TABLE keep (id INTEGER PRIMARY KEY, s TEXT)");
+  exec(db, "CREATE TABLE gone (id INTEGER PRIMARY KEY, s TEXT)");
+  for (int i = 0; i < 500; i++) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "INSERT INTO keep VALUES (%d,'keep-%d')", i, i);
+    exec(db, sql);
+    snprintf(sql, sizeof(sql), "INSERT INTO gone VALUES (%d,'gone-%d')", i, i);
+    exec(db, sql);
+  }
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM keep"), 500);
+
+  TDB_CHECK_EQ(exec(db, "DROP TABLE gone"), TDB_OK);
+  TDB_CHECK(exec(db, "SELECT COUNT(*) FROM gone") != TDB_OK);   /* gone */
+
+  /* recreate with the same name (reuses freed pages) and refill */
+  exec(db, "CREATE TABLE gone (id INTEGER PRIMARY KEY, s TEXT)");
+  for (int i = 0; i < 500; i++) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "INSERT INTO gone VALUES (%d,'new-%d')", i, i);
+    exec(db, sql);
+  }
+
+  /* the surviving table is still fully intact */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM keep"), 500);
+  check_text(db, "SELECT s FROM keep WHERE id = 250", "keep-250");
+  check_text(db, "SELECT s FROM gone WHERE id = 250", "new-250");
+
+  /* persists across reopen */
+  tdb_close(db);
+  tdb_open(path, &db);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM keep"), 500);
+  check_text(db, "SELECT s FROM keep WHERE id = 100", "keep-100");
+  tdb_close(db);
+  remove(path); remove("test_droptab.db-wal");
+}
+
 static void test_drop_column_persist(void) {
   const char *path = "test_dropcol.db";
   remove(path); remove("test_dropcol.db-wal");
@@ -777,6 +820,7 @@ static tdb_test_case cases[] = {
   {"alter_persist", test_alter_persist},
   {"drop_column", test_drop_column},
   {"drop_column_persist", test_drop_column_persist},
+  {"drop_table_reclaim", test_drop_table_reclaim},
   {"index_scan", test_index_scan},
   {"index_persist", test_index_persist},
   {"savepoints", test_savepoints},

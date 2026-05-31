@@ -176,10 +176,55 @@ static void test_index(void) {
   tdb_pager_close(p);
 }
 
+/* tdb_btree_destroy returns every page (incl. overflow chains) to the freelist,
+** and a fresh tree then reuses them rather than growing the file. */
+static void test_destroy_reclaim(void) {
+  tdb_pager *p = open_mem();
+  tdb_pgno root;
+  TDB_CHECK_EQ(tdb_btree_create(p, TDB_BT_TABLE, &root), TDB_OK);
+  tdb_btree *bt; tdb_btree_open(p, root, TDB_BT_TABLE, NULL, &bt);
+
+  const int N = 1500;
+  for (int i = 0; i < N; i++) {
+    /* large values force overflow pages too */
+    char buf[200]; int n = snprintf(buf, sizeof(buf), "row-%d-%0150d", i, i);
+    TDB_CHECK_EQ(tdb_btree_put(bt, (tdb_rowid)(i + 1), buf, n), TDB_OK);
+  }
+  tdb_btree_close(bt);
+
+  tdb_pgno size_full = tdb_pager_db_size(p);
+  tdb_pgno free_before = tdb_pager_freelist_count(p);
+
+  /* destroy frees a batch of pages */
+  TDB_CHECK_EQ(tdb_btree_destroy(p, root, TDB_BT_TABLE), TDB_OK);
+  tdb_pgno free_after = tdb_pager_freelist_count(p);
+  TDB_CHECK(free_after > free_before + 10);   /* many pages reclaimed */
+  TDB_CHECK_EQ(tdb_pager_db_size(p), size_full); /* file not shrunk, just freed */
+
+  /* a new tree of the same size reuses freed pages: db_size barely grows */
+  tdb_pgno root2;
+  TDB_CHECK_EQ(tdb_btree_create(p, TDB_BT_TABLE, &root2), TDB_OK);
+  tdb_btree_open(p, root2, TDB_BT_TABLE, NULL, &bt);
+  for (int i = 0; i < N; i++) {
+    char buf[200]; int n = snprintf(buf, sizeof(buf), "k-%d-%0150d", i, i);
+    TDB_CHECK_EQ(tdb_btree_put(bt, (tdb_rowid)(i + 1), buf, n), TDB_OK);
+  }
+  /* verify the new tree reads back correctly */
+  tdb_cursor *cur; tdb_cursor_open(bt, &cur);
+  const uint8_t *v; int n;
+  TDB_CHECK_EQ(tdb_btree_get(bt, 1, &v, &n, cur), TDB_OK);
+  tdb_cursor_close(cur);
+  tdb_btree_close(bt);
+
+  TDB_CHECK(tdb_pager_db_size(p) <= size_full + 5);  /* reused, did not double */
+  tdb_pager_close(p);
+}
+
 static tdb_test_case cases[] = {
   {"table_many", test_table_many},
   {"table_fuzz", test_table_fuzz},
   {"overflow", test_overflow},
   {"index", test_index},
+  {"destroy_reclaim", test_destroy_reclaim},
 };
 TDB_MAIN(cases)

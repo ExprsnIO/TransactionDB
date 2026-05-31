@@ -1264,12 +1264,77 @@ static void test_stream_snapshot(void) {
   tdb_close(db);
 }
 
+/* read the single int column of a query into ids[], returning the row count */
+static int collect_ints(tdb_db *db, const char *sql, int *ids, int cap) {
+  tdb_stmt *s = NULL;
+  if (tdb_prepare_v2(db, sql, -1, &s, NULL) != TDB_OK) return -1;
+  int n = 0;
+  while (tdb_step(s) == TDB_ROW && n < cap) ids[n++] = (int)tdb_column_int(s, 0);
+  tdb_finalize(s);
+  return n;
+}
+
+static void test_stream_sort(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,1,50),(2,1,30),(3,2,30),(4,2,10),(5,1,40),(6,3,20)");
+  int ids[16], n;
+
+  /* ORDER BY ascending (streamed via the Sort operator) */
+  n = collect_ints(db, "SELECT id FROM t ORDER BY v", ids, 16);
+  TDB_CHECK_EQ(n, 6);
+  /* v: 10,20,30,30,40,50 -> ids 4,6,(2|3),(2|3),5,1 */
+  TDB_CHECK_EQ(ids[0], 4); TDB_CHECK_EQ(ids[1], 6);
+  TDB_CHECK_EQ(ids[4], 5); TDB_CHECK_EQ(ids[5], 1);
+
+  /* top-N (bounded heap): ORDER BY v DESC LIMIT 3 -> 50,40,30 = ids 1,5, then a 30 */
+  n = collect_ints(db, "SELECT id FROM t ORDER BY v DESC LIMIT 3", ids, 16);
+  TDB_CHECK_EQ(n, 3);
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 5);
+  TDB_CHECK(ids[2] == 2 || ids[2] == 3);
+
+  /* multi-key: grp ASC, v DESC */
+  n = collect_ints(db, "SELECT id FROM t ORDER BY grp, v DESC", ids, 16);
+  TDB_CHECK_EQ(n, 6);
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 5); TDB_CHECK_EQ(ids[2], 2);  /* grp1: 50,40,30 */
+  TDB_CHECK_EQ(ids[3], 3); TDB_CHECK_EQ(ids[4], 4);                            /* grp2: 30,10 */
+  TDB_CHECK_EQ(ids[5], 6);                                                     /* grp3: 20 */
+
+  /* LIMIT + OFFSET over a sorted stream */
+  n = collect_ints(db, "SELECT id FROM t ORDER BY v LIMIT 2 OFFSET 2", ids, 16);
+  TDB_CHECK_EQ(n, 2);   /* asc 10,20,30,30,... offset 2 -> the two v=30 rows */
+  TDB_CHECK((ids[0] == 2 || ids[0] == 3) && (ids[1] == 2 || ids[1] == 3) && ids[0] != ids[1]);
+
+  /* filter + sort together */
+  n = collect_ints(db, "SELECT id FROM t WHERE grp = 1 ORDER BY v DESC", ids, 16);
+  TDB_CHECK_EQ(n, 3);
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 5); TDB_CHECK_EQ(ids[2], 2);
+
+  /* LIMIT 0 with ORDER BY yields nothing; empty filter yields nothing */
+  TDB_CHECK_EQ(collect_ints(db, "SELECT id FROM t ORDER BY v LIMIT 0", ids, 16), 0);
+  TDB_CHECK_EQ(collect_ints(db, "SELECT id FROM t WHERE v > 1000 ORDER BY v", ids, 16), 0);
+
+  /* top-N larger than the row count returns all rows sorted */
+  TDB_CHECK_EQ(collect_ints(db, "SELECT id FROM t ORDER BY v DESC LIMIT 100", ids, 16), 6);
+
+  /* abandon a sorted stream after one row: the buffered heap must be freed */
+  {
+    tdb_stmt *s = NULL;
+    tdb_prepare_v2(db, "SELECT id FROM t ORDER BY v", -1, &s, NULL);
+    TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+    tdb_finalize(s);   /* heap built, only one row emitted -> close frees the rest */
+  }
+
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"geospatial", test_geospatial},
   {"spatial_index", test_spatial_index},
   {"correlated", test_correlated},
   {"streaming", test_streaming},
   {"stream_snapshot", test_stream_snapshot},
+  {"stream_sort", test_stream_sort},
   {"upsert", test_upsert},
   {"returning", test_returning},
   {"cte", test_cte},

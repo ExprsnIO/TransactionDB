@@ -1,11 +1,14 @@
 /* tdb_exec_stream.inc — pull-based (volcano) operator tree.
 **
 ** Included by tdb_exec.c after the materializing executor, this introduces a
-** small family of demand-driven operators — Scan, Filter, Project, Limit —
-** wired child-to-parent so each next() pulls one row from below. A SELECT that
-** is a single base-table scan with an optional WHERE / projection / LIMIT is
-** compiled into such a tree; the row at a time pull means a LIMIT stops the
-** scan early instead of materializing the whole table first.
+** small family of demand-driven operators — Scan, Filter, Sort, Project, Limit
+** — wired child-to-parent so each next() pulls one row from below. A SELECT
+** that is a single base-table scan with an optional WHERE / ORDER BY /
+** projection / LIMIT is compiled into such a tree; the row at a time pull means
+** a LIMIT stops the scan early instead of materializing the whole table first.
+** Sort is the one blocking operator: it drains its child once, but when ORDER
+** BY is paired with LIMIT it keeps only the top (OFFSET+LIMIT) rows in a
+** bounded heap rather than buffering the entire input.
 **
 ** tdb_step() pulls one row per call straight through the tree (see
 ** tdb_stmt_stream_next): nothing is collected into st->rows, so memory stays
@@ -15,7 +18,11 @@
 ** even as the connection commits other writes.
 */
 
-typedef enum { OP_SCAN, OP_FILTER, OP_PROJECT, OP_LIMIT } op_kind;
+typedef enum { OP_SCAN, OP_FILTER, OP_SORT, OP_PROJECT, OP_LIMIT } op_kind;
+
+/* one buffered row inside a Sort operator: the (owned) source row and its
+** computed sort-key vector */
+typedef struct { tdb_value *row; tdb_value *key; } sortent;
 
 typedef struct tdb_op {
   op_kind        kind;
@@ -44,6 +51,17 @@ typedef struct tdb_op {
   /* OP_LIMIT */
   int64_t        limit, offset, emitted, skipped;
   int            has_limit;
+
+  /* OP_SORT (blocking; bounded top-N when capN >= 0) */
+  tdb_expr     **okeys;       /* ORDER BY key expressions (resolved on source) */
+  uint8_t       *odesc;       /* per-key descending flag (points into the AST) */
+  int            nkey;
+  int64_t        capN;        /* keep only the best capN rows, or -1 = all */
+  sortent       *heap;        /* max-heap (root = worst kept) while filling */
+  int            nheap, heapcap;
+  int            sorted;      /* input consumed + ordered */
+  int            emit;        /* next index to emit */
+  int            srcncol;     /* width of buffered source rows */
 } tdb_op;
 
 /* ---- eligibility: reject anything the simple operators can't stream ---- */
@@ -66,7 +84,7 @@ static int expr_blocks_stream(const tdb_expr *e) {
 }
 
 static int select_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_table **out_tbl) {
-  if (q->setop || q->group || q->having || q->distinct || q->order) return 0;
+  if (q->setop || q->group || q->having || q->distinct) return 0;
   if (q->with) return 0;        /* its CTEs (which may shadow a table) aren't in scope here */
   if (!q->from || q->from->next || q->from->subquery) return 0;
   if (!q->from->table || q->from->as_of) return 0;
@@ -76,6 +94,8 @@ static int select_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_table 
   if (expr_blocks_stream(q->where)) return 0;
   if (q->cols) for (int i = 0; i < q->cols->n; i++)
     if (expr_blocks_stream(q->cols->items[i])) return 0;
+  if (q->order) for (int i = 0; i < q->order->n; i++)   /* ORDER BY streams via a Sort op */
+    if (expr_blocks_stream(q->order->exprs[i])) return 0;
   *out_tbl = t;
   return 1;
 }
@@ -143,10 +163,102 @@ static int limit_next(tdb_op *op, tdb_value **row, int *ncol) {
   return TDB_ROW;
 }
 
+/* compare two key vectors by the op's ORDER BY keys/desc; <0 if a sorts first */
+static int sortkey_cmp(const tdb_op *op, const tdb_value *a, const tdb_value *b) {
+  for (int k = 0; k < op->nkey; k++) {
+    int c = tdb_value_compare(&a[k], &b[k], TDB_COLL_BINARY);
+    if (op->odesc && op->odesc[k]) c = -c;
+    if (c) return c;
+  }
+  return 0;
+}
+
+/* max-heap on op->heap[0..nheap): the root is the entry that sorts LAST, i.e.
+** the worst one to keep, so a bounded top-N evicts it first. */
+static void heap_sift_up(tdb_op *op, int i) {
+  while (i > 0) {
+    int p = (i - 1) / 2;
+    if (sortkey_cmp(op, op->heap[i].key, op->heap[p].key) <= 0) break;
+    sortent t = op->heap[i]; op->heap[i] = op->heap[p]; op->heap[p] = t;
+    i = p;
+  }
+}
+static void heap_sift_down(tdb_op *op, int i) {
+  for (;;) {
+    int l = 2 * i + 1, r = 2 * i + 2, m = i;
+    if (l < op->nheap && sortkey_cmp(op, op->heap[l].key, op->heap[m].key) > 0) m = l;
+    if (r < op->nheap && sortkey_cmp(op, op->heap[r].key, op->heap[m].key) > 0) m = r;
+    if (m == i) break;
+    sortent t = op->heap[i]; op->heap[i] = op->heap[m]; op->heap[m] = t;
+    i = m;
+  }
+}
+static void sortent_free(sortent *e, int ncol, int nkey) {
+  if (e->row) { for (int i = 0; i < ncol; i++) tdb_value_clear(&e->row[i]); tdb_mfree(e->row); e->row = NULL; }
+  if (e->key) { for (int i = 0; i < nkey; i++) tdb_value_clear(&e->key[i]); tdb_mfree(e->key); e->key = NULL; }
+}
+
+/* Consume the child once, buffering rows (bounded to capN via the heap when
+** capN >= 0), then order the buffer ascending in place for emission. */
+static int sort_materialize(tdb_op *op) {
+  for (;;) {
+    tdb_value *r; int nc;
+    int rc = op_next(op->child, &r, &nc);
+    if (rc == TDB_DONE) break;
+    if (rc != TDB_ROW) return rc;
+    op->srcncol = nc;
+    ectx ec = { r, nc, NULL, 0, op->st, NULL, NULL };
+    tdb_value *key = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(op->nkey ? op->nkey : 1));
+    for (int k = 0; k < op->nkey; k++) { tdb_value_init(&key[k]); eval(op->db, &ec, op->okeys[k], &key[k]); }
+
+    if (op->capN >= 0 && op->nheap == (int)op->capN) {
+      /* heap full: keep this row only if it sorts before the current worst */
+      if (op->capN == 0 || sortkey_cmp(op, key, op->heap[0].key) >= 0) {
+        for (int k = 0; k < op->nkey; k++) tdb_value_clear(&key[k]);
+        tdb_mfree(key);
+        continue;
+      }
+      sortent_free(&op->heap[0], op->srcncol, op->nkey);
+      op->heap[0].row = dup_row(r, nc); op->heap[0].key = key;
+      heap_sift_down(op, 0);
+    } else {
+      if (op->nheap == op->heapcap) {
+        op->heapcap = op->heapcap ? op->heapcap * 2 : 64;
+        op->heap = (sortent *)tdb_realloc(op->heap, sizeof(sortent) * (size_t)op->heapcap);
+      }
+      op->heap[op->nheap].row = dup_row(r, nc);
+      op->heap[op->nheap].key = key;
+      op->nheap++;
+      heap_sift_up(op, op->nheap - 1);
+    }
+  }
+  /* heapsort: repeatedly move the max (root) to the shrinking tail, leaving the
+  ** buffer ordered ascending for emission */
+  int n = op->nheap;
+  for (int end = n - 1; end > 0; end--) {
+    sortent t = op->heap[0]; op->heap[0] = op->heap[end]; op->heap[end] = t;
+    op->nheap = end;
+    heap_sift_down(op, 0);
+  }
+  op->nheap = n;
+  op->sorted = 1; op->emit = 0;
+  return TDB_OK;
+}
+
+static int sort_next(tdb_op *op, tdb_value **row, int *ncol) {
+  if (!op->sorted) { int rc = sort_materialize(op); if (rc) return rc; }
+  if (op->emit >= op->nheap) return TDB_DONE;
+  *row = op->heap[op->emit].row;
+  *ncol = op->srcncol;
+  op->emit++;
+  return TDB_ROW;
+}
+
 static int op_next(tdb_op *op, tdb_value **row, int *ncol) {
   switch (op->kind) {
     case OP_SCAN:    return scan_next(op, row, ncol);
     case OP_FILTER:  return filter_next(op, row, ncol);
+    case OP_SORT:    return sort_next(op, row, ncol);
     case OP_PROJECT: return project_next(op, row, ncol);
     case OP_LIMIT:   return limit_next(op, row, ncol);
   }
@@ -164,6 +276,9 @@ static void op_close(tdb_op *op) {
   } else if (op->kind == OP_PROJECT) {
     if (op->outrow) { for (int i = 0; i < op->nout; i++) tdb_value_clear(&op->outrow[i]); tdb_mfree(op->outrow); }
     tdb_mfree(op->oexpr);    /* the array (its exprs are arena-owned) */
+  } else if (op->kind == OP_SORT) {
+    for (int i = 0; i < op->nheap; i++) sortent_free(&op->heap[i], op->srcncol, op->nkey);
+    tdb_mfree(op->heap);     /* okeys/odesc point into the AST (arena) */
   }
   tdb_mfree(op);
 }
@@ -250,6 +365,24 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
     tdb_op *flt = op_new(OP_FILTER, db, st);
     flt->child = src; flt->pred = q->where;
     src = flt;
+  }
+
+  /* ORDER BY: sort before projection so keys can reference any source column.
+  ** With a LIMIT the sort is bounded to the top (OFFSET+LIMIT) rows. */
+  if (q->order) {
+    tdb_op *sort = op_new(OP_SORT, db, st);
+    sort->child = src;
+    sort->okeys = q->order->exprs;
+    sort->odesc = q->order->desc;
+    sort->nkey  = q->order->n;
+    if (q->has_limit) {
+      int64_t lim = const_int(db, st, q->limit, -1);
+      int64_t off = q->offset ? const_int(db, st, q->offset, 0) : 0;
+      sort->capN = (lim < 0) ? -1 : (lim + (off > 0 ? off : 0));
+    } else {
+      sort->capN = -1;
+    }
+    src = sort;
   }
 
   tdb_op *proj = op_new(OP_PROJECT, db, st);

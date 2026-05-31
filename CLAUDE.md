@@ -69,10 +69,11 @@ Bottom to top:
   execution bodies live in `tdb_exec_dml.inc` / `tdb_exec_select.inc`, `#include`d into
   `tdb_exec.c` (they are not separately compiled). Most SELECTs **materialize** their result set
   (full cross-product join → filter → group → project → sort → limit). A single base-table scan
-  with an optional WHERE / projection / LIMIT instead runs through a pull-based **volcano operator
-  tree** (`tdb_exec_stream.inc`: Scan → Filter → Project → Limit) that `tdb_step()` pulls one row
-  at a time, holding a statement-owned read snapshot open across steps; anything more complex falls
-  back to materialization. Correlated subqueries are supported (unbound columns resolve outward
+  with an optional WHERE / ORDER BY / projection / LIMIT instead runs through a pull-based **volcano
+  operator tree** (`tdb_exec_stream.inc`: Scan → Filter → Sort → Project → Limit) that `tdb_step()`
+  pulls one row at a time, holding a statement-owned read snapshot open across steps; the Sort
+  operator becomes a bounded top-N heap when ORDER BY is paired with LIMIT. Anything more complex
+  falls back to materialization. Correlated subqueries are supported (unbound columns resolve outward
   through enclosing query contexts, re-run per outer row).
 - **`src/api/`** — `tdb_api.c` implements the public C API over everything above. `tdb_db.h`
   (internal) defines `struct tdb_db` (the connection: pager, catalog, lockmgr, txnmgr, storage

@@ -1103,9 +1103,61 @@ static void test_spatial_index(void) {
   remove(path); remove("test_spidx.db-wal");
 }
 
+static void test_correlated(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE emp (id INTEGER, name TEXT, dept INTEGER, salary INTEGER)");
+  exec(db, "INSERT INTO emp VALUES (1,'a',10,100),(2,'b',10,200),(3,'c',20,150),"
+           "(4,'d',20,300),(5,'e',30,50)");
+  exec(db, "CREATE TABLE dept (id INTEGER, name TEXT)");
+  exec(db, "INSERT INTO dept VALUES (10,'eng'),(20,'sales'),(30,'hr')");
+
+  /* correlated scalar subquery: each employee's dept average */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT (SELECT AVG(salary) FROM emp e2 WHERE e2.dept = e1.dept) "
+    "FROM emp e1 WHERE id = 1"), 150);   /* dept 10: (100+200)/2 */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT (SELECT AVG(salary) FROM emp e2 WHERE e2.dept = e1.dept) "
+    "FROM emp e1 WHERE id = 4"), 225);   /* dept 20: (150+300)/2 */
+
+  /* correlated EXISTS: depts with an employee earning > 250 -> only sales */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM dept d WHERE EXISTS "
+    "(SELECT 1 FROM emp e WHERE e.dept = d.id AND e.salary > 250)"), 1);
+  check_text(db,
+    "SELECT name FROM dept d WHERE EXISTS "
+    "(SELECT 1 FROM emp e WHERE e.dept = d.id AND e.salary > 250)", "sales");
+
+  /* correlated NOT EXISTS: the complement -> eng, hr */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM dept d WHERE NOT EXISTS "
+    "(SELECT 1 FROM emp e WHERE e.dept = d.id AND e.salary > 250)"), 2);
+
+  /* employees earning above their own dept average -> b (200>150), d (300>225) */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM emp e1 WHERE salary > "
+    "(SELECT AVG(salary) FROM emp e2 WHERE e2.dept = e1.dept)"), 2);
+
+  /* correlated IN: employees whose dept matches a correlated, filtered set */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM emp e1 WHERE dept IN "
+    "(SELECT d.id FROM dept d WHERE d.id = e1.dept AND d.name = 'eng')"), 2);
+
+  /* outer column inside a correlated subquery's SELECT list (not just WHERE) */
+  check_text(db,
+    "SELECT (SELECT d.name || ':' || e1.name FROM dept d WHERE d.id = e1.dept) "
+    "FROM emp e1 WHERE id = 3", "sales:c");
+
+  /* uncorrelated subquery still works unchanged */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM emp WHERE salary > (SELECT AVG(salary) FROM emp)"), 2);
+
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"geospatial", test_geospatial},
   {"spatial_index", test_spatial_index},
+  {"correlated", test_correlated},
   {"upsert", test_upsert},
   {"returning", test_returning},
   {"cte", test_cte},

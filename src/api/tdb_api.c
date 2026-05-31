@@ -158,7 +158,11 @@ int tdb_step(tdb_stmt *st) {
     st->cur = -1;
     if (rc != TDB_OK) { db_unlock(st->db); return rc; }
   }
-  if (st->is_select) {
+  if (st->streaming) {
+    int srows = tdb_stmt_stream_next(st);     /* pull one row through the tree */
+    if (srows == TDB_ROW) { st->cur = 0; ret = TDB_ROW; }
+    else { st->cur = -1; ret = srows; }       /* TDB_DONE or an error code */
+  } else if (st->is_select) {
     st->cur++;
     ret = (st->cur < st->nrows) ? TDB_ROW : TDB_DONE;
   } else {
@@ -171,6 +175,7 @@ int tdb_step(tdb_stmt *st) {
 int tdb_reset(tdb_stmt *st) {
   if (!st) return TDB_MISUSE;
   db_lock(st->db);
+  tdb_stmt_stream_close(st);      /* drop any open operator tree + read snapshot */
   tdb_stmt_clear_results(st);
   st->executed = 0;
   st->cur = -1;
@@ -183,6 +188,7 @@ int tdb_finalize(tdb_stmt *st) {
   if (!st) return TDB_OK;
   tdb_db *db = st->db;
   db_lock(db);
+  tdb_stmt_stream_close(st);      /* release operator tree + read snapshot */
   tdb_stmt_clear_results(st);
   if (st->params) {
     for (int i = 0; i < st->nparams; i++) tdb_value_clear(&st->params[i]);
@@ -234,8 +240,13 @@ int tdb_bind_parameter_count(tdb_stmt *st) { return st ? st->nparams : 0; }
 /* ------------------------------ columns ------------------------------- */
 
 static tdb_value *col(tdb_stmt *st, int i) {
-  if (!st || !st->is_select || st->cur < 0 || st->cur >= st->nrows) return NULL;
+  if (!st || !st->is_select) return NULL;
   if (i < 0 || i >= st->ncol) return NULL;
+  if (st->streaming) {
+    if (st->cur != 0 || !st->stream_row) return NULL;   /* cur==0 marks a live row */
+    return &st->stream_row[i];
+  }
+  if (st->cur < 0 || st->cur >= st->nrows) return NULL;
   return &st->rows[st->cur][i];
 }
 

@@ -982,8 +982,15 @@ static int stmt_execute_locked(tdb_stmt *st) {
   switch (a->kind) {
     case ST_SELECT:
       st->is_select = 1;
-      if (!try_stream_select(db, st, a->u.select, &rc))
+      /* Try the lazy streaming path. When it adopts the auto-transaction
+      ** (started), detach it from the connection so the statement keeps the
+      ** read snapshot open across tdb_step() calls and the end-of-execute
+      ** teardown below leaves it alone. */
+      if (setup_stream(db, st, a->u.select, db->txn, started, &rc)) {
+        if (started) { db->txn = NULL; started = 0; }
+      } else {
         rc = run_select(db, st, a->u.select);
+      }
       break;
     case ST_INSERT: rc = exec_insert(db, st, a); break;
     case ST_UPDATE: rc = exec_update(db, st, a); break;

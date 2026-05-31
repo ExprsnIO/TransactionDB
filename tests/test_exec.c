@@ -1221,11 +1221,55 @@ static void test_streaming(void) {
   tdb_close(db);
 }
 
+static void test_stream_snapshot(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,10),(2,20),(3,30)");
+
+  /* A lazily streamed SELECT holds a read snapshot open across steps. A write
+  ** committed on the same connection mid-stream must NOT become visible to the
+  ** in-flight scan (snapshot isolation). */
+  tdb_stmt *s = NULL;
+  TDB_CHECK_EQ(tdb_prepare_v2(db, "SELECT id FROM t", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_EQ(tdb_column_int(s, 0), 1);          /* first row pulled */
+
+  /* commit an insert on the same connection while the stream is paused */
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (4,40)"), TDB_OK);
+
+  /* the stream continues on its original snapshot: 2, 3, then DONE (never 4) */
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW); TDB_CHECK_EQ(tdb_column_int(s, 0), 2);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW); TDB_CHECK_EQ(tdb_column_int(s, 0), 3);
+  TDB_CHECK_EQ(tdb_step(s), TDB_DONE);
+  tdb_finalize(s);
+
+  /* a fresh statement sees the committed row */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 4);
+
+  /* finalizing a partially-consumed stream releases its snapshot cleanly */
+  tdb_stmt *s2 = NULL;
+  tdb_prepare_v2(db, "SELECT id FROM t", -1, &s2, NULL);
+  TDB_CHECK_EQ(tdb_step(s2), TDB_ROW);            /* pull one, then abandon */
+  tdb_finalize(s2);
+
+  /* reset mid-stream, then re-run to completion on a new snapshot */
+  tdb_stmt *s3 = NULL;
+  tdb_prepare_v2(db, "SELECT id FROM t WHERE id <= 2", -1, &s3, NULL);
+  TDB_CHECK_EQ(tdb_step(s3), TDB_ROW);
+  tdb_reset(s3);
+  int n = 0; while (tdb_step(s3) == TDB_ROW) n++;
+  TDB_CHECK_EQ(n, 2);
+  tdb_finalize(s3);
+
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"geospatial", test_geospatial},
   {"spatial_index", test_spatial_index},
   {"correlated", test_correlated},
   {"streaming", test_streaming},
+  {"stream_snapshot", test_stream_snapshot},
   {"upsert", test_upsert},
   {"returning", test_returning},
   {"cte", test_cte},

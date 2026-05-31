@@ -61,6 +61,17 @@ struct tdb_stmt {
   int           executed;
   int64_t       changes;
 
+  /* lazy (volcano) streaming: when `plan` is set, tdb_step() pulls one row at a
+  ** time through the operator tree instead of reading the materialized `rows`.
+  ** `stream_row` holds the current output row (ncol values); `own_txn` is a
+  ** statement-held read snapshot kept open across steps (NULL if the scan rides
+  ** an explicit connection transaction); `stream_done` latches end-of-stream. */
+  void         *plan;       /* tdb_op* operator-tree root, or NULL */
+  tdb_value    *stream_row;
+  tdb_txn      *own_txn;
+  int           streaming;
+  int           stream_done;
+
   /* innermost in-scope WITH common-table-expression frame (executor-internal),
   ** a linked stack walked outward; NULL when no CTEs are in scope */
   struct cte_scope *cte_scope;
@@ -69,11 +80,20 @@ struct tdb_stmt {
 /* Set the connection error message. */
 void tdb_db_seterr(tdb_db *db, const char *fmt, ...);
 
-/* Execute a prepared statement: run DDL/DML to completion, or materialize a
-** SELECT result set into stmt->rows. Implemented in tdb_exec.c. */
+/* Execute a prepared statement: run DDL/DML to completion, or prepare a SELECT
+** result — either materialized into stmt->rows or, for a streamable scan, armed
+** as a lazy operator tree pulled by tdb_step(). Implemented in tdb_exec.c. */
 int  tdb_stmt_execute(tdb_stmt *stmt);
 
 /* Free a materialized result set (rows + column names). */
 void tdb_stmt_clear_results(tdb_stmt *stmt);
+
+/* Lazy streaming (volcano) hooks, implemented in tdb_exec.c. When a SELECT is
+** compiled to an operator tree, tdb_step() pulls one row per call:
+**   tdb_stmt_stream_next advances the tree, leaving the current row in
+**   stmt->stream_row and returning TDB_ROW / TDB_DONE / an error code;
+**   tdb_stmt_stream_close tears down the tree and releases the read snapshot. */
+int  tdb_stmt_stream_next(tdb_stmt *stmt);
+void tdb_stmt_stream_close(tdb_stmt *stmt);
 
 #endif /* TDB_DB_H */

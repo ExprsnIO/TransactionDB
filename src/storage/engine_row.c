@@ -560,13 +560,19 @@ static int eng_drop_column(tdb_storage *s, tdb_txn *txn, tdb_table *t, int ci) {
   return rc;
 }
 
+static int eng_drop_index(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_index *ix) {
+  TDB_UNUSED(txn); TDB_UNUSED(t);
+  row_engine *e = (row_engine *)s->impl;
+  return tdb_btree_destroy(e->pager, ix->root, TDB_BT_INDEX);
+}
+
 static const tdb_storage_vtab g_row_vtab = {
   "row-btree",
   eng_close,
   eng_create_table, eng_drop_table, eng_create_index,
   eng_insert, eng_update, eng_remove, eng_next_rowid,
   eng_scan_open, eng_scan_next, eng_scan_close,
-  eng_seek_rowid, eng_add_column, eng_drop_column,
+  eng_seek_rowid, eng_add_column, eng_drop_column, eng_drop_index,
 };
 
 int tdb_engine_row_open(tdb_pager *p, tdb_storage **out) {

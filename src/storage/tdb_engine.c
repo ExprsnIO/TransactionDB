@@ -58,6 +58,9 @@ static int d_add_column(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
 static int d_drop_column(tdb_storage *s, tdb_txn *txn, tdb_table *t, int ci) {
   tdb_storage *e = pick(s, t); return e->vtab->drop_column(e, txn, t, ci);
 }
+static int d_drop_index(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_index *ix) {
+  tdb_storage *e = pick(s, t); return e->vtab->drop_index(e, txn, t, ix);
+}
 static int d_scan_open(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_index *use_idx,
                        const tdb_keyrange *range, tdb_txnid as_of,
                        const uint8_t *colmask, tdb_scan **out) {
@@ -85,7 +88,7 @@ static const tdb_storage_vtab g_disp_vtab = {
   d_create_table, d_drop_table, d_create_index,
   d_insert, d_update, d_remove, d_next_rowid,
   d_scan_open, d_scan_next, d_scan_close, d_seek_rowid,
-  d_add_column, d_drop_column,
+  d_add_column, d_drop_column, d_drop_index,
 };
 
 int tdb_engine_open(tdb_pager *p, tdb_storage **out) {

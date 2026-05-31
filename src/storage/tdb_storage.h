@@ -72,6 +72,9 @@ typedef struct tdb_storage_vtab {
   ** The row engine rewrites each record without the column; the columnar
   ** engine discards the column's value b-tree. */
   int (*drop_column)(tdb_storage *s, tdb_txn *txn, tdb_table *t, int col_index);
+
+  /* Reclaim the b-tree backing index `ix` (DROP INDEX). */
+  int (*drop_index)(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_index *ix);
 } tdb_storage_vtab;
 
 struct tdb_storage {

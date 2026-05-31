@@ -144,6 +144,7 @@ typedef struct tdb_saved_query {
 tdb_table  *tdb_table_new(const char *name);
 int         tdb_table_add_column(tdb_table *t, const tdb_column *col);
 int         tdb_table_drop_column(tdb_table *t, int ci);
+int         tdb_table_drop_index(tdb_table *t, int pos);
 int         tdb_table_find_column(const tdb_table *t, const char *name);
 void        tdb_table_free(tdb_table *t);
 

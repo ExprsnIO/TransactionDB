@@ -26,6 +26,7 @@ typedef enum tdb_token_kind {
   /* operators */
   TK_PLUS, TK_MINUS, TK_SLASH, TK_PERCENT,
   TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT, TK_GE, TK_CONCAT,
+  TK_BITAND, TK_BITOR, TK_BITNOT, TK_SHL, TK_SHR,
 
   /* keywords (kept alphabetical-ish; values are opaque) */
   TK_SELECT, TK_FROM, TK_WHERE, TK_GROUP, TK_BY, TK_HAVING, TK_ORDER,

@@ -240,10 +240,12 @@ int tdb_lex_next(tdb_lexer *lx, tdb_token *out) {
     case '<':
       if (at(lx, 0) == '=') { lx->pos++; out->n = 2; out->kind = TK_LE; }
       else if (at(lx, 0) == '>') { lx->pos++; out->n = 2; out->kind = TK_NE; }
+      else if (at(lx, 0) == '<') { lx->pos++; out->n = 2; out->kind = TK_SHL; }
       else out->kind = TK_LT;
       break;
     case '>':
       if (at(lx, 0) == '=') { lx->pos++; out->n = 2; out->kind = TK_GE; }
+      else if (at(lx, 0) == '>') { lx->pos++; out->n = 2; out->kind = TK_SHR; }
       else out->kind = TK_GT;
       break;
     case '!':
@@ -252,8 +254,10 @@ int tdb_lex_next(tdb_lexer *lx, tdb_token *out) {
       break;
     case '|':
       if (at(lx, 0) == '|') { lx->pos++; out->n = 2; out->kind = TK_CONCAT; }
-      else out->kind = TK_ILLEGAL;
+      else out->kind = TK_BITOR;
       break;
+    case '&': out->kind = TK_BITAND; break;
+    case '~': out->kind = TK_BITNOT; break;
     default: out->kind = TK_ILLEGAL; break;
   }
   return out->kind;
@@ -274,6 +278,8 @@ const char *tdb_token_name(tdb_token_kind k) {
     case TK_PERCENT: return "%"; case TK_EQ: return "="; case TK_NE: return "!=";
     case TK_LT: return "<"; case TK_LE: return "<="; case TK_GT: return ">";
     case TK_GE: return ">="; case TK_CONCAT: return "||";
+    case TK_BITAND: return "&"; case TK_BITOR: return "|"; case TK_BITNOT: return "~";
+    case TK_SHL: return "<<"; case TK_SHR: return ">>";
     case TK_AND: return "AND"; case TK_OR: return "OR"; case TK_NOT: return "NOT";
     case TK_IS: return "IS"; case TK_IN: return "IN"; case TK_LIKE: return "LIKE";
     case TK_BETWEEN: return "BETWEEN";

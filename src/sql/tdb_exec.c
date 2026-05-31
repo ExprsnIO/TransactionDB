@@ -351,6 +351,28 @@ static int eval_binary(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     goto done;
   }
 
+  /* bitwise (integer) operators */
+  if (op == TK_BITAND || op == TK_BITOR || op == TK_SHL || op == TK_SHR) {
+    if (l.type == TDB_VAL_NULL || r.type == TDB_VAL_NULL) { tdb_value_set_null(out); goto done; }
+    int64_t a = tdb_value_as_int(&l), b = tdb_value_as_int(&r), v = 0;
+    switch (op) {
+      case TK_BITAND: v = a & b; break;
+      case TK_BITOR:  v = a | b; break;
+      case TK_SHL:
+        if (b <= -64 || b >= 64) v = 0;
+        else if (b < 0) v = (int64_t)((uint64_t)a >> (-b));
+        else v = (int64_t)((uint64_t)a << b);
+        break;
+      case TK_SHR:
+        if (b <= -64 || b >= 64) v = 0;
+        else if (b < 0) v = (int64_t)((uint64_t)a << (-b));
+        else v = (int64_t)((uint64_t)a >> b);
+        break;
+    }
+    tdb_value_set_int(out, v);
+    goto done;
+  }
+
   /* arithmetic */
   if (l.type == TDB_VAL_NULL || r.type == TDB_VAL_NULL) { tdb_value_set_null(out); goto done; }
   if (l.type == TDB_VAL_INT && r.type == TDB_VAL_INT &&
@@ -530,6 +552,9 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
         if (v.type == TDB_VAL_REAL) tdb_value_set_real(out, -v.u.r);
         else if (v.type == TDB_VAL_INT) tdb_value_set_int(out, -v.u.i);
         else tdb_value_set_null(out);
+      } else if (e->op == TK_BITNOT) {
+        if (v.type == TDB_VAL_NULL) tdb_value_set_null(out);
+        else tdb_value_set_int(out, ~tdb_value_as_int(&v));
       } else tdb_value_copy(out, &v);
       tdb_value_clear(&v);
       return TDB_OK;

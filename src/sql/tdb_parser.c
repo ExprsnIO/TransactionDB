@@ -42,6 +42,12 @@ static int expect(P *p, tdb_token_kind k, const char *what) {
 static char *dupz(P *p, const char *z, int n) { return tdb_arena_strndup(p->a, z, (size_t)n); }
 static char *dup_tok(P *p, const tdb_token *t) { return dupz(p, t->z, t->n); }
 
+/* is the current token the identifier `kw` (case-insensitive)? */
+static int id_is(const tdb_token *t, const char *kw) {
+  return t->kind == TK_ID && (int)strlen(kw) == t->n &&
+         strncasecmp(t->z, kw, (size_t)t->n) == 0;
+}
+
 static size_t off(P *p) { return (size_t)(p->cur.z - p->sql); }
 
 /* arena copy of sql[start,end) with surrounding whitespace trimmed */
@@ -403,8 +409,13 @@ static char **parse_name_list(P *p, int *count) {
 
 static tdb_ast_stmt *parse_insert(P *p) {
   advance(p); /* INSERT */
-  expect(p, TK_INTO, "expected INTO");
   tdb_ast_stmt *s = new_stmt(p, ST_INSERT);
+  if (accept(p, TK_OR)) {           /* INSERT OR REPLACE|IGNORE|ABORT|FAIL|ROLLBACK */
+    if (id_is(&p->cur, "REPLACE")) s->u.insert.or_action = TDB_OR_REPLACE;
+    else if (id_is(&p->cur, "IGNORE")) s->u.insert.or_action = TDB_OR_IGNORE;
+    if (p->cur.kind == TK_ROLLBACK) advance(p); else advance(p);
+  }
+  expect(p, TK_INTO, "expected INTO");
   s->u.insert.table = dup_tok(p, &p->cur);
   expect(p, TK_ID, "expected table name");
   if (accept(p, TK_LP)) {
@@ -430,6 +441,34 @@ static tdb_ast_stmt *parse_insert(P *p) {
       }
       s->u.insert.rows[s->u.insert.nrows++] = row;
     } while (accept(p, TK_COMMA) && !p->err);
+  }
+
+  /* ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET ... [WHERE ...] */
+  if (accept(p, TK_ON)) {
+    if (id_is(&p->cur, "CONFLICT")) advance(p); else set_err(p, "expected CONFLICT");
+    if (accept(p, TK_LP)) { int dummy = 0; (void)parse_name_list(p, &dummy); expect(p, TK_RP, "expected )"); }
+    if (id_is(&p->cur, "DO")) advance(p); else set_err(p, "expected DO");
+    s->u.insert.has_upsert = 1;
+    if (id_is(&p->cur, "NOTHING")) { advance(p); s->u.insert.upsert_nothing = 1; }
+    else if (accept(p, TK_UPDATE)) {
+      expect(p, TK_SET, "expected SET");
+      int cap = 0;
+      do {
+        if (s->u.insert.up_nset == cap) {
+          cap = cap ? cap * 2 : 4;
+          char **gc = (char **)tdb_arena_alloc(p->a, sizeof(char *) * (size_t)cap);
+          tdb_expr **gv = (tdb_expr **)tdb_arena_alloc(p->a, sizeof(void *) * (size_t)cap);
+          for (int i = 0; i < s->u.insert.up_nset; i++) { gc[i] = s->u.insert.up_cols[i]; gv[i] = s->u.insert.up_vals[i]; }
+          s->u.insert.up_cols = gc; s->u.insert.up_vals = gv;
+        }
+        s->u.insert.up_cols[s->u.insert.up_nset] = dup_tok(p, &p->cur);
+        expect(p, TK_ID, "expected column name");
+        expect(p, TK_EQ, "expected = in SET");
+        s->u.insert.up_vals[s->u.insert.up_nset] = parse_expr(p, 0);
+        s->u.insert.up_nset++;
+      } while (accept(p, TK_COMMA) && !p->err);
+      if (accept(p, TK_WHERE)) s->u.insert.up_where = parse_expr(p, 0);
+    } else set_err(p, "expected NOTHING or UPDATE");
   }
   return s;
 }

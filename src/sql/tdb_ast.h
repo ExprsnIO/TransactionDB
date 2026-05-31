@@ -153,6 +153,13 @@ typedef struct tdb_ast_stmt {
       char        **cols;  int ncol;        /* optional column list */
       tdb_exprlist **rows; int nrows;        /* VALUES (...) , (...) */
       tdb_select   *select;                  /* INSERT ... SELECT */
+      int           or_action;               /* 0 abort, 1 ignore, 2 replace */
+      int           has_upsert;              /* ON CONFLICT ... present */
+      int           upsert_nothing;          /* ON CONFLICT DO NOTHING */
+      char        **up_cols;                 /* ON CONFLICT DO UPDATE SET ... */
+      tdb_expr    **up_vals;
+      int           up_nset;
+      tdb_expr     *up_where;
     } insert;
 
     struct {
@@ -189,6 +196,11 @@ typedef struct tdb_ast_stmt {
     struct { struct tdb_ast_stmt *inner; } explain;
   } u;
 } tdb_ast_stmt;
+
+/* INSERT OR <action> */
+#define TDB_OR_ABORT   0
+#define TDB_OR_IGNORE  1
+#define TDB_OR_REPLACE 2
 
 /* alter actions */
 #define TDB_ALTER_ADD_COLUMN    1

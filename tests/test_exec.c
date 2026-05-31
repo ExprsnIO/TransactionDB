@@ -498,7 +498,49 @@ static void test_alter_persist(void) {
   remove(path); remove("test_alter.db-wal");
 }
 
+static void test_upsert(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, hits INTEGER)");
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (1,'a',1),(2,'b',1)"), TDB_OK);
+
+  /* default behaviour: duplicate PK is an error, table unchanged */
+  TDB_CHECK(exec(db, "INSERT INTO t VALUES (1,'dup',9)") != TDB_OK);
+  check_text(db, "SELECT name FROM t WHERE id = 1", "a");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 2);
+
+  /* INSERT OR IGNORE: existing row kept, new row added */
+  TDB_CHECK_EQ(exec(db, "INSERT OR IGNORE INTO t VALUES (1,'ign',9),(3,'c',1)"), TDB_OK);
+  check_text(db, "SELECT name FROM t WHERE id = 1", "a");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 3);
+
+  /* INSERT OR REPLACE: existing row overwritten */
+  TDB_CHECK_EQ(exec(db, "INSERT OR REPLACE INTO t VALUES (1,'repl',5)"), TDB_OK);
+  check_text(db, "SELECT name FROM t WHERE id = 1", "repl");
+  TDB_CHECK_EQ(scalar(db, "SELECT hits FROM t WHERE id = 1"), 5);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 3);
+
+  /* ON CONFLICT DO NOTHING */
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (2,'x',9) ON CONFLICT DO NOTHING"), TDB_OK);
+  check_text(db, "SELECT name FROM t WHERE id = 2", "b");
+
+  /* ON CONFLICT DO UPDATE SET ... (no conflict path: plain insert) */
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (4,'d',1) ON CONFLICT DO UPDATE SET hits = hits + 1"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT hits FROM t WHERE id = 4"), 1);
+
+  /* ON CONFLICT DO UPDATE SET ... (conflict path: bump existing counter) */
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (4,'d',1) ON CONFLICT DO UPDATE SET hits = hits + 10"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT hits FROM t WHERE id = 4"), 11);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 4);
+
+  /* ON CONFLICT DO UPDATE ... WHERE: predicate false suppresses the update */
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (4,'d',1) ON CONFLICT DO UPDATE SET hits = 999 WHERE hits < 5"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT hits FROM t WHERE id = 4"), 11);  /* 11 >= 5, unchanged */
+
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
+  {"upsert", test_upsert},
   {"ddl_dml_select", test_ddl_dml_select},
   {"derived_and_view", test_derived_and_view},
   {"outer_joins", test_outer_joins},

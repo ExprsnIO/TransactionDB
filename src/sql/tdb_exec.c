@@ -167,14 +167,35 @@ typedef struct {
 static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out);
 static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q);
 
+/* A WITH frame: the CTE list attached to one SELECT, linked to the enclosing
+** frame so name lookup can walk outward (lexical scoping). */
+typedef struct cte_scope {
+  tdb_ctelist      *list;
+  struct cte_scope *parent;
+} cte_scope;
+
+/* Find an in-scope, non-active CTE by name (case-insensitive). Active CTEs are
+** those currently being materialized — skipping them blocks self-reference. */
+static tdb_cte *find_cte(tdb_stmt *st, const char *name) {
+  for (cte_scope *sc = st->cte_scope; sc; sc = sc->parent) {
+    tdb_ctelist *l = sc->list;
+    for (int i = 0; l && i < l->n; i++)
+      if (!l->items[i].active && strcasecmp(l->items[i].name, name) == 0)
+        return &l->items[i];
+  }
+  return NULL;
+}
+
 /* Run an (uncorrelated) subquery into a throwaway statement. The caller reads
 ** tmp->rows / nrows / ncol, then calls tdb_stmt_clear_results(tmp). The arena
-** and bound params are shared with the parent (not freed here). */
+** and bound params are shared with the parent (not freed here). The CTE scope
+** is inherited so common table expressions stay visible inside subqueries. */
 static int run_subselect(tdb_db *db, tdb_stmt *parent, tdb_select *q, tdb_stmt *tmp) {
   memset(tmp, 0, sizeof(*tmp));
   tmp->db = db; tmp->arena = parent->arena;
   tmp->params = parent->params; tmp->nparams = parent->nparams;
   tmp->cur = -1; tmp->is_select = 1;
+  tmp->cte_scope = parent->cte_scope;
   return exec_select(db, tmp, q);
 }
 

@@ -51,6 +51,10 @@ struct tdb_stmt {
   int           cur;       /* current row index, -1 before first step */
   int           executed;
   int64_t       changes;
+
+  /* innermost in-scope WITH common-table-expression frame (executor-internal),
+  ** a linked stack walked outward; NULL when no CTEs are in scope */
+  struct cte_scope *cte_scope;
 };
 
 /* Set the connection error message. */

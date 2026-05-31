@@ -575,8 +575,29 @@ static int exec_alter(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       tdb_mfree(oldname);
       return rc;
     }
+    case TDB_ALTER_DROP_COLUMN: {
+      int ci = tdb_table_find_column(t, a->u.alter.col);
+      if (ci < 0) { tdb_db_seterr(db, "no such column: %s", a->u.alter.col); return TDB_ERROR; }
+      if (t->ncol <= 1) { tdb_db_seterr(db, "cannot drop the only column of %s", t->name); return TDB_ERROR; }
+      if (t->cols[ci].pk) { tdb_db_seterr(db, "cannot drop PRIMARY KEY column: %s", a->u.alter.col); return TDB_ERROR; }
+      if (t->cols[ci].hidden || ci == t->row_start_col || ci == t->row_end_col) {
+        tdb_db_seterr(db, "cannot drop system column: %s", a->u.alter.col); return TDB_ERROR;
+      }
+      for (int i = 0; i < t->nindex; i++)
+        for (int k = 0; k < t->indexes[i].ncol; k++)
+          if (t->indexes[i].col_idx[k] == ci) {
+            tdb_db_seterr(db, "cannot drop column %s: used by index %s",
+                          a->u.alter.col, t->indexes[i].name);
+            return TDB_ERROR;
+          }
+      int rc = db->engine->vtab->drop_column(db->engine, db->txn, t, ci);  /* rewrite/discard storage */
+      if (rc) return rc;
+      tdb_table_drop_column(t, ci);
+      t->schema_version++;
+      return tdb_catalog_update_table(db->cat, t);
+    }
     default:
-      tdb_db_seterr(db, "ALTER TABLE DROP COLUMN not yet supported");
+      tdb_db_seterr(db, "unsupported ALTER TABLE action");
       return TDB_UNSUPPORTED;
   }
 }

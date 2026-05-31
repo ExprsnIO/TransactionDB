@@ -68,8 +68,9 @@ Bottom to top:
   `tdb_analyze` (name resolution / semantic analysis) → `tdb_exec` (executor). DML and SELECT
   execution bodies live in `tdb_exec_dml.inc` / `tdb_exec_select.inc`, `#include`d into
   `tdb_exec.c` (they are not separately compiled). The executor currently **materializes** result
-  sets (full cross-product join → filter → group → project → sort → limit); lazy/volcano
-  streaming and correlated subqueries are intentionally deferred.
+  sets (full cross-product join → filter → group → project → sort → limit). Correlated subqueries
+  are supported (unbound columns resolve outward through enclosing query contexts, re-run per outer
+  row); lazy/volcano streaming is intentionally deferred.
 - **`src/api/`** — `tdb_api.c` implements the public C API over everything above. `tdb_db.h`
   (internal) defines `struct tdb_db` (the connection: pager, catalog, lockmgr, txnmgr, storage
   engine, optional lua, current txn, autocommit flag) and `struct tdb_stmt` (a prepared statement

@@ -4,8 +4,10 @@
 ** (INNER/CROSS joins), filtering by the join ON conditions and WHERE,
 ** optionally grouping/aggregating, projecting, sorting, and applying
 ** LIMIT/OFFSET — producing a fully materialized result set. DML evaluates
-** rows and drives the storage vtable. Outer joins, correlated subqueries,
-** and lazy (volcano) streaming are intentionally left for later.
+** rows and drives the storage vtable. Correlated subqueries are supported by
+** resolving unbound column references outward through enclosing query contexts
+** and re-running the subquery per outer row; lazy (volcano) streaming is
+** intentionally left for later.
 */
 #include "../api/tdb_db.h"
 #include "../api/tdb_env.h"
@@ -38,7 +40,7 @@ typedef struct {
   int          join;      /* tdb_join_kind: join to the preceding source */
   tdb_expr    *on;        /* ON condition (resolved), or NULL */
 } qsrc;
-typedef struct {
+typedef struct qctx {
   qsrc      src[MAXSRC];
   int       nsrc;
   int       totalcols;
@@ -46,6 +48,7 @@ typedef struct {
   int       nagg;
   int       paramcount;
   int       err;
+  struct qctx *outer;   /* enclosing query's context (correlated subqueries) */
 } qctx;
 
 typedef struct { tdb_value **rows; int n, cap, ncol; } rowset;
@@ -102,21 +105,27 @@ static int mat_table(tdb_db *db, tdb_table *t, tdb_index *idx,
 
 static int resolve_expr(tdb_db *db, qctx *q, tdb_expr *e);
 
+/* Resolve a column against `q`'s sources; on miss, walk outward through the
+** enclosing query contexts (correlated reference), recording how many scopes
+** up the match was found in e->outer_level. */
 static int resolve_column(tdb_db *db, qctx *q, tdb_expr *e) {
-  for (int s = 0; s < q->nsrc; s++) {
-    qsrc *src = &q->src[s];
-    if (e->table) {
-      const char *nm = src->alias ? src->alias : (src->tbl ? src->tbl->name : NULL);
-      if (!nm || strcasecmp(nm, e->table) != 0) continue;
-    }
-    if (src->tbl) {
-      int ci = tdb_table_find_column(src->tbl, e->name);
-      if (ci >= 0) { e->col_index = src->base + ci; return TDB_OK; }
-    } else {
-      for (int k = 0; k < src->ncol; k++)
-        if (src->colnames[k] && strcasecmp(src->colnames[k], e->name) == 0) {
-          e->col_index = src->base + k; return TDB_OK;
-        }
+  int level = 0;
+  for (qctx *scope = q; scope; scope = scope->outer, level++) {
+    for (int s = 0; s < scope->nsrc; s++) {
+      qsrc *src = &scope->src[s];
+      if (e->table) {
+        const char *nm = src->alias ? src->alias : (src->tbl ? src->tbl->name : NULL);
+        if (!nm || strcasecmp(nm, e->table) != 0) continue;
+      }
+      if (src->tbl) {
+        int ci = tdb_table_find_column(src->tbl, e->name);
+        if (ci >= 0) { e->col_index = src->base + ci; e->outer_level = level; return TDB_OK; }
+      } else {
+        for (int k = 0; k < src->ncol; k++)
+          if (src->colnames[k] && strcasecmp(src->colnames[k], e->name) == 0) {
+            e->col_index = src->base + k; e->outer_level = level; return TDB_OK;
+          }
+      }
     }
   }
   tdb_db_seterr(db, "no such column: %s", e->name);
@@ -158,16 +167,18 @@ static int resolve_expr(tdb_db *db, qctx *q, tdb_expr *e) {
 
 /* ----------------------------- evaluation ----------------------------- */
 
-typedef struct {
+typedef struct ectx {
   tdb_value *row;       /* combined source row */
   int        nrow;
   tdb_value *aggvals;   /* aggregate results (post-agg), or NULL */
   int        naggvals;
   tdb_stmt  *stmt;
+  qctx        *qc;      /* this query's resolution context (for subqueries) */
+  struct ectx *outer;   /* enclosing query's per-row context (correlation) */
 } ectx;
 
 static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out);
-static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q);
+static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer);
 
 /* A WITH frame: the CTE list attached to one SELECT, linked to the enclosing
 ** frame so name lookup can walk outward (lexical scoping). */
@@ -192,13 +203,14 @@ static tdb_cte *find_cte(tdb_stmt *st, const char *name) {
 ** tmp->rows / nrows / ncol, then calls tdb_stmt_clear_results(tmp). The arena
 ** and bound params are shared with the parent (not freed here). The CTE scope
 ** is inherited so common table expressions stay visible inside subqueries. */
-static int run_subselect(tdb_db *db, tdb_stmt *parent, tdb_select *q, tdb_stmt *tmp) {
+static int run_subselect(tdb_db *db, tdb_stmt *parent, tdb_select *q, tdb_stmt *tmp,
+                         ectx *outer) {
   memset(tmp, 0, sizeof(*tmp));
   tmp->db = db; tmp->arena = parent->arena;
   tmp->params = parent->params; tmp->nparams = parent->nparams;
   tmp->cur = -1; tmp->is_select = 1;
   tmp->cte_scope = parent->cte_scope;
-  return exec_select(db, tmp, q);
+  return exec_select(db, tmp, q, outer);
 }
 
 static int val_true(const tdb_value *v) {
@@ -616,10 +628,14 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
   switch (e->kind) {
     case EX_LITERAL: return tdb_value_copy(out, &e->lit);
     case EX_NULL: tdb_value_set_null(out); return TDB_OK;
-    case EX_COLUMN:
-      if (c->row && e->col_index >= 0 && e->col_index < c->nrow)
-        return tdb_value_copy(out, &c->row[e->col_index]);
+    case EX_COLUMN: {
+      /* follow the correlation chain outward for an outer reference */
+      ectx *sc = c;
+      for (int up = 0; up < e->outer_level && sc; up++) sc = sc->outer;
+      if (sc && sc->row && e->col_index >= 0 && e->col_index < sc->nrow)
+        return tdb_value_copy(out, &sc->row[e->col_index]);
       tdb_value_set_null(out); return TDB_OK;
+    }
     case EX_PARAM:
       if (c->stmt && e->col_index >= 0 && e->col_index < c->stmt->nparams)
         return tdb_value_copy(out, &c->stmt->params[e->col_index]);
@@ -670,7 +686,7 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
       int res = 0;
       if (e->subquery) {
         tdb_stmt tmp;
-        if (run_subselect(db, c->stmt, e->subquery, &tmp) == TDB_OK) {
+        if (run_subselect(db, c->stmt, e->subquery, &tmp, c) == TDB_OK) {
           for (int i = 0; i < tmp.nrows && !res; i++)
             if (x.type != TDB_VAL_NULL && tmp.ncol > 0 && tmp.rows[i][0].type != TDB_VAL_NULL &&
                 tdb_value_compare(&x, &tmp.rows[i][0], TDB_COLL_BINARY) == 0) res = 1;
@@ -690,7 +706,7 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     }
     case EX_SUBQUERY: {
       tdb_stmt tmp;
-      if (run_subselect(db, c->stmt, e->subquery, &tmp) == TDB_OK && tmp.nrows > 0 && tmp.ncol > 0)
+      if (run_subselect(db, c->stmt, e->subquery, &tmp, c) == TDB_OK && tmp.nrows > 0 && tmp.ncol > 0)
         tdb_value_copy(out, &tmp.rows[0][0]);
       else tdb_value_set_null(out);
       tdb_stmt_clear_results(&tmp);
@@ -699,7 +715,7 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     case EX_EXISTS: {
       tdb_stmt tmp;
       int ex = 0;
-      if (run_subselect(db, c->stmt, e->subquery, &tmp) == TDB_OK) ex = (tmp.nrows > 0);
+      if (run_subselect(db, c->stmt, e->subquery, &tmp, c) == TDB_OK) ex = (tmp.nrows > 0);
       tdb_stmt_clear_results(&tmp);
       tdb_value_set_int(out, ex);
       return TDB_OK;
@@ -733,7 +749,7 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
 ** source's join kind + ON, then the WHERE predicate. Supports INNER/CROSS and
 ** LEFT/RIGHT/FULL outer joins (unmatched sides get NULL-padded). */
 static int join_build(tdb_db *db, tdb_stmt *st, qctx *q, rowset *sets,
-                      tdb_expr *where, rowset *out) {
+                      tdb_expr *where, rowset *out, ectx *outer) {
   int total = q->totalcols;
   rowset acc; rowset_init(&acc, total);
 
@@ -758,7 +774,7 @@ static int join_build(tdb_db *db, tdb_stmt *st, qctx *q, rowset *sets,
           tdb_value_copy(&cand[src->base + k], &sets[s].rows[ri][k]);
         int ok = 1;
         if (src->on) {
-          ectx ec = { cand, total, NULL, 0, st };
+          ectx ec = { cand, total, NULL, 0, st, q, outer };
           tdb_value v; tdb_value_init(&v);
           eval(db, &ec, src->on, &v);
           ok = val_true(&v);
@@ -794,7 +810,7 @@ static int join_build(tdb_db *db, tdb_stmt *st, qctx *q, rowset *sets,
   for (int i = 0; i < acc.n; i++) {
     int ok = 1;
     if (where) {
-      ectx ec = { acc.rows[i], total, NULL, 0, st };
+      ectx ec = { acc.rows[i], total, NULL, 0, st, q, outer };
       tdb_value v; tdb_value_init(&v);
       eval(db, &ec, where, &v);
       ok = val_true(&v);
@@ -833,10 +849,10 @@ static int sort_cmp(const void *pa, const void *pb) {
   return 0;
 }
 
-static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q);
+static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer);
 
 static int run_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
-  return exec_select(db, st, q);
+  return exec_select(db, st, q, NULL);
 }
 
 #include "tdb_exec_select.inc"

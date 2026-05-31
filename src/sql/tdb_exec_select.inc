@@ -20,7 +20,7 @@ typedef struct {
 
 static int const_int(tdb_db *db, tdb_stmt *st, tdb_expr *e, int64_t dflt) {
   if (!e) return (int)dflt;
-  ectx ec = { NULL, 0, NULL, 0, st };
+  ectx ec = { NULL, 0, NULL, 0, st, NULL, NULL };
   tdb_value v; tdb_value_init(&v);
   eval(db, &ec, e, &v);
   int64_t r = (v.type == TDB_VAL_NULL) ? dflt : tdb_value_as_int(&v);
@@ -128,7 +128,7 @@ static void apply_pred(tdb_db *db, tdb_stmt *st, const char *lead, tdb_expr *p,
   } else return;
 
   tdb_value v; tdb_value_init(&v);
-  ectx ec = { NULL, 0, NULL, 0, st };
+  ectx ec = { NULL, 0, NULL, 0, st, NULL, NULL };
   eval(db, &ec, val, &v);
   if (v.type == TDB_VAL_NULL) { tdb_value_clear(&v); return; }
   switch (op) {
@@ -152,7 +152,7 @@ static int expr_is_col(const tdb_expr *e, const char *col) {
 /* Evaluate a constant geometry expression to its bounding box. */
 static int const_geom_bbox(tdb_db *db, tdb_stmt *st, tdb_expr *e, tdb_bbox *out) {
   if (!expr_is_foldable(e)) return 0;
-  ectx ec = { NULL, 0, NULL, 0, st };
+  ectx ec = { NULL, 0, NULL, 0, st, NULL, NULL };
   tdb_value v; tdb_value_init(&v);
   eval(db, &ec, e, &v);
   int ok = (v.type == TDB_VAL_BLOB && v.u.s.p &&
@@ -185,7 +185,7 @@ static int spatial_window(tdb_db *db, tdb_stmt *st, const char *col,
   if (!const_geom_bbox(db, st, geomarg, out)) return 0;
 
   if (dwithin && p->args->n >= 3 && expr_is_foldable(p->args->items[2])) {
-    ectx ec = { NULL, 0, NULL, 0, st };
+    ectx ec = { NULL, 0, NULL, 0, st, NULL, NULL };
     tdb_value d; tdb_value_init(&d);
     eval(db, &ec, p->args->items[2], &d);
     double dd = tdb_value_as_real(&d);
@@ -281,7 +281,7 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
       qs->tbl = t; qs->ncol = t->ncol;
       tdb_txnid as_of = 0;
       if (s->as_of) {
-        ectx ec = { NULL, 0, NULL, 0, st };
+        ectx ec = { NULL, 0, NULL, 0, st, NULL, NULL };
         tdb_value v; tdb_value_init(&v);
         eval(db, &ec, s->as_of, &v);
         as_of = (tdb_txnid)tdb_value_as_int(&v);
@@ -303,7 +303,7 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
 
   tdb_stmt tmp;
   if (cte) cte->active = 1;                  /* block self-reference while running */
-  int rc = run_subselect(db, st, sub, &tmp);
+  int rc = run_subselect(db, st, sub, &tmp, NULL);
   if (cte) cte->active = 0;
   if (rc) { tdb_stmt_clear_results(&tmp); return rc; }
   qs->ncol = tmp.ncol;
@@ -324,23 +324,25 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
   return TDB_OK;
 }
 
-static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q);
-static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q);
+static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer);
+static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer);
 
 /* Push this SELECT's WITH frame (if any) so its CTEs are visible to the body
-** and any nested subqueries, run the body, then pop the frame. */
-static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q) {
+** and any nested subqueries, run the body, then pop the frame. `outer` is the
+** enclosing query's per-row context for correlated subqueries (NULL at top). */
+static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer) {
   cte_scope scope; cte_scope *saved = st->cte_scope;
   if (q->with) { scope.list = q->with; scope.parent = saved; st->cte_scope = &scope; }
-  int rc = exec_select_body(db, st, q);
+  int rc = exec_select_body(db, st, q, outer);
   st->cte_scope = saved;
   return rc;
 }
 
-static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q) {
-  if (q->setop) return exec_setop_chain(db, st, q);
+static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer) {
+  if (q->setop) return exec_setop_chain(db, st, q, outer);
 
   qctx Q; memset(&Q, 0, sizeof(Q));
+  Q.outer = outer ? outer->qc : NULL;   /* correlated name resolution */
   rowset sets[MAXSRC];
 
   /* rule-based index pick: a lone base table with an indexable WHERE */
@@ -430,7 +432,7 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   if (Q.nsrc == 0) {
     rowset_add(&in, row_alloc(1));   /* SELECT with no FROM: single empty row */
   } else {
-    join_build(db, st, &Q, sets, q->where, &in);
+    join_build(db, st, &Q, sets, q->where, &in, outer);
   }
   for (int s = 0; s < Q.nsrc; s++) rowset_free(&sets[s]);
 
@@ -448,7 +450,7 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q) {
 
   if (!aggregated) {
     for (int r = 0; r < in.n; r++) {
-      ectx ec = { in.rows[r], in.ncol, NULL, 0, st };
+      ectx ec = { in.rows[r], in.ncol, NULL, 0, st, &Q, outer };
       tdb_value *vr = row_alloc(nout);
       for (int i = 0; i < nout; i++) eval(db, &ec, oexpr[i], &vr[i]);
       tdb_value *kr = norder ? row_alloc(norder) : NULL;
@@ -459,7 +461,7 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q) {
     /* group rows */
     group *groups = NULL; int ng = 0, gcap = 0;
     for (int r = 0; r < in.n; r++) {
-      ectx ec = { in.rows[r], in.ncol, NULL, 0, st };
+      ectx ec = { in.rows[r], in.ncol, NULL, 0, st, &Q, outer };
       /* compute group key */
       tdb_value *key = ngroup ? row_alloc(ngroup) : NULL;
       for (int i = 0; i < ngroup; i++) eval(db, &ec, q->group->items[i], &key[i]);
@@ -492,7 +494,7 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q) {
     for (int g = 0; g < ng; g++) {
       tdb_value *aggvals = Q.nagg ? row_alloc(Q.nagg) : NULL;
       for (int j = 0; j < Q.nagg; j++) accum_result(&groups[g].acc[j], Q.aggs[j], &aggvals[j]);
-      ectx ec = { groups[g].rep, in.ncol, aggvals, Q.nagg, st };
+      ectx ec = { groups[g].rep, in.ncol, aggvals, Q.nagg, st, &Q, outer };
       int keep = 1;
       if (q->having) { tdb_value hv; tdb_value_init(&hv); eval(db, &ec, q->having, &hv); keep = val_true(&hv); tdb_value_clear(&hv); }
       if (keep) {
@@ -590,10 +592,11 @@ static tdb_value *dup_row(tdb_value *r, int ncol) {
 }
 
 /* run one SELECT node ignoring its set-op chain, into `tmp` */
-static int run_single(tdb_db *db, tdb_stmt *parent, tdb_select *sel, tdb_stmt *tmp) {
+static int run_single(tdb_db *db, tdb_stmt *parent, tdb_select *sel, tdb_stmt *tmp,
+                      ectx *outer) {
   int sop = sel->setop; tdb_select *nx = sel->setop_next;
   sel->setop = 0; sel->setop_next = NULL;
-  int rc = run_subselect(db, parent, sel, tmp);
+  int rc = run_subselect(db, parent, sel, tmp, outer);
   sel->setop = sop; sel->setop_next = nx;
   return rc;
 }
@@ -633,7 +636,7 @@ static void sort_result(tdb_value **rows, int n, int ncol, char **names,
   tdb_mfree(keys); tdb_mfree(idx); tdb_mfree(tmp);
 }
 
-static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q) {
+static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer) {
   /* the trailing ORDER BY/LIMIT (parsed onto the last SELECT) binds to the
   ** whole result: strip it, combine operands, then apply it */
   tdb_select *last = q;
@@ -646,7 +649,7 @@ static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   char **names = NULL; int ncol = 0; int rc;
 
   tdb_stmt t0;
-  rc = run_single(db, st, q, &t0);
+  rc = run_single(db, st, q, &t0, outer);
   if (rc) { tdb_stmt_clear_results(&t0); goto restore; }
   ncol = t0.ncol;
   names = (char **)tdb_calloc(sizeof(char *) * (size_t)(ncol ? ncol : 1));
@@ -656,7 +659,7 @@ static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q) {
 
   for (tdb_select *node = q; node->setop; node = node->setop_next) {
     tdb_stmt tb;
-    rc = run_single(db, st, node->setop_next, &tb);
+    rc = run_single(db, st, node->setop_next, &tb, outer);
     if (rc) { tdb_stmt_clear_results(&tb); goto done; }
     int op = node->setop, all = node->setop_all;
 

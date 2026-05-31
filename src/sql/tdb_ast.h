@@ -48,6 +48,7 @@ struct tdb_expr {
   int           distinct; /* EX_AGG: DISTINCT */
   int           negated;  /* EX_IN / EX_BETWEEN / EX_LIKE: NOT ... */
   int           col_index;/* analyzer: resolved column slot, or -1 */
+  int           outer_level;/* 0 = local; >0 = correlated ref N scopes outward */
   int           agg_index;/* analyzer: aggregate slot, or -1 */
   int           fn_id;    /* analyzer: resolved builtin/aggregate id */
   tdb_expr     *left;

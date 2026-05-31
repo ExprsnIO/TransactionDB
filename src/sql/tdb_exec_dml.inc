@@ -32,7 +32,7 @@ static int finalize_row(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_value *full)
     if (col->generated != TDB_GEN_NONE && col->generated_sql) {
       tdb_expr *ge = prepare_col_expr(db, st, t, col->generated_sql);
       if (!ge) return TDB_ERROR;
-      ectx ec = { full, t->ncol, NULL, 0, st };
+      ectx ec = { full, t->ncol, NULL, 0, st, NULL, NULL };
       tdb_value v; tdb_value_init(&v);
       eval(db, &ec, ge, &v);
       tdb_value_clear(&full[i]); full[i] = v;
@@ -118,7 +118,7 @@ static void ret_proj_free(ret_proj *rp) { tdb_mfree(rp->exprs); rp->exprs = NULL
 static void returning_emit(tdb_db *db, tdb_stmt *st, ret_proj *rp,
                            tdb_value *rowvals, int ncol) {
   if (!rp->exprs) return;
-  ectx ec = { rowvals, ncol, NULL, 0, st };
+  ectx ec = { rowvals, ncol, NULL, 0, st, NULL, NULL };
   tdb_value *out = row_alloc(rp->n);
   for (int i = 0; i < rp->n; i++) eval(db, &ec, rp->exprs[i], &out[i]);
   add_result_row(st, out);
@@ -138,7 +138,7 @@ static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *ta
   for (int i = 0; i < t->ncol; i++) {
     if (t->cols[i].default_sql) {
       tdb_expr *de = prepare_col_expr(db, st, t, t->cols[i].default_sql);
-      if (de) { ectx ec = { NULL, 0, NULL, 0, st }; eval(db, &ec, de, &full[i]); }
+      if (de) { ectx ec = { NULL, 0, NULL, 0, st, NULL, NULL }; eval(db, &ec, de, &full[i]); }
     }
   }
   int nv = nsrc < ntarget ? nsrc : ntarget;
@@ -176,7 +176,7 @@ static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *ta
         tdb_value *urow = row_alloc(t->ncol);
         for (int i = 0; i < t->ncol && i < enc; i++) tdb_value_copy(&urow[i], &exd[i]);
         for (int i = 0; i < enc; i++) tdb_value_clear(&exd[i]);
-        ectx ec = { urow, t->ncol, NULL, 0, st };
+        ectx ec = { urow, t->ncol, NULL, 0, st, NULL, NULL };
         int doit = 1;
         if (a->u.insert.up_where) { tdb_value w; tdb_value_init(&w); eval(db, &ec, a->u.insert.up_where, &w); doit = val_true(&w); tdb_value_clear(&w); }
         int rc = TDB_OK;
@@ -248,7 +248,7 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   if (a->u.insert.select) {
     /* INSERT ... SELECT */
     tdb_stmt tmp;
-    rc = run_subselect(db, st, a->u.insert.select, &tmp);
+    rc = run_subselect(db, st, a->u.insert.select, &tmp, NULL);
     if (!rc) {
       for (int r = 0; r < tmp.nrows && !rc; r++) {
         int applied = 0;
@@ -273,7 +273,7 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   for (int r = 0; r < a->u.insert.nrows && !rc; r++) {
     tdb_exprlist *row = a->u.insert.rows[r];
     tdb_value *src = row_alloc(row->n ? row->n : 1);
-    ectx ec0 = { NULL, 0, NULL, 0, st };
+    ectx ec0 = { NULL, 0, NULL, 0, st, NULL, NULL };
     for (int i = 0; i < row->n; i++) eval(db, &ec0, row->items[i], &src[i]);
     int applied = 0;
     rc = insert_row_vals(db, st, t, target, ntarget, src, row->n, pkc, a, up_setidx, &rec, &rp, &applied);
@@ -335,7 +335,7 @@ static int exec_update(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   if (rc) { rrowset_free(&rr); ret_proj_free(&rp); return rc; }
   tdb_buf rec; tdb_buf_init(&rec);
   for (int r = 0; r < rr.n; r++) {
-    ectx ec = { rr.rows[r], t->ncol, NULL, 0, st };
+    ectx ec = { rr.rows[r], t->ncol, NULL, 0, st, NULL, NULL };
     if (a->u.update.where) {
       tdb_value w; tdb_value_init(&w); eval(db, &ec, a->u.update.where, &w);
       int ok = val_true(&w); tdb_value_clear(&w);
@@ -376,7 +376,7 @@ static int exec_delete(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   rrowset rr; int rc = mat_rid(db, t, &rr);
   if (rc) { rrowset_free(&rr); ret_proj_free(&rp); return rc; }
   for (int r = 0; r < rr.n; r++) {
-    ectx ec = { rr.rows[r], t->ncol, NULL, 0, st };
+    ectx ec = { rr.rows[r], t->ncol, NULL, 0, st, NULL, NULL };
     if (a->u.del.where) {
       tdb_value w; tdb_value_init(&w); eval(db, &ec, a->u.del.where, &w);
       int ok = val_true(&w); tdb_value_clear(&w);
@@ -567,7 +567,7 @@ static int exec_call(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   for (int i = 0; i < argc; i++)
     if (resolve_expr(db, &q, a->u.call.args->items[i])) return TDB_ERROR;
   tdb_value *args = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(argc ? argc : 1));
-  ectx ec = { NULL, 0, NULL, 0, st };
+  ectx ec = { NULL, 0, NULL, 0, st, NULL, NULL };
   for (int i = 0; i < argc; i++) { tdb_value_init(&args[i]); eval(db, &ec, a->u.call.args->items[i], &args[i]); }
   char *err = NULL;
   int rc = tdb_lua_call_proc(db->lua, a->u.call.name, args, argc, &err);

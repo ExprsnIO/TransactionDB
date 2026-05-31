@@ -678,6 +678,40 @@ static void test_drop_index(void) {
   remove(path); remove("test_dropidx.db-wal");
 }
 
+static void test_drop_view(void) {
+  const char *path = "test_dropview.db";
+  remove(path); remove("test_dropview.db-wal");
+  tdb_db *db; tdb_open(path, &db);
+
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,10),(2,20),(3,30)");
+  exec(db, "CREATE VIEW hi AS SELECT v FROM t WHERE v >= 20");
+  TDB_CHECK_EQ(rowcount(db, "SELECT * FROM hi"), 2);
+
+  /* drop it: the view name no longer resolves */
+  TDB_CHECK_EQ(exec(db, "DROP VIEW hi"), TDB_OK);
+  TDB_CHECK(exec(db, "SELECT * FROM hi") != TDB_OK);
+
+  /* error + IF EXISTS */
+  TDB_CHECK(exec(db, "DROP VIEW nope") != TDB_OK);
+  TDB_CHECK_EQ(exec(db, "DROP VIEW IF EXISTS nope"), TDB_OK);
+
+  /* recreate with a different definition */
+  exec(db, "CREATE VIEW hi AS SELECT v FROM t WHERE v >= 10");
+  TDB_CHECK_EQ(rowcount(db, "SELECT * FROM hi"), 3);
+  tdb_close(db);
+
+  /* the recreated view persists across reopen, and the drop persists too */
+  tdb_open(path, &db);
+  TDB_CHECK_EQ(rowcount(db, "SELECT * FROM hi"), 3);
+  TDB_CHECK_EQ(exec(db, "DROP VIEW hi"), TDB_OK);
+  tdb_close(db);
+  tdb_open(path, &db);
+  TDB_CHECK(exec(db, "SELECT * FROM hi") != TDB_OK);   /* stays dropped */
+  tdb_close(db);
+  remove(path); remove("test_dropview.db-wal");
+}
+
 static void test_drop_table_reclaim(void) {
   const char *path = "test_droptab.db";
   remove(path); remove("test_droptab.db-wal");
@@ -719,6 +753,30 @@ static void test_drop_table_reclaim(void) {
   check_text(db, "SELECT s FROM keep WHERE id = 100", "keep-100");
   tdb_close(db);
   remove(path); remove("test_droptab.db-wal");
+}
+
+/* A DROP TABLE (no recreate) must stay dropped after reopen: the persisted
+** catalog row is removed, so the table is not resurrected pointing at pages
+** that were freed (and possibly reused) when it was dropped. */
+static void test_drop_table_persist(void) {
+  const char *path = "test_droptab2.db";
+  remove(path); remove("test_droptab2.db-wal");
+  tdb_db *db; tdb_open(path, &db);
+  exec(db, "CREATE TABLE keep (id INTEGER PRIMARY KEY, v INTEGER)");
+  exec(db, "CREATE TABLE gone (id INTEGER PRIMARY KEY, v INTEGER)");
+  exec(db, "INSERT INTO keep VALUES (1,11),(2,22)");
+  exec(db, "INSERT INTO gone VALUES (1,99)");
+  TDB_CHECK_EQ(exec(db, "DROP TABLE gone"), TDB_OK);
+  tdb_close(db);
+
+  tdb_open(path, &db);
+  TDB_CHECK(exec(db, "SELECT * FROM gone") != TDB_OK);     /* stays dropped */
+  TDB_CHECK_EQ(scalar(db, "SELECT v FROM keep WHERE id = 2"), 22);  /* survivor intact */
+  /* the name is free to reuse */
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE gone (id INTEGER PRIMARY KEY, v INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM gone"), 0);
+  tdb_close(db);
+  remove(path); remove("test_droptab2.db-wal");
 }
 
 static void test_drop_column_persist(void) {
@@ -922,7 +980,9 @@ static tdb_test_case cases[] = {
   {"drop_column", test_drop_column},
   {"drop_column_persist", test_drop_column_persist},
   {"drop_index", test_drop_index},
+  {"drop_view", test_drop_view},
   {"drop_table_reclaim", test_drop_table_reclaim},
+  {"drop_table_persist", test_drop_table_persist},
   {"vacuum_shrinks", test_vacuum_shrinks},
   {"index_scan", test_index_scan},
   {"index_persist", test_index_persist},

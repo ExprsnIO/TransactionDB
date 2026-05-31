@@ -42,6 +42,7 @@ tdb_routine *tdb_catalog_routine_at(tdb_catalog *c, int i);
 /* Remove a table from the in-memory cache (session-scoped; on-disk catalog
 ** row reclamation is left to a future vacuum/rewrite). */
 void       tdb_catalog_drop_table(tdb_catalog *c, const char *name);
+void       tdb_catalog_drop_view(tdb_catalog *c, const char *name);
 
 /* Rewrite a table's persisted catalog row (e.g. after CREATE INDEX adds an
 ** index to an existing table). The *_as variant locates the row by a given

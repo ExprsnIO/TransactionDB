@@ -392,12 +392,51 @@ int tdb_catalog_update_table(tdb_catalog *c, tdb_table *t) {
   return tdb_catalog_update_table_as(c, t->name, t);
 }
 
+/* Delete the persisted catalog row for `name` (any object type: the name is
+** the first field after the type byte for tables, views, and routines). */
+static int del_row(tdb_catalog *c, const char *name) {
+  tdb_btree *bt;
+  int rc = tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt);
+  if (rc) return rc;
+  tdb_cursor *cur;
+  rc = tdb_cursor_open(bt, &cur);
+  if (rc) { tdb_btree_close(bt); return rc; }
+  tdb_rowid rid = 0;
+  for (tdb_cursor_first(cur); !tdb_cursor_eof(cur); tdb_cursor_next(cur)) {
+    const uint8_t *v; int n;
+    if (tdb_cursor_data(cur, &v, &n)) break;
+    rd r = { v, n, 0, 0 };
+    (void)r_u8(&r);                 /* object type */
+    char *nm = r_str(&r);
+    int match = (nm && strcasecmp(nm, name) == 0);
+    tdb_mfree(nm);
+    if (match) { tdb_cursor_rowid(cur, &rid); break; }
+  }
+  tdb_cursor_close(cur);
+  if (rid) { int f = 0; rc = tdb_btree_del(bt, rid, &f); }
+  tdb_btree_close(bt);
+  return rc;
+}
+
 void tdb_catalog_drop_table(tdb_catalog *c, const char *name) {
+  del_row(c, name);   /* drop the persisted row so the table stays gone */
   for (int i = 0; i < c->ntable; i++) {
     if (strcasecmp(c->tables[i]->name, name) == 0) {
       tdb_table_free(c->tables[i]);
       for (int j = i; j < c->ntable - 1; j++) c->tables[j] = c->tables[j + 1];
       c->ntable--;
+      return;
+    }
+  }
+}
+
+void tdb_catalog_drop_view(tdb_catalog *c, const char *name) {
+  del_row(c, name);
+  for (int i = 0; i < c->nview; i++) {
+    if (strcasecmp(c->views[i]->name, name) == 0) {
+      tdb_view_free(c->views[i]);
+      for (int j = i; j < c->nview - 1; j++) c->views[j] = c->views[j + 1];
+      c->nview--;
       return;
     }
   }

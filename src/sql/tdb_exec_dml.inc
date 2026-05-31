@@ -477,7 +477,15 @@ static int exec_drop(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     tdb_table_drop_index(owner, pos);
     return tdb_catalog_update_table(db->cat, owner);  /* persist the smaller index set */
   }
-  /* DROP VIEW: in-memory only for now */
+  if (a->kind == ST_DROP_VIEW) {
+    if (!tdb_catalog_find_view(db->cat, a->u.drop.name)) {
+      if (a->u.drop.if_exists) return TDB_OK;
+      tdb_db_seterr(db, "no such view: %s", a->u.drop.name);
+      return TDB_ERROR;
+    }
+    tdb_catalog_drop_view(db->cat, a->u.drop.name);  /* drops the persisted catalog row */
+    return TDB_OK;
+  }
   return TDB_OK;
 }
 

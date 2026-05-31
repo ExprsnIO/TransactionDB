@@ -108,11 +108,12 @@ int main(void) {
     tdb_db *db;
     tdb_open(":memory:", &db);
 
-    tdb_exec(db, "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)", NULL);
-    tdb_exec(db, "INSERT INTO users VALUES (1, 'Ada')", NULL);
+    tdb_exec(db, "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)",
+             NULL, NULL, NULL);
+    tdb_exec(db, "INSERT INTO users VALUES (1, 'Ada')", NULL, NULL, NULL);
 
     tdb_stmt *stmt;
-    tdb_prepare(db, "SELECT id, name FROM users WHERE id = ?", &stmt);
+    tdb_prepare_v2(db, "SELECT id, name FROM users WHERE id = ?", -1, &stmt, NULL);
     tdb_bind_int(stmt, 1, 1);          /* parameters are 1-based */
 
     while (tdb_step(stmt) == TDB_ROW) {
@@ -139,9 +140,9 @@ int main() {
     db.exec("INSERT INTO users VALUES (1, 'Ada')");
 
     auto stmt = db.prepare("SELECT id, name FROM users WHERE id = ?");
-    stmt.bind(1, int64_t{1});
+    stmt.bind(1, 1);   // binds are chainable and 1-based
     while (stmt.step()) {
-        std::cout << stmt.column_int(0) << " -> " << stmt.column_text(1) << "\n";
+        std::cout << stmt.getInt(0) << " -> " << stmt.getText(1) << "\n";
     }
 }
 ```
@@ -175,4 +176,4 @@ For a deeper tour of the internals and conventions, see [`CLAUDE.md`](CLAUDE.md)
 
 ## License
 
-See the repository for license details.
+Licensed under the [Apache License 2.0](LICENSE).

@@ -304,6 +304,8 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
   Q.nsrc = 1; Q.totalcols = t->ncol;
 
   if (q->where && resolve_expr(db, &Q, q->where)) return NULL;
+  if (q->order) for (int i = 0; i < q->order->n; i++)
+    if (resolve_expr(db, &Q, q->order->exprs[i])) return NULL;
 
   /* projection: expand '*', resolve exprs, collect output names */
   tdb_expr **oexpr = NULL; char **onames = NULL; int nout = 0, ocap = 0;

@@ -401,11 +401,24 @@ static void ceng_close(tdb_storage *s) {
   tdb_mfree(s);
 }
 
+static int ceng_add_column(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
+  TDB_UNUSED(txn);
+  col_engine *e = (col_engine *)s->impl;
+  tdb_pgno *grown = (tdb_pgno *)tdb_realloc(t->col_roots, sizeof(tdb_pgno) * (size_t)t->ncol);
+  if (!grown) return TDB_NOMEM;
+  t->col_roots = grown;
+  int rc = tdb_btree_create(e->pager, TDB_BT_TABLE, &t->col_roots[t->ncol - 1]);
+  if (rc) return rc;
+  t->ncol_roots = t->ncol;
+  return TDB_OK;
+}
+
 static const tdb_storage_vtab g_col_vtab = {
   "columnar", ceng_close,
   ceng_create_table, ceng_drop_table, ceng_create_index,
   ceng_insert, ceng_update, ceng_remove, ceng_next_rowid,
   ceng_scan_open, ceng_scan_next, ceng_scan_close, ceng_seek_rowid,
+  ceng_add_column,
 };
 
 int tdb_engine_columnar_open(tdb_pager *p, tdb_storage **out) {

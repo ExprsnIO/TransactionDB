@@ -44,7 +44,9 @@ tdb_routine *tdb_catalog_routine_at(tdb_catalog *c, int i);
 void       tdb_catalog_drop_table(tdb_catalog *c, const char *name);
 
 /* Rewrite a table's persisted catalog row (e.g. after CREATE INDEX adds an
-** index to an existing table). */
+** index to an existing table). The *_as variant locates the row by a given
+** name (used by ALTER TABLE ... RENAME TO). */
 int        tdb_catalog_update_table(tdb_catalog *c, tdb_table *t);
+int        tdb_catalog_update_table_as(tdb_catalog *c, const char *find_name, tdb_table *t);
 
 #endif /* TDB_CATALOG_H */

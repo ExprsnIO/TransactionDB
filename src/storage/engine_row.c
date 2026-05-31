@@ -489,13 +489,18 @@ static void eng_close(tdb_storage *s) {
   tdb_mfree(s);
 }
 
+static int eng_add_column(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
+  TDB_UNUSED(s); TDB_UNUSED(txn); TDB_UNUSED(t);
+  return TDB_OK; /* rows are stored whole; old rows simply lack the column */
+}
+
 static const tdb_storage_vtab g_row_vtab = {
   "row-btree",
   eng_close,
   eng_create_table, eng_drop_table, eng_create_index,
   eng_insert, eng_update, eng_remove, eng_next_rowid,
   eng_scan_open, eng_scan_next, eng_scan_close,
-  eng_seek_rowid,
+  eng_seek_rowid, eng_add_column,
 };
 
 int tdb_engine_row_open(tdb_pager *p, tdb_storage **out) {

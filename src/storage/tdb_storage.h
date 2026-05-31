@@ -62,6 +62,10 @@ typedef struct tdb_storage_vtab {
   /* Point lookup honoring MVCC. *found = 0 if no visible version exists. */
   int (*seek_rowid)(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_rowid rowid,
                     const uint8_t **rec, int *reclen, int *found);
+
+  /* Provision storage for a newly-appended column (ALTER TABLE ADD COLUMN).
+  ** The column is already at t->cols[t->ncol-1]. */
+  int (*add_column)(tdb_storage *s, tdb_txn *txn, tdb_table *t);
 } tdb_storage_vtab;
 
 struct tdb_storage {

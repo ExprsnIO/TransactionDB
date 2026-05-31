@@ -354,7 +354,7 @@ tdb_table *tdb_catalog_table_at(tdb_catalog *c, int i) { return c->tables[i]; }
 int tdb_catalog_routine_count(tdb_catalog *c) { return c->nroutine; }
 tdb_routine *tdb_catalog_routine_at(tdb_catalog *c, int i) { return c->routines[i]; }
 
-int tdb_catalog_update_table(tdb_catalog *c, tdb_table *t) {
+int tdb_catalog_update_table_as(tdb_catalog *c, const char *find_name, tdb_table *t) {
   tdb_btree *bt;
   int rc = tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt);
   if (rc) return rc;
@@ -370,7 +370,7 @@ int tdb_catalog_update_table(tdb_catalog *c, tdb_table *t) {
       rd r = { v, n, 0, 0 };
       r_u8(&r);
       char *name = r_str(&r);
-      if (name && strcasecmp(name, t->name) == 0) {
+      if (name && strcasecmp(name, find_name) == 0) {
         tdb_cursor_rowid(cur, &target); found = 1; tdb_mfree(name); break;
       }
       tdb_mfree(name);
@@ -386,6 +386,10 @@ int tdb_catalog_update_table(tdb_catalog *c, tdb_table *t) {
   } else rc = TDB_NOTFOUND;
   tdb_btree_close(bt);
   return rc;
+}
+
+int tdb_catalog_update_table(tdb_catalog *c, tdb_table *t) {
+  return tdb_catalog_update_table_as(c, t->name, t);
 }
 
 void tdb_catalog_drop_table(tdb_catalog *c, const char *name) {

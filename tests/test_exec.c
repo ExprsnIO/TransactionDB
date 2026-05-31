@@ -577,6 +577,52 @@ static void test_drop_column(void) {
   tdb_close(db);
 }
 
+static long file_size(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  fseek(f, 0, SEEK_END);
+  long n = ftell(f);
+  fclose(f);
+  return n;
+}
+
+static void test_vacuum_shrinks(void) {
+  const char *path = "test_vacuum.db";
+  remove(path); remove("test_vacuum.db-wal");
+  tdb_db *db; tdb_open(path, &db);
+
+  exec(db, "CREATE TABLE keep (id INTEGER PRIMARY KEY, v INTEGER)");
+  exec(db, "CREATE TABLE big (id INTEGER PRIMARY KEY, s TEXT)");
+  exec(db, "INSERT INTO keep VALUES (1,111),(2,222)");
+  for (int i = 0; i < 1500; i++) {
+    char sql[160];
+    snprintf(sql, sizeof(sql), "INSERT INTO big VALUES (%d,'%0100d')", i, i);
+    exec(db, sql);
+  }
+  exec(db, "VACUUM");
+  tdb_close(db);
+  long full = file_size(path);
+
+  /* drop the big table and compact */
+  tdb_open(path, &db);
+  exec(db, "DROP TABLE big");
+  TDB_CHECK_EQ(exec(db, "VACUUM"), TDB_OK);
+  tdb_close(db);
+  long shrunk = file_size(path);
+
+  TDB_CHECK(shrunk < full);                 /* file actually got smaller */
+  TDB_CHECK(shrunk * 2 < full);             /* and substantially so */
+
+  /* the surviving table is intact and the db is usable after reopen */
+  tdb_open(path, &db);
+  TDB_CHECK_EQ(scalar(db, "SELECT v FROM keep WHERE id = 2"), 222);
+  exec(db, "CREATE TABLE more (id INTEGER PRIMARY KEY, n INTEGER)");
+  TDB_CHECK_EQ(exec(db, "INSERT INTO more VALUES (1,7)"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT n FROM more WHERE id=1"), 7);
+  tdb_close(db);
+  remove(path); remove("test_vacuum.db-wal");
+}
+
 static void test_drop_table_reclaim(void) {
   const char *path = "test_droptab.db";
   remove(path); remove("test_droptab.db-wal");
@@ -821,6 +867,7 @@ static tdb_test_case cases[] = {
   {"drop_column", test_drop_column},
   {"drop_column_persist", test_drop_column_persist},
   {"drop_table_reclaim", test_drop_table_reclaim},
+  {"vacuum_shrinks", test_vacuum_shrinks},
   {"index_scan", test_index_scan},
   {"index_persist", test_index_persist},
   {"savepoints", test_savepoints},

@@ -462,6 +462,85 @@ int tdb_pager_checkpoint(tdb_pager *p) {
   return tdb_wal_checkpoint(p->wal, p->file, NULL);
 }
 
+/* Drop clean, unpinned cache pages above `maxkeep` (used after truncation). */
+static void evict_above(tdb_pager *p, tdb_pgno maxkeep) {
+  for (int b = 0; b < TDB_CACHE_BUCKETS; b++) {
+    tdb_page *pg = p->buckets[b];
+    while (pg) {
+      tdb_page *next = pg->hnext;
+      if (pg->pgno > maxkeep && pg->refs == 0) { pg->dirty = 0; cache_remove(p, pg); }
+      pg = next;
+    }
+  }
+}
+
+int tdb_pager_vacuum(tdb_pager *p) {
+  if (p->readonly) return TDB_READONLY;
+  if (p->in_txn) return TDB_MISUSE;
+  if (p->hdr.db_size <= 1 || p->hdr.freelist_count == 0) return TDB_OK;
+
+  /* fold any pending WAL frames into the main file so it is current */
+  int rc = tdb_pager_checkpoint(p);
+  if (rc) return rc;
+
+  rc = tdb_pager_begin(p);
+  if (rc) return rc;
+
+  tdb_pgno dbsize = p->hdr.db_size;
+  uint8_t *isfree = (uint8_t *)tdb_calloc((size_t)dbsize + 1);
+  if (!isfree) { tdb_pager_rollback(p); return TDB_NOMEM; }
+
+  /* mark every free page by walking the free-list trunks */
+  for (tdb_pgno trunk = p->hdr.freelist_head; trunk; ) {
+    if (trunk <= dbsize) isfree[trunk] = 1;
+    tdb_page *tp;
+    rc = tdb_pager_get(p, trunk, &tp);
+    if (rc) { tdb_mfree(isfree); tdb_pager_rollback(p); return rc; }
+    uint32_t lc = tdb_get_u32(tp->data + TDB_FL_LEAF_COUNT);
+    for (uint32_t i = 0; i < lc; i++) {
+      tdb_pgno leaf = tdb_get_u32(tp->data + TDB_FL_LEAVES + i * 4u);
+      if (leaf <= dbsize) isfree[leaf] = 1;
+    }
+    tdb_pgno next = tdb_get_u32(tp->data + TDB_FL_NEXT_TRUNK);
+    tdb_pager_unref(p, tp);
+    trunk = next;
+  }
+
+  /* shrink past the contiguous run of free pages at the end of the file */
+  tdb_pgno newsize = dbsize;
+  while (newsize >= 2 && isfree[newsize]) newsize--;
+  if (newsize == dbsize) { tdb_mfree(isfree); tdb_pager_rollback(p); return TDB_OK; }
+
+  /* collect the free pages we are keeping (those at or below newsize) */
+  tdb_pgno *kept = NULL; int nkept = 0, cap = 0;
+  for (tdb_pgno g = 2; g <= newsize; g++) {
+    if (!isfree[g]) continue;
+    if (nkept == cap) {
+      cap = cap ? cap * 2 : 64;
+      kept = (tdb_pgno *)tdb_realloc(kept, sizeof(tdb_pgno) * (size_t)cap);
+    }
+    kept[nkept++] = g;
+  }
+  tdb_mfree(isfree);
+
+  /* rebuild the free-list from scratch using only the kept pages */
+  p->hdr.freelist_head = 0; p->hdr.freelist_count = 0; p->hdr_dirty = 1;
+  for (int i = 0; i < nkept && !rc; i++) rc = tdb_pager_free(p, kept[i]);
+  tdb_mfree(kept);
+  if (rc) { tdb_pager_rollback(p); return rc; }
+
+  p->hdr.db_size = newsize; p->hdr_dirty = 1;
+
+  rc = tdb_pager_commit(p);
+  if (rc) return rc;
+
+  /* push the rebuilt free-list into the main file, then physically truncate */
+  rc = tdb_pager_checkpoint(p);
+  if (rc) return rc;
+  evict_above(p, newsize);
+  return tdb_file_truncate(p->file, (uint64_t)newsize * p->page_size);
+}
+
 /* ------------------------------ open/close ---------------------------- */
 
 static char *wal_path(const char *path) {

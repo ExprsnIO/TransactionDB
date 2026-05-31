@@ -120,10 +120,63 @@ static void test_memory_db(void) {
   tdb_pager_close(p);
 }
 
+/* tdb_pager_vacuum truncates trailing free pages and shrinks the file, while
+** preserving the pages that remain in use and the kept free-list. */
+static void test_vacuum(void) {
+  const char *path = "test_pager_4.db";
+  remove(path); remove("test_pager_4.db-wal");
+
+  tdb_pager *p = NULL;
+  tdb_pager_open(NULL, path, TDB_OPEN_READWRITE | TDB_OPEN_CREATE, &p);
+  tdb_pager_begin(p);
+
+  /* allocate 50 pages; stamp each so we can verify survivors */
+  tdb_pgno pg[50];
+  for (int i = 0; i < 50; i++) {
+    tdb_page *x; tdb_pager_alloc(p, &x);
+    pg[i] = x->pgno;
+    memset(x->data, i + 1, tdb_pager_page_size(p));
+    tdb_pager_write(p, x); tdb_pager_unref(p, x);
+  }
+  tdb_pager_commit(p);
+  tdb_pgno grown = tdb_pager_db_size(p);
+  TDB_CHECK(grown >= 51);
+
+  /* free the last 30 pages (a trailing run) */
+  tdb_pager_begin(p);
+  for (int i = 20; i < 50; i++) TDB_CHECK_EQ(tdb_pager_free(p, pg[i]), TDB_OK);
+  tdb_pager_commit(p);
+  TDB_CHECK_EQ(tdb_pager_freelist_count(p), 30u);
+
+  /* vacuum: file shrinks, trailing free pages gone */
+  TDB_CHECK_EQ(tdb_pager_vacuum(p), TDB_OK);
+  TDB_CHECK(tdb_pager_db_size(p) < grown);
+  TDB_CHECK(tdb_pager_db_size(p) <= pg[19] + 1);   /* dropped the freed tail */
+  TDB_CHECK_EQ(tdb_pager_freelist_count(p), 0u);   /* no free pages remained <= newsize */
+
+  /* surviving pages keep their content */
+  for (int i = 0; i < 20; i++) {
+    tdb_page *x; TDB_CHECK_EQ(tdb_pager_get(p, pg[i], &x), TDB_OK);
+    TDB_CHECK_EQ(x->data[0], (uint8_t)(i + 1));
+    tdb_pager_unref(p, x);
+  }
+  tdb_pager_close(p);
+
+  /* reopen: the smaller size and surviving pages persist */
+  tdb_pager_open(NULL, path, TDB_OPEN_READWRITE, &p);
+  TDB_CHECK(tdb_pager_db_size(p) <= pg[19] + 1);
+  tdb_page *x; tdb_pager_get(p, pg[5], &x);
+  TDB_CHECK_EQ(x->data[0], 6);
+  tdb_pager_unref(p, x);
+  tdb_pager_close(p);
+  remove(path); remove("test_pager_4.db-wal");
+}
+
 static tdb_test_case cases[] = {
   {"alloc_commit_persist", test_alloc_commit_persist},
   {"rollback", test_rollback},
   {"freelist", test_freelist},
   {"memory_db", test_memory_db},
+  {"vacuum", test_vacuum},
 };
 TDB_MAIN(cases)

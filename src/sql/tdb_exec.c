@@ -8,6 +8,7 @@
 ** and lazy (volcano) streaming are intentionally left for later.
 */
 #include "../api/tdb_db.h"
+#include "../api/tdb_env.h"
 #include "tdb_analyze.h"
 #include "tdb_parser.h"
 #ifdef TDB_HAVE_LUA
@@ -827,7 +828,8 @@ static int exec_explain(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *inner) {
 
 /* ------------------------------ dispatch ------------------------------ */
 
-int tdb_stmt_execute(tdb_stmt *st) {
+/* The real body; runs while holding the env execution lock. */
+static int stmt_execute_locked(tdb_stmt *st) {
   tdb_db *db = st->db;
   tdb_ast_stmt *a = st->ast;
   if (!a) return TDB_OK;
@@ -846,11 +848,31 @@ int tdb_stmt_execute(tdb_stmt *st) {
 
   /* otherwise run inside the explicit txn, or an auto txn we open/close here */
   int started = 0;
+  int writable = (a->kind != ST_SELECT);
+
+  /* A write must hold the env's single writer slot BEFORE it begins a pager
+  ** write transaction — the pager is single-writer and its dirty-page set is
+  ** shared, so a second writer must not call tdb_pager_begin/rollback at all
+  ** while another holds it. Conflicts use WAIT-DIE on txn age. For an explicit
+  ** transaction the claiming id is the open txn; for an autocommit write we
+  ** peek the next id the txn manager will assign. */
+  if (db->env && writable) {
+    tdb_txnid claim = db->txn ? db->txn->id : tdb_txnmgr_peek_next(db->tm);
+    int wr = tdb_env_acquire_writer(db->env, claim);
+    if (wr != TDB_OK) {
+      tdb_db_seterr(db, "database is locked (write conflict)");
+      return wr;  /* TDB_BUSY (older, retry) / TDB_ABORT (younger, give up) */
+    }
+  }
+
   if (!db->txn) {
-    int writable = (a->kind != ST_SELECT);
     int rc = tdb_txn_begin(db->tm, TDB_ISO_SNAPSHOT, writable, &db->txn);
-    if (rc) return rc;
+    if (rc) { if (db->env && writable) tdb_env_release_writer(db->env, tdb_txnmgr_peek_next(db->tm)); return rc; }
     started = 1;
+    if (db->env && writable) {
+      /* re-key the writer slot to the id actually assigned (peek == assigned) */
+      db->env->writer = db->txn->id;
+    }
   }
 
   int rc;
@@ -873,6 +895,7 @@ int tdb_stmt_execute(tdb_stmt *st) {
   }
 
   if (started) {
+    tdb_txnid wid = db->txn ? db->txn->id : 0;
     if (a->kind != ST_SELECT && rc == TDB_OK) {
       int crc = tdb_txn_commit(db->txn);
       if (crc) rc = crc;
@@ -880,6 +903,15 @@ int tdb_stmt_execute(tdb_stmt *st) {
       tdb_txn_rollback(db->txn);
     }
     db->txn = NULL;
+    if (db->env && wid) tdb_env_release_writer(db->env, wid);  /* auto-txn writer done */
   }
+  return rc;
+}
+
+int tdb_stmt_execute(tdb_stmt *st) {
+  tdb_db *db = st->db;
+  tdb_env_enter(db->env);            /* serialize execution on the shared env */
+  int rc = stmt_execute_locked(st);
+  tdb_env_leave(db->env);
   return rc;
 }

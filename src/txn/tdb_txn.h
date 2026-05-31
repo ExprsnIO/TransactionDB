@@ -43,6 +43,7 @@ int  tdb_txnmgr_open(tdb_pager *p, tdb_lockmgr *lm, tdb_txnmgr **out);
 void tdb_txnmgr_close(tdb_txnmgr *m);
 tdb_xstate tdb_txnmgr_state(void *ctx, tdb_txnid xid); /* tdb_xstate_fn-compatible */
 tdb_lockmgr *tdb_txnmgr_locks(tdb_txnmgr *m);
+tdb_txnid    tdb_txnmgr_peek_next(tdb_txnmgr *m);
 
 int  tdb_txn_begin(tdb_txnmgr *m, tdb_isolation iso, int writable, tdb_txn **out);
 int  tdb_txn_commit(tdb_txn *t);

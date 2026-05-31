@@ -66,6 +66,12 @@ typedef struct tdb_storage_vtab {
   /* Provision storage for a newly-appended column (ALTER TABLE ADD COLUMN).
   ** The column is already at t->cols[t->ncol-1]. */
   int (*add_column)(tdb_storage *s, tdb_txn *txn, tdb_table *t);
+
+  /* Remove storage for column `col_index` (ALTER TABLE DROP COLUMN). Called
+  ** while `t` still has the OLD column layout (the catalog drop happens after).
+  ** The row engine rewrites each record without the column; the columnar
+  ** engine discards the column's value b-tree. */
+  int (*drop_column)(tdb_storage *s, tdb_txn *txn, tdb_table *t, int col_index);
 } tdb_storage_vtab;
 
 struct tdb_storage {

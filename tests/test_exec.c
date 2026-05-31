@@ -534,6 +534,67 @@ static void test_alter(void) {
   tdb_close(db);
 }
 
+static void test_drop_column(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+
+  /* drop a middle column: remaining columns keep their values */
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,10,'x',100),(2,20,'y',200),(3,30,'z',300)");
+  TDB_CHECK_EQ(exec(db, "ALTER TABLE t DROP COLUMN b"), TDB_OK);
+  {
+    tdb_stmt *cs;
+    TDB_CHECK_EQ(tdb_prepare_v2(db, "SELECT * FROM t WHERE id=1", -1, &cs, NULL), TDB_OK);
+    TDB_CHECK_EQ(tdb_step(cs), TDB_ROW);
+    TDB_CHECK_EQ(tdb_column_count(cs), 3);     /* id, a, c (b dropped) */
+    tdb_finalize(cs);
+  }
+  TDB_CHECK_EQ(scalar(db, "SELECT a FROM t WHERE id=2"), 20);
+  TDB_CHECK_EQ(scalar(db, "SELECT c FROM t WHERE id=3"), 300);
+  TDB_CHECK(exec(db, "SELECT b FROM t") != TDB_OK);            /* gone */
+  TDB_CHECK_EQ(scalar(db, "SELECT SUM(c) FROM t"), 600);
+
+  /* dropping a column that some rows never stored (added later) keeps NULLs */
+  exec(db, "ALTER TABLE t ADD COLUMN d INTEGER");
+  exec(db, "INSERT INTO t (id,a,c,d) VALUES (4,40,400,4)");
+  TDB_CHECK_EQ(exec(db, "ALTER TABLE t DROP COLUMN a"), TDB_OK);   /* a is middle */
+  TDB_CHECK_EQ(scalar(db, "SELECT c FROM t WHERE id=4"), 400);
+  TDB_CHECK_EQ(scalar(db, "SELECT d FROM t WHERE id=4"), 4);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE d IS NULL"), 3); /* rows 1-3 */
+
+  /* guards */
+  TDB_CHECK(exec(db, "ALTER TABLE t DROP COLUMN id") != TDB_OK);   /* PK */
+  TDB_CHECK(exec(db, "ALTER TABLE t DROP COLUMN nope") != TDB_OK); /* missing */
+  exec(db, "CREATE INDEX ic ON t(c)");
+  TDB_CHECK(exec(db, "ALTER TABLE t DROP COLUMN c") != TDB_OK);    /* indexed */
+
+  /* columnar drop */
+  exec(db, "CREATE TABLE cc (id INTEGER PRIMARY KEY, p INTEGER, q INTEGER, r INTEGER) WITH COLUMNAR");
+  exec(db, "INSERT INTO cc VALUES (1,1,2,3),(2,4,5,6)");
+  TDB_CHECK_EQ(exec(db, "ALTER TABLE cc DROP COLUMN q"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT p FROM cc WHERE id=2"), 4);
+  TDB_CHECK_EQ(scalar(db, "SELECT r FROM cc WHERE id=2"), 6);
+  TDB_CHECK(exec(db, "SELECT q FROM cc") != TDB_OK);
+  tdb_close(db);
+}
+
+static void test_drop_column_persist(void) {
+  const char *path = "test_dropcol.db";
+  remove(path); remove("test_dropcol.db-wal");
+  tdb_db *db; tdb_open(path, &db);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,10,'x',100),(2,20,'y',200)");
+  exec(db, "ALTER TABLE t DROP COLUMN b");
+  tdb_close(db);
+  /* reopen: the rewritten records and shrunken schema must persist */
+  tdb_open(path, &db);
+  TDB_CHECK_EQ(scalar(db, "SELECT c FROM t WHERE id=1"), 100);
+  TDB_CHECK(exec(db, "SELECT b FROM t") != TDB_OK);
+  exec(db, "INSERT INTO t (id,a,c) VALUES (3,30,300)");
+  TDB_CHECK_EQ(scalar(db, "SELECT a FROM t WHERE id=3"), 30);
+  tdb_close(db);
+  remove(path); remove("test_dropcol.db-wal");
+}
+
 static void test_alter_persist(void) {
   const char *path = "test_alter.db";
   remove(path); remove("test_alter.db-wal");
@@ -714,6 +775,8 @@ static tdb_test_case cases[] = {
   {"projection_pushdown", test_projection_pushdown},
   {"alter", test_alter},
   {"alter_persist", test_alter_persist},
+  {"drop_column", test_drop_column},
+  {"drop_column_persist", test_drop_column_persist},
   {"index_scan", test_index_scan},
   {"index_persist", test_index_persist},
   {"savepoints", test_savepoints},

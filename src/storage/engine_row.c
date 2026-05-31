@@ -494,13 +494,75 @@ static int eng_add_column(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
   return TDB_OK; /* rows are stored whole; old rows simply lack the column */
 }
 
+/* Rewrite every record in one b-tree (main or history) without column `ci`,
+** preserving each row's MVCC header so visibility is unchanged. A record that
+** has fewer stored values than `ci` (a column added after the row was written)
+** is left as-is — the missing trailing values still decode as NULL. */
+static int rewrite_drop_col_bt(row_engine *e, tdb_pgno root, int ci) {
+  tdb_btree *bt;
+  int rc = tdb_btree_open(e->pager, root, TDB_BT_TABLE, NULL, &bt);
+  if (rc) return rc;
+  tdb_cursor *cur;
+  rc = tdb_cursor_open(bt, &cur);
+  if (rc) { tdb_btree_close(bt); return rc; }
+
+  /* snapshot the rowids first — rewriting mutates the tree we are walking */
+  tdb_rowid *ids = NULL; int n = 0, cap = 0;
+  for (tdb_cursor_first(cur); !tdb_cursor_eof(cur); tdb_cursor_next(cur)) {
+    tdb_rowid id;
+    if (tdb_cursor_rowid(cur, &id)) continue;
+    if (n == cap) {
+      cap = cap ? cap * 2 : 64;
+      ids = (tdb_rowid *)tdb_realloc(ids, sizeof(tdb_rowid) * (size_t)cap);
+    }
+    ids[n++] = id;
+  }
+  tdb_cursor_close(cur);
+
+  tdb_buf cur_row, recbuf, wrapped;
+  tdb_buf_init(&cur_row); tdb_buf_init(&recbuf); tdb_buf_init(&wrapped);
+  for (int r = 0; r < n && !rc; r++) {
+    int found = 0;
+    rc = fetch_main(e, bt, ids[r], &cur_row, &found);   /* stable copy */
+    if (rc || !found) { if (rc) break; else continue; }
+    tdb_txnid xmin, xmax; uint64_t prev; int rl;
+    const uint8_t *rec = get_rowhdr(cur_row.data, (int)cur_row.len, &xmin, &xmax, &prev, &rl);
+    tdb_value vals[64]; int nc = 0;
+    if (tdb_record_decode(rec, (size_t)rl, vals, 64, &nc)) { rc = TDB_CORRUPT; break; }
+    if (ci < nc) {
+      tdb_value_clear(&vals[ci]);
+      for (int i = ci; i < nc - 1; i++) vals[i] = vals[i + 1];
+      nc--;
+    }
+    tdb_buf_reset(&recbuf);
+    rc = tdb_record_encode(vals, nc, &recbuf);
+    for (int i = 0; i < nc; i++) tdb_value_clear(&vals[i]);
+    if (rc) break;
+    rc = wrap_row(&wrapped, xmin, xmax, prev, recbuf.data, (int)recbuf.len);
+    if (rc) break;
+    rc = tdb_btree_put(bt, ids[r], wrapped.data, (int)wrapped.len);
+  }
+  tdb_buf_free(&cur_row); tdb_buf_free(&recbuf); tdb_buf_free(&wrapped);
+  tdb_mfree(ids);
+  tdb_btree_close(bt);
+  return rc;
+}
+
+static int eng_drop_column(tdb_storage *s, tdb_txn *txn, tdb_table *t, int ci) {
+  TDB_UNUSED(txn);
+  row_engine *e = (row_engine *)s->impl;
+  int rc = rewrite_drop_col_bt(e, t->root, ci);
+  if (!rc && t->history_root) rc = rewrite_drop_col_bt(e, t->history_root, ci);
+  return rc;
+}
+
 static const tdb_storage_vtab g_row_vtab = {
   "row-btree",
   eng_close,
   eng_create_table, eng_drop_table, eng_create_index,
   eng_insert, eng_update, eng_remove, eng_next_rowid,
   eng_scan_open, eng_scan_next, eng_scan_close,
-  eng_seek_rowid, eng_add_column,
+  eng_seek_rowid, eng_add_column, eng_drop_column,
 };
 
 int tdb_engine_row_open(tdb_pager *p, tdb_storage **out) {

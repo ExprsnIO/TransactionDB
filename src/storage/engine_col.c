@@ -413,12 +413,25 @@ static int ceng_add_column(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
   return TDB_OK;
 }
 
+/* Drop column `ci`'s value b-tree by removing its root from the array and
+** shifting the rest down. The b-tree's pages are orphaned until VACUUM. */
+static int ceng_drop_column(tdb_storage *s, tdb_txn *txn, tdb_table *t, int ci) {
+  TDB_UNUSED(s); TDB_UNUSED(txn);
+  if (ci < 0 || ci >= t->ncol_roots) {
+    if (t->ncol_roots > 0) t->ncol_roots--;   /* no separate store; just shrink */
+    return TDB_OK;
+  }
+  for (int i = ci; i < t->ncol_roots - 1; i++) t->col_roots[i] = t->col_roots[i + 1];
+  t->ncol_roots--;
+  return TDB_OK;
+}
+
 static const tdb_storage_vtab g_col_vtab = {
   "columnar", ceng_close,
   ceng_create_table, ceng_drop_table, ceng_create_index,
   ceng_insert, ceng_update, ceng_remove, ceng_next_rowid,
   ceng_scan_open, ceng_scan_next, ceng_scan_close, ceng_seek_rowid,
-  ceng_add_column,
+  ceng_add_column, ceng_drop_column,
 };
 
 int tdb_engine_columnar_open(tdb_pager *p, tdb_storage **out) {

@@ -48,6 +48,21 @@ int tdb_table_add_column(tdb_table *t, const tdb_column *col) {
   return TDB_OK;
 }
 
+int tdb_table_drop_column(tdb_table *t, int ci) {
+  if (ci < 0 || ci >= t->ncol) return TDB_NOTFOUND;
+  tdb_column_free(&t->cols[ci]);
+  for (int i = ci; i < t->ncol - 1; i++) t->cols[i] = t->cols[i + 1];
+  t->ncol--;
+  /* shift hidden temporal period column indices that sat after the dropped one */
+  if (t->row_start_col > ci) t->row_start_col--;
+  if (t->row_end_col > ci) t->row_end_col--;
+  /* shift index column references (the caller guarantees no index uses `ci`) */
+  for (int i = 0; i < t->nindex; i++)
+    for (int k = 0; k < t->indexes[i].ncol; k++)
+      if (t->indexes[i].col_idx[k] > ci) t->indexes[i].col_idx[k]--;
+  return TDB_OK;
+}
+
 int tdb_table_find_column(const tdb_table *t, const char *name) {
   for (int i = 0; i < t->ncol; i++)
     if (t->cols[i].name && strcasecmp(t->cols[i].name, name) == 0) return i;

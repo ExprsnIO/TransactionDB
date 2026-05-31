@@ -7,11 +7,12 @@
 ** compiled into such a tree; the row at a time pull means a LIMIT stops the
 ** scan early instead of materializing the whole table first.
 **
-** Stage 1 drains the tree to completion inside statement execution (the result
-** is still collected into st->rows), so the transaction lifetime is unchanged;
-** the win here is lazy evaluation with early termination and the operator
-** framework itself. A later stage will let tdb_step() pull through the tree
-** lazily across calls, holding the read snapshot open between rows.
+** tdb_step() pulls one row per call straight through the tree (see
+** tdb_stmt_stream_next): nothing is collected into st->rows, so memory stays
+** bounded regardless of result size. The statement adopts the auto read
+** transaction and holds that snapshot open across steps, releasing it when the
+** stream is exhausted, reset, or finalized — so the scan sees a stable snapshot
+** even as the connection commits other writes.
 */
 
 typedef enum { OP_SCAN, OP_FILTER, OP_PROJECT, OP_LIMIT } op_kind;
@@ -177,8 +178,8 @@ static tdb_op *op_new(op_kind k, tdb_db *db, tdb_stmt *st) {
 
 /* Build a Scan -> [Filter] -> Project -> [Limit] tree for a streamable SELECT,
 ** or return NULL (caller falls back to the materializing executor). On success
-** st->ncol / st->colnames are set and the scan is opened. */
-static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q) {
+** st->ncol / st->colnames are set and the scan is opened against `txn`. */
+static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_txn *txn) {
   tdb_table *t = NULL;
   if (!select_streamable(db, st, q, &t)) return NULL;
 
@@ -234,7 +235,7 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   scan->has_mask = compute_colmask(t, q, scan->colmask);
 
   tdb_scan *sc = NULL;
-  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, have_idx ? idx : NULL,
+  int rc = db->engine->vtab->scan_open(db->engine, txn, t, have_idx ? idx : NULL,
                                        have_idx ? &kr : NULL, 0,
                                        scan->has_mask ? scan->colmask : NULL, &sc);
   tdb_value_clear(&kr.lo); tdb_value_clear(&kr.hi);
@@ -274,28 +275,66 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   return src;
 }
 
-/* Drain the operator tree into st->rows (Stage 1: result still materialized). */
-static int drain_stream(tdb_db *db, tdb_stmt *st, tdb_op *root) {
-  TDB_UNUSED(db);
-  int rc;
-  for (;;) {
-    tdb_value *row; int nc;
-    rc = op_next(root, &row, &nc);
-    if (rc == TDB_DONE) { rc = TDB_OK; break; }
-    if (rc != TDB_ROW) break;            /* error */
-    add_result_row(st, dup_row(row, nc));
-  }
-  return rc;
+/* Entry point from statement execution: if `q` is streamable, build the
+** operator tree and arm the statement for lazy pulling (tdb_step pulls one row
+** per call). Returns 1 if streaming was set up (rc in *out_rc), 0 to fall back
+** to the materializing executor.
+**
+** `txn` is the transaction the scan reads through (the connection's current
+** txn during execution). When `own` is true that txn is an auto-transaction the
+** statement adopts and keeps open across steps; the caller has already detached
+** it from the connection. */
+static int setup_stream(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_txn *txn,
+                        int own, int *out_rc) {
+  tdb_op *root = build_stream_plan(db, st, q, txn);
+  if (!root) return 0;
+  st->plan = root;
+  st->streaming = 1;
+  st->stream_done = 0;
+  st->own_txn = own ? txn : NULL;
+  st->stream_row = row_alloc(st->ncol);
+  st->cur = -1;
+  *out_rc = TDB_OK;
+  return 1;
 }
 
-/* Entry point: try to run `q` via the streaming operator tree. Returns 1 if it
-** handled the query (rc in *out_rc), 0 if not streamable (use materialize). */
-static int try_stream_select(tdb_db *db, tdb_stmt *st, tdb_select *q, int *out_rc) {
-  tdb_op *root = build_stream_plan(db, st, q);
-  if (!root) return 0;
-  int rc = drain_stream(db, st, root);
-  op_close(root);
-  st->cur = -1;
-  *out_rc = rc;
-  return 1;
+/* Tear down a streaming statement: close the operator tree and release the
+** statement-held read snapshot. Idempotent. Touches the shared pager cache
+** (scan close), so it runs under the env guard. */
+void tdb_stmt_stream_close(tdb_stmt *st) {
+  if (!st) return;
+  tdb_env_enter(st->db->env);
+  if (st->plan) { op_close((tdb_op *)st->plan); st->plan = NULL; }
+  if (st->own_txn) { tdb_txn_rollback(st->own_txn); st->own_txn = NULL; }
+  tdb_env_leave(st->db->env);
+  if (st->stream_row) {
+    for (int i = 0; i < st->ncol; i++) tdb_value_clear(&st->stream_row[i]);
+    tdb_mfree(st->stream_row);
+    st->stream_row = NULL;
+  }
+  st->streaming = 0;
+  st->stream_done = 0;
+}
+
+/* Pull the next row through the operator tree into st->stream_row. Returns
+** TDB_ROW / TDB_DONE / an error code. On end-of-stream or error the tree and
+** snapshot are released eagerly (the result is no longer needed). */
+int tdb_stmt_stream_next(tdb_stmt *st) {
+  if (!st->plan || st->stream_done) return TDB_DONE;
+  tdb_db *db = st->db;
+  tdb_env_enter(db->env);
+  tdb_value *row; int nc;
+  int rc = op_next((tdb_op *)st->plan, &row, &nc);
+  if (rc == TDB_ROW) {
+    for (int i = 0; i < st->ncol && i < nc; i++) {
+      tdb_value_clear(&st->stream_row[i]);
+      tdb_value_copy(&st->stream_row[i], &row[i]);
+    }
+  }
+  tdb_env_leave(db->env);
+  if (rc != TDB_ROW) {
+    st->stream_done = 1;
+    tdb_stmt_stream_close(st);   /* release the snapshot promptly */
+  }
+  return rc;
 }

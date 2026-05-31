@@ -416,9 +416,20 @@ static int exec_create_index(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   tdb_create_index *ci = a->u.create_index;
   tdb_table *t = tdb_catalog_find_table(db->cat, ci->table);
   if (!t) { tdb_db_seterr(db, "no such table: %s", ci->table); return TDB_ERROR; }
+  if (ci->kind == TDB_IDX_RTREE) {
+    if (ci->ncol != 1) {
+      tdb_db_seterr(db, "spatial index requires exactly one geometry column");
+      return TDB_ERROR;
+    }
+    if (t->columnar) {
+      tdb_db_seterr(db, "spatial index requires a row-organized table");
+      return TDB_ERROR;
+    }
+  }
   tdb_index ix; memset(&ix, 0, sizeof(ix));
   ix.name = tdb_strdup(ci->name);
   ix.unique = ci->unique;
+  ix.kind = ci->kind;
   ix.ncol = ci->ncol;
   ix.col_idx = (int *)tdb_malloc(sizeof(int) * (size_t)ci->ncol);
   ix.desc = (uint8_t *)tdb_malloc((size_t)ci->ncol);
@@ -427,6 +438,14 @@ static int exec_create_index(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     ix.desc[i] = ci->desc[i];
     if (ix.col_idx[i] < 0) {
       tdb_db_seterr(db, "no such column: %s", ci->cols[i]);
+      tdb_mfree(ix.name); tdb_mfree(ix.col_idx); tdb_mfree(ix.desc);
+      return TDB_ERROR;
+    }
+  }
+  if (ci->kind == TDB_IDX_RTREE) {
+    tdb_typeid id = t->cols[ix.col_idx[0]].type.id;
+    if (id != TDB_T_GEOMETRY && id != TDB_T_POINT && id != TDB_T_GEOGRAPHY) {
+      tdb_db_seterr(db, "spatial index column must be a geometry type");
       tdb_mfree(ix.name); tdb_mfree(ix.col_idx); tdb_mfree(ix.desc);
       return TDB_ERROR;
     }

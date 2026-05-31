@@ -723,6 +723,14 @@ static tdb_ast_stmt *parse_create_index(P *p, int unique) {
   ci->name = dup_tok(p, &p->cur); expect(p, TK_ID, "expected index name");
   expect(p, TK_ON, "expected ON");
   ci->table = dup_tok(p, &p->cur); expect(p, TK_ID, "expected table name");
+  /* optional access method: USING RTREE | GIST | SPATIAL  (else B-tree) */
+  if (accept(p, TK_USING)) {
+    char *m = dup_tok(p, &p->cur);
+    expect(p, TK_ID, "expected index method");
+    if (m && (!strcasecmp(m, "RTREE") || !strcasecmp(m, "GIST") || !strcasecmp(m, "SPATIAL")))
+      ci->kind = 1;  /* TDB_IDX_RTREE */
+    else if (m && strcasecmp(m, "BTREE") != 0) { set_err(p, "unknown index method"); }
+  }
   expect(p, TK_LP, "expected (");
   int cap = 0;
   do {

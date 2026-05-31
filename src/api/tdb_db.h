@@ -18,6 +18,7 @@
 #include "../txn/tdb_lock.h"
 #include "../sql/tdb_ast.h"
 #include "../value/tdb_value.h"
+#include "../common/tdb_mutex.h"
 
 struct tdb_db {
   tdb_pager   *pager;
@@ -31,6 +32,7 @@ struct tdb_db {
   int          flags;
   char        *path;
   char         errmsg[256];
+  tdb_mutex   *mu;         /* serializes API calls: makes one tdb_db thread-safe */
 };
 
 struct tdb_stmt {

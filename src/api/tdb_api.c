@@ -23,6 +23,12 @@ void tdb_db_seterr(tdb_db *db, const char *fmt, ...) {
   va_end(ap);
 }
 
+/* Connection-level lock: makes a single tdb_db safe to share across threads
+** (SQLite "serialized" mode). The mutex is recursive so the re-entrant API
+** (tdb_exec -> prepare/step/finalize) does not self-deadlock. */
+static void db_lock(tdb_db *db)   { if (db && db->mu) tdb_mutex_lock(db->mu); }
+static void db_unlock(tdb_db *db) { if (db && db->mu) tdb_mutex_unlock(db->mu); }
+
 /* ----------------------------- connection ----------------------------- */
 
 int tdb_open(const char *filename, tdb_db **ppDb) {
@@ -37,6 +43,8 @@ int tdb_open_v2(const char *filename, tdb_db **ppDb, int flags) {
   db->flags = flags;
   db->autocommit = 1;
   db->path = filename ? tdb_strdup(filename) : NULL;
+  db->mu = tdb_mutex_new_recursive();
+  if (!db->mu) { tdb_close(db); return TDB_NOMEM; }
 
   int rc = tdb_pager_open(NULL, filename, flags, &db->pager);
   if (rc) goto fail;
@@ -76,6 +84,7 @@ int tdb_close(tdb_db *db) {
   if (db->lm) tdb_lockmgr_free(db->lm);
   if (db->cat) tdb_catalog_close(db->cat);
   if (db->pager) tdb_pager_close(db->pager);
+  if (db->mu) tdb_mutex_free(db->mu);
   tdb_mfree(db->path);
   tdb_mfree(db);
   return TDB_OK;
@@ -110,24 +119,27 @@ int tdb_prepare_v2(tdb_db *db, const char *sql, int nbyte, tdb_stmt **ppStmt,
   TDB_UNUSED(nbyte);
   if (ppStmt) *ppStmt = NULL;
   if (!db || !sql) return TDB_MISUSE;
+  db_lock(db);
 
   tdb_arena *a = tdb_arena_new(8192);
-  if (!a) return TDB_NOMEM;
+  if (!a) { db_unlock(db); return TDB_NOMEM; }
   tdb_ast_stmt *ast = NULL; char *err = NULL; const char *tail = sql;
   int rc = tdb_parse(a, sql, &ast, &err, &tail);
   if (rc == TDB_DONE) {           /* nothing but whitespace */
     if (pzTail) *pzTail = tail;
     tdb_arena_free(a);
+    db_unlock(db);
     return TDB_OK;
   }
   if (rc != TDB_OK) {
     tdb_db_seterr(db, "%s", err ? err : "parse error");
     tdb_arena_free(a);
     if (pzTail) *pzTail = tail;
+    db_unlock(db);
     return rc;
   }
   tdb_stmt *st = (tdb_stmt *)tdb_calloc(sizeof(*st));
-  if (!st) { tdb_arena_free(a); return TDB_NOMEM; }
+  if (!st) { tdb_arena_free(a); db_unlock(db); return TDB_NOMEM; }
   st->db = db;
   st->arena = a;
   st->ast = ast;
@@ -135,35 +147,45 @@ int tdb_prepare_v2(tdb_db *db, const char *sql, int nbyte, tdb_stmt **ppStmt,
   st->is_select = (ast->kind == ST_SELECT);
   if (ppStmt) *ppStmt = st;
   if (pzTail) *pzTail = tail;
+  db_unlock(db);
   return TDB_OK;
 }
 
 int tdb_step(tdb_stmt *st) {
   if (!st) return TDB_MISUSE;
+  db_lock(st->db);
+  int ret;
   if (!st->executed) {
     int rc = tdb_stmt_execute(st);
     st->executed = 1;
     st->cur = -1;
-    if (rc != TDB_OK) return rc;
+    if (rc != TDB_OK) { db_unlock(st->db); return rc; }
   }
   if (st->is_select) {
     st->cur++;
-    return (st->cur < st->nrows) ? TDB_ROW : TDB_DONE;
+    ret = (st->cur < st->nrows) ? TDB_ROW : TDB_DONE;
+  } else {
+    ret = TDB_DONE;
   }
-  return TDB_DONE;
+  db_unlock(st->db);
+  return ret;
 }
 
 int tdb_reset(tdb_stmt *st) {
   if (!st) return TDB_MISUSE;
+  db_lock(st->db);
   tdb_stmt_clear_results(st);
   st->executed = 0;
   st->cur = -1;
   st->changes = 0;
+  db_unlock(st->db);
   return TDB_OK;
 }
 
 int tdb_finalize(tdb_stmt *st) {
   if (!st) return TDB_OK;
+  tdb_db *db = st->db;
+  db_lock(db);
   tdb_stmt_clear_results(st);
   if (st->params) {
     for (int i = 0; i < st->nparams; i++) tdb_value_clear(&st->params[i]);
@@ -171,6 +193,7 @@ int tdb_finalize(tdb_stmt *st) {
   }
   if (st->arena) tdb_arena_free(st->arena);
   tdb_mfree(st);
+  db_unlock(db);
   return TDB_OK;
 }
 
@@ -257,6 +280,7 @@ int tdb_exec(tdb_db *db, const char *sql, tdb_exec_cb cb, void *user,
   if (!db || !sql) return TDB_MISUSE;
   const char *tail = sql;
   int rc = TDB_OK;
+  db_lock(db);
 
   while (tail && *tail) {
     tdb_stmt *st = NULL;
@@ -291,6 +315,7 @@ int tdb_exec(tdb_db *db, const char *sql, tdb_exec_cb cb, void *user,
     if (rc != TDB_OK) break;
     tail = next;
   }
+  db_unlock(db);
   return rc;
 }
 

@@ -14,6 +14,9 @@ typedef struct tdb_mutex  tdb_mutex;
 typedef struct tdb_rwlock tdb_rwlock;
 
 tdb_mutex *tdb_mutex_new(void);
+/* Like tdb_mutex_new, but the owning thread may re-lock it (used for the
+** re-entrant connection-level lock that makes a tdb_db thread-safe). */
+tdb_mutex *tdb_mutex_new_recursive(void);
 void       tdb_mutex_free(tdb_mutex *m);
 void       tdb_mutex_lock(tdb_mutex *m);
 int        tdb_mutex_trylock(tdb_mutex *m); /* 1 = acquired, 0 = busy */

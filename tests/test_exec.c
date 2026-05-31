@@ -1033,8 +1033,79 @@ static void test_geospatial(void) {
   remove(path); remove("test_geo.db-wal");
 }
 
+static void test_spatial_index(void) {
+  const char *path = "test_spidx.db";
+  remove(path); remove("test_spidx.db-wal");
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE pts (id INTEGER PRIMARY KEY, g GEOMETRY)"), TDB_OK);
+  /* a 30x30 grid of points -> 900 rows, enough to split the R-tree */
+  exec(db, "BEGIN");
+  for (int x = 0; x < 30; x++)
+    for (int y = 0; y < 30; y++) {
+      char sql[96];
+      snprintf(sql, sizeof(sql), "INSERT INTO pts VALUES (%d, 'POINT(%d %d)')", x * 30 + y + 1, x, y);
+      TDB_CHECK_EQ(exec(db, sql), TDB_OK);
+    }
+  exec(db, "COMMIT");
+
+  /* build the spatial index AFTER the data (exercises bulk population) */
+  TDB_CHECK_EQ(exec(db, "CREATE INDEX ix ON pts USING RTREE (g)"), TDB_OK);
+
+  /* the plan must choose the spatial index */
+  check_text(db,
+    "EXPLAIN SELECT id FROM pts WHERE ST_Intersects(g, ST_GeomFromText('POLYGON((5 5,9 5,9 9,5 9,5 5))'))",
+    "SEARCH pts USING INDEX ix");
+
+  /* window [5,5]..[9,9] -> the 5x5 = 25 grid points in that block */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM pts WHERE ST_Intersects(g, ST_GeomFromText('POLYGON((5 5,9 5,9 9,5 9,5 5))'))"), 25);
+
+  /* ST_DWithin window: points within 1.0 of (15,15) -> the point and its 4 axis neighbours = 5 */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM pts WHERE ST_DWithin(g, ST_Point(15,15), 1.0)"), 5);
+
+  /* a window matching nothing */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM pts WHERE ST_Intersects(g, ST_GeomFromText('POLYGON((100 100,110 100,110 110,100 110,100 100))'))"), 0);
+
+  /* MVCC: move a point out of a window, ensure index reflects it */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM pts WHERE ST_DWithin(g, ST_Point(0,0), 0.5)"), 1); /* (0,0) */
+  exec(db, "UPDATE pts SET g = 'POINT(100 100)' WHERE id = 1");                                    /* id 1 == (0,0) */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM pts WHERE ST_DWithin(g, ST_Point(0,0), 0.5)"), 0); /* moved away */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM pts WHERE ST_DWithin(g, ST_Point(100,100), 0.5)"), 1);
+
+  /* DELETE a point inside the [5,9] block -> count drops by one.
+  ** (7,7) was inserted with id = 7*30 + 7 + 1 = 218. */
+  exec(db, "DELETE FROM pts WHERE id = 218");
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM pts WHERE ST_Intersects(g, ST_GeomFromText('POLYGON((5 5,9 5,9 9,5 9,5 5))'))"), 24);
+  tdb_close(db);
+
+  /* persistence: reopen and re-query through the index */
+  tdb_open(path, &db);
+  check_text(db,
+    "EXPLAIN SELECT id FROM pts WHERE ST_Intersects(g, ST_GeomFromText('POLYGON((5 5,9 5,9 9,5 9,5 5))'))",
+    "SEARCH pts USING INDEX ix");
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM pts WHERE ST_Intersects(g, ST_GeomFromText('POLYGON((5 5,9 5,9 9,5 9,5 5))'))"), 24);
+
+  /* DROP INDEX reclaims it; queries still work via full scan */
+  TDB_CHECK_EQ(exec(db, "DROP INDEX ix"), TDB_OK);
+  check_text(db,
+    "EXPLAIN SELECT id FROM pts WHERE ST_Intersects(g, ST_GeomFromText('POLYGON((5 5,9 5,9 9,5 9,5 5))'))",
+    "SCAN pts");
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM pts WHERE ST_Intersects(g, ST_GeomFromText('POLYGON((5 5,9 5,9 9,5 9,5 5))'))"), 24);
+
+  /* a spatial index requires a single geometry column */
+  TDB_CHECK(exec(db, "CREATE INDEX bad ON pts USING RTREE (id)") != TDB_OK);
+  tdb_close(db);
+  remove(path); remove("test_spidx.db-wal");
+}
+
 static tdb_test_case cases[] = {
   {"geospatial", test_geospatial},
+  {"spatial_index", test_spatial_index},
   {"upsert", test_upsert},
   {"returning", test_returning},
   {"cte", test_cte},

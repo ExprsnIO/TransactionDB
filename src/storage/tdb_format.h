@@ -64,6 +64,8 @@
 #define TDB_PAGE_LEAF_INDEX     0x0A
 #define TDB_PAGE_OVERFLOW       0xFF
 #define TDB_PAGE_FREELIST_TRUNK 0xFE
+#define TDB_PAGE_RTREE_LEAF     0x0C   /* R-tree leaf (bbox -> rowid) */
+#define TDB_PAGE_RTREE_INTERIOR 0x04   /* R-tree interior (bbox -> child page) */
 
 /* ------------------------------------------------------------------ */
 /* B-tree page header (relative to the start of the btree area)        */

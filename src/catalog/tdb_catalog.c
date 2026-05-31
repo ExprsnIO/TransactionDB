@@ -97,6 +97,7 @@ static void ser_table(const tdb_table *t, tdb_buf *b) {
     w_str(b, ix->name);
     w_u32(b, ix->root);
     w_u8(b, (uint8_t)ix->unique);
+    w_u8(b, (uint8_t)ix->kind);
     w_var(b, (uint64_t)ix->ncol);
     for (int j = 0; j < ix->ncol; j++) {
       w_var(b, (uint64_t)ix->col_idx[j]);
@@ -157,6 +158,7 @@ static tdb_table *deser_table(rd *r) {
     ix.name = r_str(r);
     ix.root = r_u32(r);
     ix.unique = r_u8(r);
+    ix.kind = r_u8(r);
     ix.ncol = (int)r_var(r);
     if (ix.ncol > 0) {
       ix.col_idx = (int *)tdb_malloc(sizeof(int) * (size_t)ix.ncol);

@@ -62,6 +62,13 @@ typedef struct tdb_fkey {
   int    on_update;
 } tdb_fkey;
 
+/* Index access method: a key-ordered B-tree, or an R-tree spatial index over
+** a single geometry column (keyed on bounding boxes). */
+typedef enum tdb_index_kind {
+  TDB_IDX_BTREE = 0,
+  TDB_IDX_RTREE = 1
+} tdb_index_kind;
+
 typedef struct tdb_index {
   char     *name;
   tdb_pgno  root;
@@ -69,6 +76,7 @@ typedef struct tdb_index {
   int       ncol;
   int      *col_idx;  /* indices into the table's column array */
   uint8_t  *desc;     /* per-column descending flag */
+  int       kind;     /* tdb_index_kind: 0 = B-tree, 1 = R-tree (spatial) */
 } tdb_index;
 
 /* A snapshot of the column layout at a particular schema version. Retained so

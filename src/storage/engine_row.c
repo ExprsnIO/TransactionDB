@@ -16,10 +16,12 @@
 */
 #include "tdb_storage.h"
 #include "tdb_btree.h"
+#include "tdb_rtree.h"
 #include "../common/tdb_mem.h"
 #include "../common/tdb_util.h"
 #include "../common/tdb_buf.h"
 #include "../value/tdb_record.h"
+#include "../value/tdb_geom.h"
 
 #include <string.h>
 
@@ -44,6 +46,12 @@ struct tdb_scan {
   tdb_keyrange range;
   int          has_range;
   tdb_txnid    as_of;      /* FOR SYSTEM_TIME AS OF version (0 = snapshot) */
+
+  /* spatial (R-tree) scan state: candidate rowids gathered up front, then
+  ** fetched and MVCC-verified one at a time like an index-driven scan. */
+  int          spatial;
+  tdb_rowid   *cand;
+  int          ncand, candcap, candi;
 };
 
 /* --------------------------- row header codec ------------------------- */
@@ -125,10 +133,41 @@ static int open_index(row_engine *e, tdb_table *t, tdb_index *ix, tdb_btree **ou
   return tdb_btree_open(e->pager, ix->root, TDB_BT_INDEX, ki, out);
 }
 
+/* Bounding box of the geometry stored in an R-tree index's column, for `rec`.
+** *ok is set when the column holds a valid geometry (NULL/invalid -> skip). */
+static int row_geom_bbox(const tdb_table *t, const tdb_index *ix,
+                         const uint8_t *rec, int reclen, tdb_bbox *out, int *ok) {
+  TDB_UNUSED(t);
+  *ok = 0;
+  tdb_value vals[32]; int nc = 0;
+  if (tdb_record_decode(rec, (size_t)reclen, vals, 32, &nc)) return TDB_CORRUPT;
+  int ci = ix->col_idx[0];
+  if (ci < nc && vals[ci].type == TDB_VAL_BLOB && vals[ci].u.s.p &&
+      tdb_geom_bbox((const uint8_t *)vals[ci].u.s.p, (int)vals[ci].u.s.n, out) == TDB_OK)
+    *ok = 1;
+  for (int i = 0; i < nc; i++) tdb_value_clear(&vals[i]);
+  return TDB_OK;
+}
+
+/* Maintain an R-tree index for one row (insert or delete its bbox->rowid). */
+static int rtree_apply(row_engine *e, tdb_table *t, tdb_index *ix,
+                       const uint8_t *rec, int reclen, tdb_rowid rowid, int insert) {
+  tdb_bbox bb; int ok = 0;
+  int rc = row_geom_bbox(t, ix, rec, reclen, &bb, &ok);
+  if (rc || !ok) return rc;          /* NULL/invalid geometry: nothing to index */
+  if (insert) return tdb_rtree_insert(e->pager, ix->root, &bb, rowid);
+  int found; return tdb_rtree_delete(e->pager, ix->root, &bb, rowid, &found);
+}
+
 static int index_apply(row_engine *e, tdb_table *t, const uint8_t *rec, int reclen,
                        tdb_rowid rowid, int insert) {
   for (int k = 0; k < t->nindex; k++) {
     tdb_index *ix = &t->indexes[k];
+    if (ix->kind == TDB_IDX_RTREE) {
+      int rc = rtree_apply(e, t, ix, rec, reclen, rowid, insert);
+      if (rc) return rc;
+      continue;
+    }
     tdb_keyinfo ki; tdb_collation coll[34]; uint8_t desc[34];
     tdb_btree *ib;
     int rc = open_index(e, t, ix, &ib, &ki, coll, desc);
@@ -161,22 +200,36 @@ static int eng_drop_table(tdb_storage *s, tdb_txn *txn, tdb_table *t) {
   row_engine *e = (row_engine *)s->impl;
   int rc = tdb_btree_destroy(e->pager, t->root, TDB_BT_TABLE);
   if (!rc && t->history_root) rc = tdb_btree_destroy(e->pager, t->history_root, TDB_BT_TABLE);
-  for (int i = 0; i < t->nindex && !rc; i++)
-    rc = tdb_btree_destroy(e->pager, t->indexes[i].root, TDB_BT_INDEX);
+  for (int i = 0; i < t->nindex && !rc; i++) {
+    if (t->indexes[i].kind == TDB_IDX_RTREE)
+      rc = tdb_rtree_destroy(e->pager, t->indexes[i].root);
+    else
+      rc = tdb_btree_destroy(e->pager, t->indexes[i].root, TDB_BT_INDEX);
+  }
   return rc;
 }
 
 static int eng_create_index(tdb_storage *s, tdb_txn *txn, tdb_table *t,
                             tdb_index *ix) {
   row_engine *e = (row_engine *)s->impl;
-  int rc = tdb_btree_create(e->pager, TDB_BT_INDEX, &ix->root);
-  if (rc) return rc;
+  int rc;
+  if (ix->kind == TDB_IDX_RTREE) {
+    rc = tdb_rtree_create(e->pager, &ix->root);
+    if (rc) return rc;
+  } else {
+    rc = tdb_btree_create(e->pager, TDB_BT_INDEX, &ix->root);
+    if (rc) return rc;
+  }
   /* Populate from currently-visible rows. */
   tdb_scan *sc;
   rc = s->vtab->scan_open(s, txn, t, NULL, NULL, 0, NULL, &sc);
   if (rc) return rc;
   tdb_rowid rid; const uint8_t *rec; int reclen;
   while ((rc = s->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {
+    if (ix->kind == TDB_IDX_RTREE) {
+      rtree_apply(e, t, ix, rec, reclen, rid, 1);
+      continue;
+    }
     tdb_keyinfo ki; tdb_collation coll[34]; uint8_t desc[34];
     tdb_btree *ib;
     if (open_index(e, t, ix, &ib, &ki, coll, desc) == TDB_OK) {
@@ -369,6 +422,19 @@ static int eng_seek_rowid(tdb_storage *s, tdb_txn *txn, tdb_table *t,
   return rc;
 }
 
+/* R-tree search callback: append a candidate rowid to the scan's list. */
+static int rtree_collect(void *ctx, tdb_rowid rowid) {
+  tdb_scan *sc = (tdb_scan *)ctx;
+  if (sc->ncand == sc->candcap) {
+    int cap = sc->candcap ? sc->candcap * 2 : 32;
+    tdb_rowid *grown = (tdb_rowid *)tdb_realloc(sc->cand, sizeof(tdb_rowid) * (size_t)cap);
+    if (!grown) return TDB_NOMEM;
+    sc->cand = grown; sc->candcap = cap;
+  }
+  sc->cand[sc->ncand++] = rowid;
+  return 0;
+}
+
 static int eng_scan_open(tdb_storage *s, tdb_txn *txn, tdb_table *t,
                          tdb_index *use_idx, const tdb_keyrange *range,
                          tdb_txnid as_of, const uint8_t *colmask, tdb_scan **out) {
@@ -382,7 +448,17 @@ static int eng_scan_open(tdb_storage *s, tdb_txn *txn, tdb_table *t,
   if (!rc) rc = tdb_btree_open(e->pager, t->history_root, TDB_BT_TABLE, NULL, &sc->hist);
   if (rc) { s->vtab->scan_close(sc); return rc; }
 
-  if (use_idx) {
+  if (use_idx && use_idx->kind == TDB_IDX_RTREE) {
+    /* spatial scan: gather candidate rowids from the R-tree for the query
+    ** window, then fetch + MVCC-verify each (exact predicate is re-checked by
+    ** the executor's WHERE). */
+    sc->idx = use_idx; sc->spatial = 1;
+    if (range && range->has_bbox) {
+      rc = tdb_rtree_search(e->pager, use_idx->root, &range->bbox, rtree_collect, sc);
+      if (rc) { s->vtab->scan_close(sc); return rc; }
+    }
+    sc->candi = 0;
+  } else if (use_idx) {
     sc->idx = use_idx;
     build_keyinfo(t, use_idx, &sc->ki, sc->coll, sc->desc);
     rc = tdb_btree_open(e->pager, use_idx->root, TDB_BT_INDEX, &sc->ki, &sc->ixbt);
@@ -451,8 +527,34 @@ static int scan_next_index(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec,
   return TDB_DONE;
 }
 
+/* spatial scan: walk the gathered candidate rowids, fetch + MVCC-verify each */
+static int scan_next_spatial(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec,
+                             int *reclen) {
+  row_engine *e = (row_engine *)sc->s->impl;
+  while (sc->candi < sc->ncand) {
+    tdb_rowid rid = sc->cand[sc->candi++];
+    tdb_buf mainv; tdb_buf_init(&mainv);
+    int f = 0;
+    int rc = fetch_main(e, sc->tbl, rid, &mainv, &f);
+    if (!rc && f) {
+      int found = 0;
+      rc = resolve_visible(e, sc->txn, sc->tbl, sc->hist, mainv.data, (int)mainv.len,
+                           &sc->work, &sc->rec, &found, sc->as_of);
+      if (!rc && found) {
+        tdb_buf_free(&mainv);
+        *rowid = rid; *rec = sc->rec.data; *reclen = (int)sc->rec.len;
+        return TDB_ROW;
+      }
+    }
+    tdb_buf_free(&mainv);
+    if (rc) return rc;
+  }
+  return TDB_DONE;
+}
+
 static int eng_scan_next(tdb_scan *sc, tdb_rowid *rowid, const uint8_t **rec,
                          int *reclen) {
+  if (sc->spatial) return scan_next_spatial(sc, rowid, rec, reclen);
   if (sc->idx) return scan_next_index(sc, rowid, rec, reclen);
   row_engine *e = (row_engine *)sc->s->impl;
   while (!tdb_cursor_eof(sc->cur)) {
@@ -482,6 +584,7 @@ static void eng_scan_close(tdb_scan *sc) {
   if (sc->hist) tdb_btree_close(sc->hist);
   tdb_buf_free(&sc->rec);
   tdb_buf_free(&sc->work);
+  tdb_mfree(sc->cand);
   tdb_mfree(sc);
 }
 
@@ -563,6 +666,8 @@ static int eng_drop_column(tdb_storage *s, tdb_txn *txn, tdb_table *t, int ci) {
 static int eng_drop_index(tdb_storage *s, tdb_txn *txn, tdb_table *t, tdb_index *ix) {
   TDB_UNUSED(txn); TDB_UNUSED(t);
   row_engine *e = (row_engine *)s->impl;
+  if (ix->kind == TDB_IDX_RTREE)
+    return tdb_rtree_destroy(e->pager, ix->root);
   return tdb_btree_destroy(e->pager, ix->root, TDB_BT_INDEX);
 }
 

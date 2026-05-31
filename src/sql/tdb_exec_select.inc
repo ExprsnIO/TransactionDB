@@ -81,6 +81,25 @@ static void accum_result(const accum *ac, tdb_expr *agg, tdb_value *out) {
 static int expr_is_const(const tdb_expr *e) {
   return e && (e->kind == EX_LITERAL || e->kind == EX_NULL || e->kind == EX_PARAM);
 }
+
+/* Constant-foldable: evaluable without a row — literals, params, and pure
+** expressions/functions over foldable operands (e.g. ST_GeomFromText('...'),
+** ST_Point(5,5)). Excludes column/aggregate/subquery references. */
+static int expr_is_foldable(const tdb_expr *e) {
+  if (!e) return 1;
+  switch (e->kind) {
+    case EX_LITERAL: case EX_NULL: case EX_PARAM: return 1;
+    case EX_COLUMN: case EX_AGG: case EX_SUBQUERY: case EX_EXISTS: case EX_STAR:
+      return 0;
+    case EX_FUNC: case EX_CAST: case EX_UNARY: case EX_BINARY:
+    case EX_IN: case EX_BETWEEN: case EX_CASE:
+      if (!expr_is_foldable(e->left) || !expr_is_foldable(e->right)) return 0;
+      if (e->args) for (int i = 0; i < e->args->n; i++)
+        if (!expr_is_foldable(e->args->items[i])) return 0;
+      return 1;
+    default: return 0;
+  }
+}
 static int flip_op(int op) {
   switch (op) {
     case TK_LT: return TK_GT; case TK_LE: return TK_GE;
@@ -125,8 +144,60 @@ static void apply_pred(tdb_db *db, tdb_stmt *st, const char *lead, tdb_expr *p,
   tdb_value_clear(&v);
 }
 
-/* Choose an index whose leading column has an equality/range predicate in
-** WHERE. Returns 1 and fills *out_idx / *out_range on success. */
+/* True if `e` is a reference to the (unqualified or matching) column `col`. */
+static int expr_is_col(const tdb_expr *e, const char *col) {
+  return e && e->kind == EX_COLUMN && !e->table && e->name && !strcasecmp(e->name, col);
+}
+
+/* Evaluate a constant geometry expression to its bounding box. */
+static int const_geom_bbox(tdb_db *db, tdb_stmt *st, tdb_expr *e, tdb_bbox *out) {
+  if (!expr_is_foldable(e)) return 0;
+  ectx ec = { NULL, 0, NULL, 0, st };
+  tdb_value v; tdb_value_init(&v);
+  eval(db, &ec, e, &v);
+  int ok = (v.type == TDB_VAL_BLOB && v.u.s.p &&
+            tdb_geom_bbox((const uint8_t *)v.u.s.p, (int)v.u.s.n, out) == TDB_OK);
+  tdb_value_clear(&v);
+  return ok;
+}
+
+/* Look for a spatial predicate over `col` from which an R-tree query window can
+** be derived: ST_Contains/ST_Within/ST_Intersects(col, const-geom) or
+** ST_DWithin(col, const-geom, const-dist). Descends top-level ANDs. */
+static int spatial_window(tdb_db *db, tdb_stmt *st, const char *col,
+                          tdb_expr *p, tdb_bbox *out) {
+  if (!p) return 0;
+  if (p->kind == EX_BINARY && p->op == TK_AND)
+    return spatial_window(db, st, col, p->left, out) ||
+           spatial_window(db, st, col, p->right, out);
+  if (p->kind != EX_FUNC || !p->name || !p->args || p->args->n < 2) return 0;
+  const char *fn = p->name;
+  int dwithin = !strcasecmp(fn, "st_dwithin");
+  if (!dwithin && strcasecmp(fn, "st_contains") && strcasecmp(fn, "st_within") &&
+      strcasecmp(fn, "st_intersects")) return 0;
+
+  tdb_expr *a0 = p->args->items[0], *a1 = p->args->items[1];
+  tdb_expr *geomarg;
+  if (expr_is_col(a0, col)) geomarg = a1;
+  else if (expr_is_col(a1, col)) geomarg = a0;
+  else return 0;
+
+  if (!const_geom_bbox(db, st, geomarg, out)) return 0;
+
+  if (dwithin && p->args->n >= 3 && expr_is_foldable(p->args->items[2])) {
+    ectx ec = { NULL, 0, NULL, 0, st };
+    tdb_value d; tdb_value_init(&d);
+    eval(db, &ec, p->args->items[2], &d);
+    double dd = tdb_value_as_real(&d);
+    tdb_value_clear(&d);
+    out->minx -= dd; out->miny -= dd; out->maxx += dd; out->maxy += dd;
+  }
+  return 1;
+}
+
+/* Choose an index for a single-table WHERE: an R-tree for a spatial predicate,
+** otherwise a B-tree whose leading column has an equality/range bound.
+** Returns 1 and fills *out_idx / *out_range on success. */
 static int pick_index(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_expr *where,
                       tdb_index **out_idx, tdb_keyrange *out_range) {
   if (!where) return 0;
@@ -134,6 +205,16 @@ static int pick_index(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_expr *where,
     tdb_index *ix = &t->indexes[xi];
     if (ix->ncol < 1) continue;
     const char *lead = t->cols[ix->col_idx[0]].name;
+    if (ix->kind == TDB_IDX_RTREE) {
+      tdb_bbox q;
+      if (spatial_window(db, st, lead, where, &q)) {
+        memset(out_range, 0, sizeof(*out_range));
+        tdb_value_init(&out_range->lo); tdb_value_init(&out_range->hi);
+        out_range->has_bbox = 1; out_range->bbox = q;
+        *out_idx = ix; return 1;
+      }
+      continue;
+    }
     tdb_keyrange r; memset(&r, 0, sizeof(r));
     tdb_value_init(&r.lo); tdb_value_init(&r.hi);
     int got = 0;

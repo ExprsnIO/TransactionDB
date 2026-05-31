@@ -17,15 +17,20 @@
 #include "../common/tdb_internal.h"
 #include "../catalog/tdb_schema.h"
 #include "../txn/tdb_txn.h"
+#include "../value/tdb_geom.h"   /* tdb_bbox */
 
 typedef struct tdb_storage tdb_storage;
 typedef struct tdb_scan    tdb_scan;
 
-/* Bounds on an index's leading column for an index-driven scan. */
+/* Bounds for an index-driven scan. For a B-tree index these bound the leading
+** column; for an R-tree (spatial) index, `has_bbox`/`bbox` give the query
+** window and the leading-column bounds are unused. */
 typedef struct tdb_keyrange {
   int       has_lo, has_hi;   /* whether a lower / upper bound is present */
   int       lo_incl, hi_incl; /* bound inclusivity */
   tdb_value lo, hi;           /* bound values (compared to the leading column) */
+  int       has_bbox;         /* spatial: query window present */
+  tdb_bbox  bbox;             /* spatial: bounding box to search */
 } tdb_keyrange;
 
 typedef struct tdb_storage_vtab {

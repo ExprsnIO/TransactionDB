@@ -148,6 +148,7 @@ typedef struct tdb_create_index {
   char **cols;
   uint8_t *desc;
   int    ncol;
+  int    kind;          /* tdb_index_kind: 0 = B-tree, 1 = R-tree (USING RTREE) */
 } tdb_create_index;
 
 /* ------------------------------ statements ---------------------------- */

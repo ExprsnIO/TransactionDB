@@ -837,11 +837,11 @@ int tdb_stmt_execute(tdb_stmt *st) {
       a->kind == ST_SAVEPOINT || a->kind == ST_RELEASE || a->kind == ST_ROLLBACK_TO)
     return exec_txn(db, st, a);
 
-  /* EXPLAIN describes a plan (no execution); VACUUM forces a checkpoint */
+  /* EXPLAIN describes a plan (no execution); VACUUM checkpoints + compacts */
   if (a->kind == ST_EXPLAIN) { st->is_select = 1; return exec_explain(db, st, a->u.explain.inner); }
   if (a->kind == ST_VACUUM) {
     if (db->txn) { tdb_db_seterr(db, "cannot VACUUM within a transaction"); return TDB_ERROR; }
-    return tdb_pager_checkpoint(db->pager);
+    return tdb_pager_vacuum(db->pager);
   }
 
   /* otherwise run inside the explicit txn, or an auto txn we open/close here */

@@ -48,6 +48,11 @@ int  tdb_pager_commit(tdb_pager *p);    /* atomically flush to WAL + fsync */
 int  tdb_pager_rollback(tdb_pager *p);  /* discard buffered changes */
 int  tdb_pager_checkpoint(tdb_pager *p);
 
+/* Compact the file by truncating trailing free pages: rebuilds the free-list
+** without the free pages at the end of the file, shrinks the page count, and
+** truncates the underlying file. Must be called outside a write transaction. */
+int  tdb_pager_vacuum(tdb_pager *p);
+
 /* Statement-level savepoints (within a write transaction). tdb_pager_savepoint
 ** returns a level index; release discards a savepoint (keeping its changes);
 ** rollback reverts to it. */

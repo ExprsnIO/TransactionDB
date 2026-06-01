@@ -749,3 +749,15 @@ void tdb_catalog_drop_view(tdb_catalog *c, const char *name) {
     }
   }
 }
+
+void tdb_catalog_drop_routine(tdb_catalog *c, const char *name) {
+  del_row(c, name);
+  for (int i = 0; i < c->nroutine; i++) {
+    if (strcasecmp(c->routines[i]->name, name) == 0) {
+      tdb_routine_free(c->routines[i]);
+      for (int j = i; j < c->nroutine - 1; j++) c->routines[j] = c->routines[j + 1];
+      c->nroutine--;
+      return;
+    }
+  }
+}

@@ -732,7 +732,22 @@ static int exec_create_view(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 
 static int exec_create_routine(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
+  const char *name = a->u.create_routine.name;
   const char *lang = a->u.create_routine.lang;
+  /* Without OR REPLACE, reject collisions across both Lua-backed and PL/SQL
+  ** routines. With OR REPLACE, drop any existing definition first. */
+  int exists = tdb_catalog_find_routine(db->cat, name) != NULL ||
+               tdb_db_find_plsql(db, name) != NULL;
+  if (exists && !a->u.create_routine.or_replace) {
+    tdb_db_seterr(db, "routine %s already exists (use OR REPLACE)", name);
+    return TDB_ERROR;
+  }
+  if (exists) {
+    /* tdb_db_add_plsql already replaces in-place; only the Lua/catalog path
+    ** needs an explicit drop of the persisted routine row. */
+    if (tdb_catalog_find_routine(db->cat, name))
+      tdb_catalog_drop_routine(db->cat, name);
+  }
   if (lang && (!strcasecmp(lang, "plsql") || !strcasecmp(lang, "plpgsql"))) {
     tdb_plsql_proc *proc = NULL;
     char err[160] = {0};
@@ -740,7 +755,7 @@ static int exec_create_routine(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
                              (const char *const *)a->u.create_routine.params,
                              a->u.create_routine.nparams, &proc, err, sizeof(err));
     if (rc != TDB_OK) { tdb_db_seterr(db, "PL/SQL compile error: %s", err); return TDB_ERROR; }
-    return tdb_db_add_plsql(db, a->u.create_routine.name, proc,
+    return tdb_db_add_plsql(db, name, proc,
                             a->u.create_routine.is_function, a->u.create_routine.nparams);
   }
 #ifdef TDB_HAVE_LUA

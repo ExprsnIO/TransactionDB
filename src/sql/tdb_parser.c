@@ -929,14 +929,28 @@ static tdb_ast_stmt *parse_create_routine(P *p, int is_function) {
 
 static tdb_ast_stmt *parse_create(P *p) {
   advance(p); /* CREATE */
+  int or_replace = 0;
+  if (accept(p, TK_OR)) {
+    if (!id_is(&p->cur, "REPLACE")) { set_err(p, "expected REPLACE after OR"); return new_stmt(p, ST_CREATE_TABLE); }
+    advance(p);
+    or_replace = 1;
+  }
   if (accept(p, TK_UNIQUE)) return parse_create_index(p, 1);
   if (p->cur.kind == TK_INDEX) return parse_create_index(p, 0);
   if (p->cur.kind == TK_MATERIALIZED) { advance(p); return parse_create_view(p, 1); }
   if (p->cur.kind == TK_VIEW) return parse_create_view(p, 0);
-  if (p->cur.kind == TK_FUNCTION) return parse_create_routine(p, 1);
-  if (p->cur.kind == TK_PROCEDURE) return parse_create_routine(p, 0);
+  if (p->cur.kind == TK_FUNCTION) {
+    tdb_ast_stmt *s = parse_create_routine(p, 1);
+    s->u.create_routine.or_replace = or_replace;
+    return s;
+  }
+  if (p->cur.kind == TK_PROCEDURE) {
+    tdb_ast_stmt *s = parse_create_routine(p, 0);
+    s->u.create_routine.or_replace = or_replace;
+    return s;
+  }
   if (p->cur.kind == TK_TABLESPACE) return parse_create_tablespace(p);
-  /* CREATE [OR REPLACE] FUNCTION not handled via OR REPLACE keyword set; fallthrough */
+  if (or_replace) { set_err(p, "OR REPLACE is only valid for FUNCTION / PROCEDURE"); return new_stmt(p, ST_CREATE_TABLE); }
   return parse_create_table(p);
 }
 

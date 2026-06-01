@@ -90,6 +90,11 @@ struct tdb_db {
   char        *current_user; /* identity for ACL checks; NULL = superuser */
   char         errmsg[256];
   tdb_mutex   *mu;         /* serializes API calls: makes one tdb_db thread-safe */
+
+  /* SQLite-style statistics (per connection) updated by DML statements. */
+  int64_t      last_insert_rowid;
+  int64_t      changes;        /* rows changed by the most recent successful DML */
+  int64_t      total_changes;  /* lifetime row-change count since open */
 };
 
 struct tdb_stmt {

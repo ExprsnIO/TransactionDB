@@ -89,6 +89,16 @@ const char *tdb_libversion(void);
 const char *tdb_status_str(int code);
 
 /* ------------------------------------------------------------------ */
+/* Connection statistics (SQLite-style)                                */
+/* ------------------------------------------------------------------ */
+/* Last rowid assigned by an INSERT on this connection (0 if none). */
+int64_t tdb_last_insert_rowid(tdb_db *db);
+/* Number of rows changed by the most recent successful DML statement.  */
+int     tdb_changes(tdb_db *db);
+/* Lifetime count of rows changed by DML since the connection opened.   */
+int64_t tdb_total_changes(tdb_db *db);
+
+/* ------------------------------------------------------------------ */
 /* One-shot execution                                                  */
 /* ------------------------------------------------------------------ */
 /*

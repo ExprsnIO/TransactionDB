@@ -227,6 +227,9 @@ typedef struct ectx {
 static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out);
 static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer);
 
+/* additional SQLite-compatible builtins (date/time, JSON, printf, …) */
+#include "tdb_exec_funcs.inc"
+
 /* A WITH frame: the CTE list attached to one SELECT, linked to the enclosing
 ** frame so name lookup can walk outward (lexical scoping). */
 typedef struct cte_scope {
@@ -512,6 +515,13 @@ static int rep_point_of(const tdb_value *v, double *x, double *y) {
 static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
   const char *fn = e->name;
   int argc = e->args ? e->args->n : 0;
+  /* Try the SQLite-compatible extension library first (date/time, JSON,
+  ** printf/format, quote/char/unicode, last_insert_rowid/changes, etc.). */
+  {
+    int r = try_builtin_extra(db, c, e, out);
+    if (r == 1) return TDB_OK;
+    if (r < 0) return TDB_ERROR;
+  }
   tdb_value a0; tdb_value_init(&a0);
   if (argc >= 1) eval(db, c, e->args->items[0], &a0);
 
@@ -1179,6 +1189,13 @@ static int stmt_execute_locked(tdb_stmt *st) {
     }
     db->txn = NULL;
     if (db->env && wid) tdb_env_release_writer(db->env, wid);  /* auto-txn writer done */
+  }
+
+  /* Publish the DML row count (sqlite_changes / sqlite_total_changes mirror). */
+  if (rc == TDB_OK && (a->kind == ST_INSERT || a->kind == ST_UPDATE ||
+                       a->kind == ST_DELETE)) {
+    db->changes = st->changes;
+    db->total_changes += st->changes;
   }
   return rc;
 }

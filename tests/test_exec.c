@@ -1606,6 +1606,35 @@ static void test_stream_distinct(void) {
   tdb_close(db);
 }
 
+static void test_recursive_cte(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+
+  /* Generate-series: 1..5. SUM = 15. */
+  TDB_CHECK_EQ(scalar(db,
+    "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL "
+    "  SELECT n+1 FROM t WHERE n < 5) "
+    "SELECT SUM(n) FROM t"), 15);
+
+  /* Bounded factorial — exercises UNION ALL termination and frontier semantics. */
+  TDB_CHECK_EQ(scalar(db,
+    "WITH RECURSIVE f(i, v) AS ( "
+    "  SELECT 1, 1 UNION ALL "
+    "  SELECT i+1, v*(i+1) FROM f WHERE i < 6) "
+    "SELECT v FROM f WHERE i = 6"), 720);
+
+  /* Graph reachability with UNION (DISTINCT) — must terminate even when
+  ** the recursion would otherwise revisit nodes. */
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE edges (src TEXT, dst TEXT)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db,
+    "INSERT INTO edges VALUES ('a','b'),('b','c'),('c','d'),('d','b')"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db,
+    "WITH RECURSIVE reach(node) AS ( "
+    "  SELECT 'a' UNION "
+    "  SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node) "
+    "SELECT COUNT(*) FROM reach"), 4);
+  tdb_close(db);
+}
+
 static void test_phase11_utility(void) {
   tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
   TDB_CHECK_EQ(exec(db,
@@ -1652,6 +1681,7 @@ static tdb_test_case cases[] = {
   {"returning", test_returning},
   {"cte", test_cte},
   {"ddl_dml_select", test_ddl_dml_select},
+  {"recursive_cte", test_recursive_cte},
   {"phase11_utility", test_phase11_utility},
   {"derived_and_view", test_derived_and_view},
   {"outer_joins", test_outer_joins},

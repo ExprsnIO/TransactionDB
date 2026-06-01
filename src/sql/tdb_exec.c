@@ -188,14 +188,46 @@ typedef struct cte_scope {
   struct cte_scope *parent;
 } cte_scope;
 
+/* Pre-materialized rows for a recursive CTE's working set / final result.
+** Owned for the duration of the outer SELECT; rows are heap-allocated and
+** freed in cte_rows_free at scope-pop time. */
+typedef struct cte_rows {
+  tdb_value **rows;
+  int          nrows, capr;
+  int          ncol;
+  char       **colnames;     /* arena-allocated */
+} cte_rows;
+
+static void cte_rows_free(cte_rows *cr) {
+  if (!cr) return;
+  for (int i = 0; i < cr->nrows; i++) {
+    for (int k = 0; k < cr->ncol; k++) tdb_value_clear(&cr->rows[i][k]);
+    tdb_mfree(cr->rows[i]);
+  }
+  tdb_mfree(cr->rows);
+  tdb_mfree(cr);
+}
+
+/* deep-copy row k of stmt `s` into a freshly allocated array */
+static tdb_value *row_dup(tdb_stmt *s, int k) {
+  tdb_value *r = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(s->ncol ? s->ncol : 1));
+  if (!r) return NULL;
+  for (int i = 0; i < s->ncol; i++) { tdb_value_init(&r[i]); tdb_value_copy(&r[i], &s->rows[k][i]); }
+  return r;
+}
+
 /* Find an in-scope, non-active CTE by name (case-insensitive). Active CTEs are
-** those currently being materialized — skipping them blocks self-reference. */
+** those currently being materialized — skipping them blocks self-reference.
+** A CTE with `rows` already attached (recursive-CTE working set) is treated
+** as visible regardless of `active`: the recursive arm wants to read it. */
 static tdb_cte *find_cte(tdb_stmt *st, const char *name) {
   for (cte_scope *sc = st->cte_scope; sc; sc = sc->parent) {
     tdb_ctelist *l = sc->list;
-    for (int i = 0; l && i < l->n; i++)
-      if (!l->items[i].active && strcasecmp(l->items[i].name, name) == 0)
-        return &l->items[i];
+    for (int i = 0; l && i < l->n; i++) {
+      if (strcasecmp(l->items[i].name, name) != 0) continue;
+      if (l->items[i].active && !l->items[i].rows) continue;
+      return &l->items[i];
+    }
   }
   return NULL;
 }

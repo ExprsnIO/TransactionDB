@@ -273,7 +273,26 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
   tdb_cte    *cte = NULL;
   if (!sub && s->table) {
     cte = find_cte(st, s->table);              /* a WITH name shadows a table */
-    if (cte) { sub = cte->select; if (!qs->alias) qs->alias = cte->name; }
+    if (cte) {
+      if (!qs->alias) qs->alias = cte->name;
+      /* recursive CTE: read directly from the pre-materialized rowset
+      ** instead of re-running the body. */
+      if (cte->rows) {
+        cte_rows *cr = (cte_rows *)cte->rows;
+        qs->ncol = cr->ncol;
+        qs->colnames = (char **)tdb_arena_alloc(st->arena,
+            sizeof(char *) * (size_t)(cr->ncol ? cr->ncol : 1));
+        for (int k = 0; k < cr->ncol; k++) qs->colnames[k] = cr->colnames[k];
+        rowset_init(set, cr->ncol ? cr->ncol : 1);
+        for (int r = 0; r < cr->nrows; r++) {
+          tdb_value *row = row_alloc(cr->ncol ? cr->ncol : 1);
+          for (int k = 0; k < cr->ncol; k++) tdb_value_copy(&row[k], &cr->rows[r][k]);
+          rowset_add(set, row);
+        }
+        return TDB_OK;
+      }
+      sub = cte->select;
+    }
   }
   if (!sub && s->table) {
     tdb_table *t = tdb_catalog_find_table(db->cat, s->table);
@@ -327,13 +346,178 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
 static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer);
 static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer);
 
+/* Run a recursive CTE to fixed point. The body is expected to be a UNION
+** (with or without ALL) of a seed (non-recursive) arm and a recursive arm
+** that reads the CTE name. Strategy:
+**
+**   1. Run the seed alone — this fixes the CTE's schema and seeds the
+**      working set.
+**   2. Loop: run the recursive arm with the CTE's current rows visible.
+**      Append (or, for UNION, dedup-append) the iteration output to the
+**      working set. Stop when no new rows appear.
+**
+** This is the textbook seed/recursive split and handles both UNION ALL
+** (no dedup) and UNION DISTINCT (row-equality dedup) recursion. A safety
+** cap prevents non-terminating queries from blocking forever. */
+#define TDB_CTE_MAX_ITERS 8192
+
+static int row_value_equal(const tdb_value *a, const tdb_value *b) {
+  return tdb_value_compare(a, b, TDB_COLL_BINARY) == 0;
+}
+static int row_already_in(cte_rows *cr, tdb_value *row) {
+  for (int i = 0; i < cr->nrows; i++) {
+    int eq = 1;
+    for (int k = 0; k < cr->ncol; k++)
+      if (!row_value_equal(&cr->rows[i][k], &row[k])) { eq = 0; break; }
+    if (eq) return 1;
+  }
+  return 0;
+}
+
+static int cte_rows_grow(cte_rows *acc) {
+  if (acc->nrows < acc->capr) return TDB_OK;
+  int cap = acc->capr ? acc->capr * 2 : 16;
+  tdb_value **g = (tdb_value **)tdb_realloc(acc->rows, sizeof(void *) * (size_t)cap);
+  if (!g) return TDB_NOMEM;
+  acc->rows = g; acc->capr = cap;
+  return TDB_OK;
+}
+
+/* Move all rows from `src` into `dst` and reset `src` to empty (transfers
+** ownership of the row arrays — no copying). */
+static void cte_rows_take(cte_rows *dst, cte_rows *src) {
+  for (int i = 0; i < src->nrows; i++) {
+    if (dst->nrows == dst->capr) {
+      dst->capr = dst->capr ? dst->capr * 2 : 16;
+      dst->rows = (tdb_value **)tdb_realloc(dst->rows, sizeof(void *) * (size_t)dst->capr);
+    }
+    dst->rows[dst->nrows++] = src->rows[i];
+  }
+  tdb_mfree(src->rows);
+  src->rows = NULL; src->nrows = 0; src->capr = 0;
+}
+
+static int materialize_recursive_cte(tdb_db *db, tdb_stmt *st, tdb_cte *c) {
+  if (c->rows) return TDB_OK;
+  cte_rows *acc = (cte_rows *)tdb_calloc(sizeof(*acc));        /* full result */
+  cte_rows *wset = (cte_rows *)tdb_calloc(sizeof(*wset));      /* current frontier */
+  if (!acc || !wset) { cte_rows_free(acc); cte_rows_free(wset); return TDB_NOMEM; }
+
+  /* Detach the recursive arm so the seed can be run in isolation. */
+  tdb_select *body = c->select;
+  int  saved_setop     = body->setop;
+  int  saved_setop_all = body->setop_all;
+  tdb_select *saved_next = body->setop_next;
+  body->setop = 0; body->setop_all = 0; body->setop_next = NULL;
+  int dedup = (saved_setop == TK_UNION && !saved_setop_all);
+
+  tdb_stmt seed;
+  int rc = run_subselect(db, st, body, &seed, NULL);
+  body->setop = saved_setop; body->setop_all = saved_setop_all; body->setop_next = saved_next;
+  if (rc) { tdb_stmt_clear_results(&seed); cte_rows_free(acc); cte_rows_free(wset); return rc; }
+
+  /* Schema comes from the seed. */
+  acc->ncol = wset->ncol = seed.ncol;
+  acc->colnames = (char **)tdb_arena_alloc(st->arena,
+      sizeof(char *) * (size_t)(seed.ncol ? seed.ncol : 1));
+  for (int k = 0; k < seed.ncol; k++) {
+    const char *nm = (k < c->ncolname) ? c->colnames[k]
+                   : (seed.colnames && seed.colnames[k]) ? seed.colnames[k] : "col";
+    acc->colnames[k] = tdb_arena_strndup(st->arena, nm, strlen(nm));
+  }
+  wset->colnames = acc->colnames;
+
+  /* Seed populates both `acc` (final result) and `wset` (initial frontier). */
+  for (int r = 0; r < seed.nrows; r++) {
+    if (cte_rows_grow(acc) || cte_rows_grow(wset)) {
+      tdb_stmt_clear_results(&seed); cte_rows_free(acc); cte_rows_free(wset);
+      return TDB_NOMEM;
+    }
+    tdb_value *a = row_dup(&seed, r), *b = row_dup(&seed, r);
+    if (!a || !b) { tdb_stmt_clear_results(&seed); cte_rows_free(acc); cte_rows_free(wset); return TDB_NOMEM; }
+    acc->rows[acc->nrows++] = a;
+    wset->rows[wset->nrows++] = b;
+  }
+  tdb_stmt_clear_results(&seed);
+
+  if (!saved_next) {
+    cte_rows_free(wset);
+    c->rows = acc;
+    return TDB_OK;
+  }
+
+  /* Iterate: each step's reference to the CTE sees `wset` only (the frontier),
+  ** not the full accumulated result — this is what gives recursive CTEs
+  ** correct termination semantics for UNION ALL recursion. */
+  for (int it = 0; it < TDB_CTE_MAX_ITERS; it++) {
+    c->rows = wset;
+    tdb_stmt step;
+    rc = run_subselect(db, st, saved_next, &step, NULL);
+    c->rows = NULL;
+    if (rc) { tdb_stmt_clear_results(&step); cte_rows_free(acc); cte_rows_free(wset); return rc; }
+
+    cte_rows *next = (cte_rows *)tdb_calloc(sizeof(*next));
+    if (!next) { tdb_stmt_clear_results(&step); cte_rows_free(acc); cte_rows_free(wset); return TDB_NOMEM; }
+    next->ncol = acc->ncol; next->colnames = acc->colnames;
+
+    for (int r = 0; r < step.nrows; r++) {
+      tdb_value *row = row_dup(&step, r);
+      if (!row) { tdb_stmt_clear_results(&step); cte_rows_free(acc); cte_rows_free(wset); cte_rows_free(next); return TDB_NOMEM; }
+      if (dedup && row_already_in(acc, row)) {
+        for (int k = 0; k < acc->ncol; k++) tdb_value_clear(&row[k]);
+        tdb_mfree(row);
+        continue;
+      }
+      if (cte_rows_grow(next)) { tdb_mfree(row); tdb_stmt_clear_results(&step); cte_rows_free(acc); cte_rows_free(wset); cte_rows_free(next); return TDB_NOMEM; }
+      next->rows[next->nrows++] = row;
+    }
+    tdb_stmt_clear_results(&step);
+
+    if (next->nrows == 0) {
+      cte_rows_free(next); cte_rows_free(wset);
+      c->rows = acc;
+      return TDB_OK;
+    }
+    /* Append `next` to `acc` (transfer ownership), and make it the new frontier. */
+    cte_rows *frontier = (cte_rows *)tdb_calloc(sizeof(*frontier));
+    frontier->ncol = acc->ncol; frontier->colnames = acc->colnames;
+    /* For frontier we need a copy distinct from acc's rows (acc takes ownership of `next`'s rows). */
+    for (int r = 0; r < next->nrows; r++) {
+      if (cte_rows_grow(frontier)) { cte_rows_free(acc); cte_rows_free(wset); cte_rows_free(next); cte_rows_free(frontier); return TDB_NOMEM; }
+      tdb_value *dup = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(acc->ncol ? acc->ncol : 1));
+      for (int k = 0; k < acc->ncol; k++) { tdb_value_init(&dup[k]); tdb_value_copy(&dup[k], &next->rows[r][k]); }
+      frontier->rows[frontier->nrows++] = dup;
+    }
+    cte_rows_take(acc, next);            /* move into acc */
+    cte_rows_free(next);
+    cte_rows_free(wset);
+    wset = frontier;
+  }
+  cte_rows_free(wset);
+  c->rows = acc;
+  tdb_db_seterr(db, "WITH RECURSIVE did not converge within %d iterations", TDB_CTE_MAX_ITERS);
+  return TDB_ERROR;
+}
+
 /* Push this SELECT's WITH frame (if any) so its CTEs are visible to the body
 ** and any nested subqueries, run the body, then pop the frame. `outer` is the
 ** enclosing query's per-row context for correlated subqueries (NULL at top). */
 static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer) {
   cte_scope scope; cte_scope *saved = st->cte_scope;
   if (q->with) { scope.list = q->with; scope.parent = saved; st->cte_scope = &scope; }
-  int rc = exec_select_body(db, st, q, outer);
+  int rc = TDB_OK;
+  if (q->with && q->with->recursive) {
+    for (int i = 0; rc == TDB_OK && i < q->with->n; i++)
+      rc = materialize_recursive_cte(db, st, &q->with->items[i]);
+  }
+  if (rc == TDB_OK) rc = exec_select_body(db, st, q, outer);
+  /* tear down any rows attached for recursive CTEs in this frame */
+  if (q->with) {
+    for (int i = 0; i < q->with->n; i++) {
+      cte_rows_free((cte_rows *)q->with->items[i].rows);
+      q->with->items[i].rows = NULL;
+    }
+  }
   st->cte_scope = saved;
   return rc;
 }

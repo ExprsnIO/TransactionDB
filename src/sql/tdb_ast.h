@@ -88,11 +88,18 @@ typedef struct tdb_cte {
   int         ncolname;
   tdb_select *select;
   int         active;
+  /* Iterative materialization for WITH RECURSIVE: the executor swaps a
+  ** pre-computed rowset (the most recent iteration's rows) into `rows`
+  ** before re-running the recursive arm. `rows` is a `tdb_stmt *` borrowed
+  ** view, declared opaquely here to avoid pulling the executor types into
+  ** the AST header. NULL means "evaluate `select` normally". */
+  void       *rows;
 } tdb_cte;
 
 typedef struct tdb_ctelist {
   tdb_cte *items;
   int      n, cap;
+  int      recursive;       /* WITH RECURSIVE ... */
 } tdb_ctelist;
 
 struct tdb_select {

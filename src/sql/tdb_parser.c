@@ -356,9 +356,11 @@ static tdb_src *parse_from(P *p) {
 ** at execution time). Returns NULL when the current token is not WITH. */
 static tdb_ctelist *parse_with(P *p) {
   if (!accept(p, TK_WITH)) return NULL;
-  if (id_is(&p->cur, "RECURSIVE")) advance(p);
+  int recursive = 0;
+  if (id_is(&p->cur, "RECURSIVE")) { advance(p); recursive = 1; }
   tdb_ctelist *w = (tdb_ctelist *)tdb_arena_alloc(p->a, sizeof(*w));
   memset(w, 0, sizeof(*w));
+  w->recursive = recursive;
   do {
     if (w->n == w->cap) {
       w->cap = w->cap ? w->cap * 2 : 4;

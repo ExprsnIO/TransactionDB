@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TDB</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="theme-auto">
+  <div class="window" id="window">
+    <!-- Titlebar -->
+    <header class="titlebar" id="titlebar">
+      <div class="traffic">
+        <button class="tl tl-close" aria-label="Close"></button>
+        <button class="tl tl-min" aria-label="Minimize"></button>
+        <button class="tl tl-zoom" aria-label="Zoom"></button>
+      </div>
+
+      <button class="tb-icon" id="toggleSidebar" title="Toggle Sidebar">
+        <svg viewBox="0 0 16 16" width="16" height="16"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v9a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12.5v-9Zm1 0v9a.5.5 0 0 0 .5.5H6V3H3.5a.5.5 0 0 0-.5.5Z"/></svg>
+      </button>
+
+      <div class="tb-segmented" role="tablist" aria-label="View">
+        <button class="seg active" data-view="browse" role="tab">Browse</button>
+        <button class="seg" data-view="query" role="tab">Query</button>
+        <button class="seg" data-view="history" role="tab">History</button>
+        <button class="seg" data-view="er" role="tab">Schema</button>
+        <button class="seg" data-view="admin" role="tab">Admin</button>
+      </div>
+
+      <div class="tb-title">
+        <div class="tb-title-main" id="tbTitle">tdb_local</div>
+        <div class="tb-title-sub" id="tbSubtitle">TDB · 24 objects</div>
+      </div>
+
+      <div class="tb-spacer"></div>
+
+      <div class="tb-search" id="tbSearchBox">
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1ZM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0Z"/></svg>
+        <input type="search" placeholder="Search…  ⌘K" id="globalSearch" />
+        <kbd>⌘K</kbd>
+      </div>
+
+      <button class="tb-icon" id="newQueryBtn" title="New Query (⌘N)">
+        <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 2a.75.75 0 0 1 .75.75v4.5h4.5a.75.75 0 0 1 0 1.5h-4.5v4.5a.75.75 0 0 1-1.5 0v-4.5h-4.5a.75.75 0 0 1 0-1.5h4.5v-4.5A.75.75 0 0 1 8 2Z"/></svg>
+      </button>
+
+      <button class="tb-icon" id="runBtn" title="Run (⌘↩)">
+        <svg viewBox="0 0 16 16" width="13" height="13"><path d="M4 2.5v11a.5.5 0 0 0 .77.42l9-5.5a.5.5 0 0 0 0-.84l-9-5.5A.5.5 0 0 0 4 2.5Z"/></svg>
+      </button>
+    </header>
+
+    <div class="main">
+      <!-- Sidebar -->
+      <aside class="sidebar" id="sidebar">
+        <div class="env-strip" id="envStrip" data-env="dev"></div>
+
+        <section class="sb-section">
+          <div class="sb-head">
+            <span>Connections</span>
+            <button class="sb-add" id="addConn" title="New Connection">+</button>
+          </div>
+          <ul class="sb-list" id="connList"></ul>
+        </section>
+
+        <section class="sb-section">
+          <div class="sb-head">
+            <span>Database</span>
+            <button class="sb-add" id="refreshSchema" title="Refresh">↻</button>
+          </div>
+          <div class="sb-filter">
+            <input type="search" placeholder="Filter objects" id="tableFilter" />
+          </div>
+
+          <div class="acc" data-acc="tables" data-open="1">
+            <div class="acc-head"><span class="caret">▾</span>Tables <span class="cnt" id="cntTables">0</span>
+              <button class="sb-add" id="newTableBtn" title="New Table…">+</button>
+            </div>
+            <ul class="sb-tree" id="tableTree"></ul>
+          </div>
+          <div class="acc" data-acc="views">
+            <div class="acc-head"><span class="caret">▸</span>Views <span class="cnt" id="cntViews">0</span></div>
+            <ul class="sb-tree" id="viewTree"></ul>
+          </div>
+          <div class="acc" data-acc="mviews">
+            <div class="acc-head"><span class="caret">▸</span>Materialized Views <span class="cnt" id="cntMViews">0</span></div>
+            <ul class="sb-tree" id="mviewTree"></ul>
+          </div>
+          <div class="acc" data-acc="indexes">
+            <div class="acc-head"><span class="caret">▸</span>Indexes <span class="cnt" id="cntIdx">0</span></div>
+            <ul class="sb-tree" id="idxTree"></ul>
+          </div>
+          <div class="acc" data-acc="seqs">
+            <div class="acc-head"><span class="caret">▸</span>Sequences <span class="cnt" id="cntSeq">0</span></div>
+            <ul class="sb-tree" id="seqTree"></ul>
+          </div>
+          <div class="acc" data-acc="scripts">
+            <div class="acc-head"><span class="caret">▸</span>Scripts <span class="cnt" id="cntScr">0</span></div>
+            <ul class="sb-tree" id="scrTree"></ul>
+          </div>
+          <div class="acc" data-acc="triggers">
+            <div class="acc-head"><span class="caret">▸</span>Triggers <span class="cnt" id="cntTrg">0</span></div>
+            <ul class="sb-tree" id="trgTree"></ul>
+          </div>
+          <div class="acc" data-acc="tablespaces">
+            <div class="acc-head"><span class="caret">▸</span>Tablespaces <span class="cnt" id="cntTs">0</span></div>
+            <ul class="sb-tree" id="tsTree"></ul>
+          </div>
+        </section>
+
+        <section class="sb-section sb-saved">
+          <div class="sb-head">
+            <span>Saved Queries</span>
+            <button class="sb-add" id="saveCurrent" title="Save Current">★</button>
+          </div>
+          <ul class="sb-list" id="savedList"></ul>
+        </section>
+      </aside>
+
+      <!-- Content -->
+      <section class="content" id="content">
+        <!-- BROWSE VIEW -->
+        <div class="view view-browse active" data-view="browse">
+          <div class="browse-head">
+            <div class="bh-title">
+              <span class="chip chip-icon" id="browseIcon">▦</span>
+              <h2 id="browseTableName">customers</h2>
+              <span class="chip chip-soft" id="browseRowCount">0 rows</span>
+              <span class="chip chip-flag" id="browseFlags"></span>
+            </div>
+            <div class="bh-tabs">
+              <button class="pill active" data-pane="rows">Data</button>
+              <button class="pill" data-pane="schema">Structure</button>
+              <button class="pill" data-pane="indexes">Indexes</button>
+              <button class="pill" data-pane="constraints">Constraints</button>
+              <button class="pill" data-pane="triggers">Triggers</button>
+              <button class="pill" data-pane="partitions">Partitions</button>
+              <button class="pill" data-pane="stats">Stats</button>
+            </div>
+            <div class="bh-actions">
+              <button class="btn btn-soft" id="filterBtn">
+                <svg viewBox="0 0 16 16" width="12" height="12"><path d="M2 3.5A.5.5 0 0 1 2.5 3h11a.5.5 0 0 1 .4.8l-4.4 5.85V13.5a.5.5 0 0 1-.8.4l-2-1.5a.5.5 0 0 1-.2-.4V9.65L2.1 3.8A.5.5 0 0 1 2 3.5Z"/></svg>
+                Filter
+              </button>
+              <button class="btn btn-soft" id="colsBtn">Columns</button>
+              <button class="btn btn-soft" id="importBtn">Import</button>
+              <button class="btn btn-soft" id="exportBtn">Export</button>
+              <button class="btn btn-primary" id="addRowBtn">+ Row</button>
+            </div>
+          </div>
+
+          <!-- Filter builder (collapsible) -->
+          <div class="filter-builder" id="filterBuilder" hidden>
+            <div class="fb-head">
+              <span>Where</span>
+              <button class="btn btn-soft" id="fbAdd">+ Condition</button>
+              <button class="btn btn-soft" id="fbClear">Clear</button>
+              <button class="btn btn-primary" id="fbApply">Apply</button>
+            </div>
+            <div class="fb-list" id="fbList"></div>
+          </div>
+
+          <div class="pane pane-rows active" data-pane="rows">
+            <div class="table-wrap">
+              <table class="data-table editable" id="dataTable">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <div class="pager">
+              <button class="btn btn-soft" id="pgPrev">‹</button>
+              <span id="pgInfo">Page 1 of 1</span>
+              <button class="btn btn-soft" id="pgNext">›</button>
+              <span class="sb-spacer"></span>
+              <span id="dirtyInfo" class="dirty hidden">0 unsaved changes</span>
+              <button class="btn btn-soft" id="revertBtn" disabled>Revert</button>
+              <button class="btn btn-primary" id="commitBtn" disabled>Commit</button>
+            </div>
+          </div>
+
+          <div class="pane pane-schema" data-pane="schema">
+            <div class="table-wrap">
+              <table class="data-table schema-table" id="schemaTable">
+                <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th><th>Key</th><th>Comment</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="pane pane-indexes" data-pane="indexes">
+            <div class="indexes-wrap">
+              <div class="table-wrap">
+                <table class="data-table">
+                  <thead><tr><th>Name</th><th>Type</th><th>Columns</th><th>Unique</th><th>Size</th></tr></thead>
+                  <tbody id="tableIndexBody"></tbody>
+                </table>
+              </div>
+              <div class="rtree-viz" id="rtreeViz"></div>
+            </div>
+          </div>
+
+          <div class="pane pane-constraints" data-pane="constraints">
+            <div class="constraints" id="constraintsPane"></div>
+          </div>
+
+          <div class="pane pane-triggers" data-pane="triggers">
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th></th><th>Name</th><th>Timing</th><th>Event</th><th>For</th><th>Body</th></tr></thead>
+                <tbody id="tableTrigBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="pane pane-partitions" data-pane="partitions">
+            <div class="part-wrap" id="partitionsPane"></div>
+          </div>
+
+          <div class="pane pane-stats" data-pane="stats">
+            <div class="stats-grid" id="statsGrid"></div>
+          </div>
+        </div>
+
+        <!-- QUERY VIEW -->
+        <div class="view view-query" data-view="query">
+          <div class="query-toolbar">
+            <div class="qt-tabs" id="qtTabs"></div>
+            <div class="qt-actions">
+              <select class="select" id="qtConn" title="Run against"></select>
+              <button class="btn btn-soft" id="explainBtn">Explain</button>
+              <button class="btn btn-soft" id="formatBtn">Format</button>
+              <button class="btn btn-soft" id="diffBtn">Diff</button>
+              <button class="btn btn-soft" id="saveQueryBtn">Save</button>
+              <button class="btn btn-primary" id="runQueryBtn">
+                <svg viewBox="0 0 16 16" width="11" height="11"><path d="M4 2.5v11a.5.5 0 0 0 .77.42l9-5.5a.5.5 0 0 0 0-.84l-9-5.5A.5.5 0 0 0 4 2.5Z"/></svg>
+                Run <kbd>⌘↩</kbd>
+              </button>
+            </div>
+          </div>
+          <div class="editor-wrap" id="editorWrap">
+            <div class="gutter" id="gutter"></div>
+            <div class="editor-stack">
+              <pre class="hl" id="hl"></pre>
+              <textarea class="editor" id="editor" spellcheck="false" autocomplete="off"></textarea>
+              <div class="ac" id="ac" hidden></div>
+            </div>
+          </div>
+          <div class="results">
+            <div class="results-head">
+              <div class="rh-tabs">
+                <button class="pill active" data-rtab="result">Result</button>
+                <button class="pill" data-rtab="messages">Messages</button>
+                <button class="pill" data-rtab="plan">Plan</button>
+                <button class="pill" data-rtab="diff">Diff</button>
+              </div>
+              <div class="rh-meta" id="resultMeta">— rows · — ms</div>
+            </div>
+            <div class="results-body">
+              <div class="rtab rtab-result active" data-rtab="result">
+                <div class="multi-results" id="multiResults"></div>
+              </div>
+              <div class="rtab rtab-messages" data-rtab="messages">
+                <pre class="log" id="messageLog">Ready.</pre>
+              </div>
+              <div class="rtab rtab-plan" data-rtab="plan">
+                <pre class="log" id="planLog">Run a query to see its plan.</pre>
+              </div>
+              <div class="rtab rtab-diff" data-rtab="diff">
+                <div class="diff-wrap" id="diffWrap">
+                  <div class="empty-pane"><div class="empty-glyph">±</div><h3>Result diff</h3><p>Run two queries and click Diff to compare.</p></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- HISTORY VIEW -->
+        <div class="view view-history" data-view="history">
+          <div class="history-head">
+            <h2>Query History</h2>
+            <div class="bh-actions">
+              <input type="search" class="hsrch" placeholder="Filter history" id="historyFilter" />
+              <button class="btn btn-soft" id="exportHistory">Export</button>
+              <button class="btn btn-soft" id="clearHistory">Clear</button>
+            </div>
+          </div>
+          <div class="history-list" id="historyList"></div>
+        </div>
+
+        <!-- SCHEMA (ER) VIEW -->
+        <div class="view view-er" data-view="er">
+          <div class="er-head">
+            <h2>Schema Diagram</h2>
+            <div class="bh-actions">
+              <button class="btn btn-soft" id="erRelayout">Re-layout</button>
+              <button class="btn btn-soft" id="erFit">Fit</button>
+              <button class="btn btn-soft" id="erExport">Export SVG</button>
+            </div>
+          </div>
+          <div class="er-canvas-wrap">
+            <svg id="erSvg" class="er-canvas" xmlns="http://www.w3.org/2000/svg"></svg>
+          </div>
+        </div>
+
+        <!-- ADMIN VIEW -->
+        <div class="view view-admin" data-view="admin">
+          <div class="admin-shell">
+            <nav class="admin-nav">
+              <button class="anv active" data-anv="scripts">Scripts</button>
+              <button class="anv" data-anv="triggers">Triggers</button>
+              <button class="anv" data-anv="wal">WAL</button>
+              <button class="anv" data-anv="txns">Transactions</button>
+              <button class="anv" data-anv="privs">Privileges</button>
+              <button class="anv" data-anv="info">information_schema</button>
+              <button class="anv" data-anv="doc">JSON / XML</button>
+              <button class="anv" data-anv="backup">Backup / Restore</button>
+              <button class="anv" data-anv="diag">Schema Compare</button>
+              <button class="anv" data-anv="dbg">PL/SQL Debugger</button>
+              <button class="anv" data-anv="settings">Settings</button>
+            </nav>
+            <div class="admin-body">
+              <!-- Scripts -->
+              <div class="apane active" data-apane="scripts">
+                <div class="apane-head">
+                  <h3>Scripts</h3>
+                  <div class="bh-actions">
+                    <select class="select" id="scrSelect"></select>
+                    <select class="select" id="scrLang">
+                      <option value="lua">Lua</option>
+                      <option value="js">JavaScript</option>
+                    </select>
+                    <button class="btn btn-soft" id="scrNew">New</button>
+                    <button class="btn btn-soft" id="scrSave">Save</button>
+                    <button class="btn btn-primary" id="scrRun">Run</button>
+                  </div>
+                </div>
+                <div class="scr-meta" id="scrMeta"></div>
+                <textarea class="code-editor" id="scrEditor" spellcheck="false"></textarea>
+                <div class="apane-foot">
+                  <div class="rh-tabs">
+                    <button class="pill active" data-stab="out">Output</button>
+                    <button class="pill" data-stab="jit">JIT</button>
+                  </div>
+                </div>
+                <pre class="log" id="scrOut">— script output —</pre>
+                <pre class="log" id="scrJit" hidden>— JIT info —</pre>
+              </div>
+
+              <!-- Triggers -->
+              <div class="apane" data-apane="triggers">
+                <div class="apane-head"><h3>Triggers</h3>
+                  <div class="bh-actions">
+                    <input type="search" class="hsrch" id="trgFilter" placeholder="Filter triggers" />
+                    <button class="btn btn-soft" id="trgNew">+ Trigger</button>
+                  </div>
+                </div>
+                <div class="table-wrap">
+                  <table class="data-table">
+                    <thead><tr><th>Enabled</th><th>Name</th><th>Table</th><th>Timing</th><th>Event</th><th>For Each</th><th>Body</th></tr></thead>
+                    <tbody id="adminTrigBody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- WAL -->
+              <div class="apane" data-apane="wal">
+                <div class="apane-head"><h3>Write-Ahead Log</h3>
+                  <div class="bh-actions">
+                    <span class="chip chip-soft" id="walCkpt"></span>
+                    <button class="btn btn-soft" id="walCheckpoint">Force checkpoint</button>
+                    <button class="btn btn-soft" id="walExport">Export</button>
+                  </div>
+                </div>
+                <div class="table-wrap">
+                  <table class="data-table">
+                    <thead><tr><th>LSN</th><th>Time</th><th>Txn</th><th>Type</th><th>Object</th><th>Bytes</th><th>Detail</th></tr></thead>
+                    <tbody id="walBody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- Transactions -->
+              <div class="apane" data-apane="txns">
+                <div class="apane-head"><h3>Transactions & Locks</h3>
+                  <div class="bh-actions">
+                    <button class="btn btn-soft" id="txnRefresh">Refresh</button>
+                  </div>
+                </div>
+                <div class="table-wrap">
+                  <table class="data-table">
+                    <thead><tr><th>XID</th><th>State</th><th>Isolation</th><th>User</th><th>Started</th><th>Locks</th><th>Last SQL</th><th></th></tr></thead>
+                    <tbody id="txnBody"></tbody>
+                  </table>
+                </div>
+                <h4 class="apane-sub">Locks</h4>
+                <div class="table-wrap">
+                  <table class="data-table">
+                    <thead><tr><th>XID</th><th>Object</th><th>Mode</th><th>Granted</th></tr></thead>
+                    <tbody id="lockBody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- Privileges -->
+              <div class="apane" data-apane="privs">
+                <div class="apane-head"><h3>Users, Roles & Privileges</h3>
+                  <div class="bh-actions">
+                    <select class="select" id="actAsUser"></select>
+                    <button class="btn btn-soft" id="newRole">+ Role</button>
+                    <button class="btn btn-soft" id="newUser">+ User</button>
+                  </div>
+                </div>
+                <div class="priv-shell">
+                  <div class="priv-side">
+                    <h4>Principals</h4>
+                    <ul class="sb-list" id="userList"></ul>
+                  </div>
+                  <div class="priv-main">
+                    <h4>Grants for <span id="privSubj">—</span></h4>
+                    <div class="table-wrap">
+                      <table class="data-table">
+                        <thead><tr><th>Object</th><th>SELECT</th><th>INSERT</th><th>UPDATE</th><th>DELETE</th><th>EXEC</th><th>ALL</th></tr></thead>
+                        <tbody id="grantBody"></tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- INFORMATION_SCHEMA -->
+              <div class="apane" data-apane="info">
+                <div class="apane-head"><h3>information_schema</h3>
+                  <div class="bh-actions">
+                    <select class="select" id="infoSelect"></select>
+                  </div>
+                </div>
+                <div class="table-wrap">
+                  <table class="data-table"><thead id="infoHead"></thead><tbody id="infoBody"></tbody></table>
+                </div>
+              </div>
+
+              <!-- Doc playground -->
+              <div class="apane" data-apane="doc">
+                <div class="apane-head"><h3>JSON / XML Playground</h3>
+                  <div class="bh-actions">
+                    <select class="select" id="docMode">
+                      <option value="xpath">XPath</option>
+                      <option value="xquery">XQuery</option>
+                      <option value="graphql">GraphQL</option>
+                      <option value="jsonpath">JSONPath</option>
+                    </select>
+                    <button class="btn btn-primary" id="docRun">Evaluate</button>
+                  </div>
+                </div>
+                <div class="doc-split">
+                  <textarea class="code-editor" id="docSrc" spellcheck="false"></textarea>
+                  <textarea class="code-editor" id="docExpr" spellcheck="false"></textarea>
+                </div>
+                <pre class="log" id="docOut">— output —</pre>
+              </div>
+
+              <!-- Backup / restore -->
+              <div class="apane" data-apane="backup">
+                <div class="apane-head"><h3>Backup & Restore</h3></div>
+                <div class="card-grid">
+                  <div class="big-card">
+                    <h4>Backup</h4>
+                    <p>Snapshot the current database to a `.tdb` archive.</p>
+                    <label>Destination<input id="bkPath" type="text" value="/Users/rick/Backups/tdb_local-2026-05-28.tdb"></label>
+                    <label class="check"><input type="checkbox" id="bkCompress" checked> zstd compression</label>
+                    <label class="check"><input type="checkbox" id="bkEncrypt"> AES-256-GCM encrypted</label>
+                    <button class="btn btn-primary" id="bkRun">Run Backup</button>
+                  </div>
+                  <div class="big-card">
+                    <h4>Restore</h4>
+                    <p>Restore from a `.tdb` file (creates a new database).</p>
+                    <label>Source<input id="rsPath" type="text" placeholder="/path/to/backup.tdb"></label>
+                    <label>Target name<input id="rsName" type="text" placeholder="tdb_restore"></label>
+                    <button class="btn btn-soft" id="rsRun">Restore</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Schema compare -->
+              <div class="apane" data-apane="diag">
+                <div class="apane-head"><h3>Schema Compare</h3>
+                  <div class="bh-actions">
+                    <select class="select" id="cmpA"></select>
+                    <span>↔</span>
+                    <select class="select" id="cmpB"></select>
+                    <button class="btn btn-primary" id="cmpRun">Compare</button>
+                    <button class="btn btn-soft" id="cmpMigrate">Generate Migration</button>
+                  </div>
+                </div>
+                <div class="table-wrap">
+                  <table class="data-table">
+                    <thead><tr><th>Object</th><th>Status</th><th>Detail</th></tr></thead>
+                    <tbody id="cmpBody"></tbody>
+                  </table>
+                </div>
+                <pre class="log" id="cmpMig" hidden>-- generated migration --</pre>
+              </div>
+
+              <!-- PL/SQL Debugger -->
+              <div class="apane" data-apane="dbg">
+                <div class="apane-head"><h3>PL/SQL Debugger</h3>
+                  <div class="bh-actions">
+                    <select class="select" id="dbgProc"></select>
+                    <button class="btn btn-soft" id="dbgStart">Start</button>
+                    <button class="btn btn-soft" id="dbgStep">Step</button>
+                    <button class="btn btn-soft" id="dbgCont">Continue</button>
+                    <button class="btn btn-soft" id="dbgStop">Stop</button>
+                  </div>
+                </div>
+                <div class="dbg-shell">
+                  <div class="dbg-code" id="dbgCode"></div>
+                  <div class="dbg-side">
+                    <h4>Variables</h4>
+                    <div class="table-wrap"><table class="data-table"><thead><tr><th>Name</th><th>Type</th><th>Value</th></tr></thead><tbody id="dbgVars"></tbody></table></div>
+                    <h4>Call stack</h4>
+                    <ul class="dbg-stack" id="dbgStack"></ul>
+                    <h4>Breakpoints</h4>
+                    <ul class="dbg-bps" id="dbgBps"></ul>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Settings -->
+              <div class="apane" data-apane="settings">
+                <div class="apane-head"><h3>Settings</h3></div>
+                <div class="settings">
+                  <div class="setting"><div class="lbl"><div>Theme</div><div class="sub">Override the system appearance.</div></div>
+                    <select id="setTheme"><option value="auto">Auto (system)</option><option value="light">Light</option><option value="dark">Dark</option></select>
+                  </div>
+                  <div class="setting"><div class="lbl"><div>Accent</div><div class="sub">Accent color used across the app.</div></div>
+                    <input type="color" id="setAccent" value="#0a84ff">
+                  </div>
+                  <div class="setting"><div class="lbl"><div>Editor font size</div><div class="sub">Affects SQL editor and code blocks.</div></div>
+                    <input type="range" id="setFont" min="11" max="18" value="12">
+                  </div>
+                  <div class="setting"><div class="lbl"><div>Query timeout</div><div class="sub">Cancel queries running longer than this.</div></div>
+                    <input type="number" id="setTimeout" value="30" min="1" max="600"> seconds
+                  </div>
+                  <div class="setting"><div class="lbl"><div>Row page size</div><div class="sub">Rows per page in Browse view.</div></div>
+                    <input type="number" id="setPageSize" value="50" min="10" max="500">
+                  </div>
+                  <div class="setting"><div class="lbl"><div>Confirm destructive SQL</div><div class="sub">Warn before running DROP / DELETE without WHERE.</div></div>
+                    <label class="switch"><input type="checkbox" id="setConfirmDDL" checked><span></span></label>
+                  </div>
+                  <div class="setting"><div class="lbl"><div>Persist state</div><div class="sub">Save tabs, history, layout to localStorage.</div></div>
+                    <label class="switch"><input type="checkbox" id="setPersist" checked><span></span></label>
+                  </div>
+                  <div class="setting"><div class="lbl"><div>SSH tunnel (per connection)</div><div class="sub">Configured in the New Connection sheet.</div></div>
+                    <button class="btn btn-soft" id="setNewConn">Open…</button>
+                  </div>
+                  <div class="setting"><div class="lbl"><div>Reset state</div><div class="sub">Clear all stored preferences and history.</div></div>
+                    <button class="btn btn-soft danger" id="setReset">Reset</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Status bar -->
+    <footer class="statusbar">
+      <span class="sb-dot ok"></span>
+      <span id="sbConn">tdb_local · /Users/rick/Library/TDB/local.tdb</span>
+      <span class="sb-sep">·</span>
+      <span id="sbTable">customers</span>
+      <span class="sb-spacer"></span>
+      <span id="sbTxn">txn: idle</span>
+      <span class="sb-sep">·</span>
+      <span id="sbSel">— rows · — columns</span>
+      <span class="sb-sep">·</span>
+      <span id="sbLatency">— ms</span>
+    </footer>
+  </div>
+
+  <!-- Connection sheet -->
+  <div class="sheet-scrim" id="sheetScrim" hidden>
+    <div class="sheet" role="dialog" aria-modal="true">
+      <div class="sheet-head"><h3>New Connection</h3><button class="tb-icon" id="closeSheet">✕</button></div>
+      <div class="sheet-body">
+        <label>Name<input type="text" id="connName" placeholder="My TDB" /></label>
+        <label>Path<input type="text" id="connPath" placeholder="/path/to/db.tdb" /></label>
+        <div class="row2">
+          <label>Mode<select id="connMode"><option>Read/Write</option><option>Read-only</option><option>In-memory</option></select></label>
+          <label>User<input type="text" id="connUser" placeholder="(superuser)" /></label>
+        </div>
+        <div class="row2">
+          <label>Environment<select id="connEnv"><option value="dev">dev</option><option value="staging">staging</option><option value="prod">prod</option></select></label>
+          <label>Group<input type="text" id="connGroup" placeholder="default" /></label>
+        </div>
+        <label class="check"><input type="checkbox" id="connEnc" /> Encrypted (AES-256-GCM)</label>
+        <div class="sub-fieldset">
+          <h4>SSH Tunnel</h4>
+          <label class="check"><input type="checkbox" id="sshOn" /> Use SSH tunnel</label>
+          <div class="row2">
+            <label>Host<input type="text" id="sshHost" placeholder="bastion.example.com" /></label>
+            <label>Port<input type="text" id="sshPort" placeholder="22" /></label>
+          </div>
+          <div class="row2">
+            <label>User<input type="text" id="sshUser" placeholder="ec2-user" /></label>
+            <label>Key file<input type="text" id="sshKey" placeholder="~/.ssh/id_ed25519" /></label>
+          </div>
+        </div>
+      </div>
+      <div class="sheet-foot">
+        <button class="btn btn-soft" id="cancelSheet">Cancel</button>
+        <button class="btn btn-primary" id="createConn">Connect</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- CREATE TABLE wizard -->
+  <div class="sheet-scrim" id="wizScrim" hidden>
+    <div class="sheet sheet-wide" role="dialog">
+      <div class="sheet-head"><h3>New Table</h3><button class="tb-icon" id="wizClose">✕</button></div>
+      <div class="sheet-body">
+        <div class="row2">
+          <label>Name<input type="text" id="wizName" placeholder="my_table"></label>
+          <label>Tablespace<select id="wizTs"></select></label>
+        </div>
+        <div class="row3">
+          <label class="check"><input type="checkbox" id="wizColumnar"> Columnar</label>
+          <label class="check"><input type="checkbox" id="wizEnc"> Encrypted</label>
+          <label>Partition by<select id="wizPart"><option value="">— none —</option><option>RANGE</option><option>LIST</option><option>HASH</option></select></label>
+        </div>
+        <h4>Columns</h4>
+        <table class="data-table wiz-cols" id="wizCols">
+          <thead><tr><th>Name</th><th>Type</th><th>Null</th><th>Default</th><th>Key</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <button class="btn btn-soft" id="wizAddCol">+ Column</button>
+        <h4>Preview</h4>
+        <pre class="log" id="wizSql">-- SQL preview --</pre>
+      </div>
+      <div class="sheet-foot">
+        <button class="btn btn-soft" id="wizCancel">Cancel</button>
+        <button class="btn btn-primary" id="wizCreate">Create Table</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Import sheet -->
+  <div class="sheet-scrim" id="impScrim" hidden>
+    <div class="sheet sheet-wide" role="dialog">
+      <div class="sheet-head"><h3>Import</h3><button class="tb-icon" id="impClose">✕</button></div>
+      <div class="sheet-body">
+        <div class="row2">
+          <label>Format<select id="impFormat"><option>CSV</option><option>JSON</option><option>SQL</option></select></label>
+          <label>Target<select id="impTarget"></select></label>
+        </div>
+        <label>Paste data<textarea class="code-editor" id="impData" rows="10"></textarea></label>
+        <h4>Column mapping</h4>
+        <div class="map-grid" id="impMap">Pick a target table to map columns.</div>
+      </div>
+      <div class="sheet-foot">
+        <button class="btn btn-soft" id="impCancel">Cancel</button>
+        <button class="btn btn-primary" id="impRun">Import</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export sheet -->
+  <div class="sheet-scrim" id="expScrim" hidden>
+    <div class="sheet" role="dialog">
+      <div class="sheet-head"><h3>Export</h3><button class="tb-icon" id="expClose">✕</button></div>
+      <div class="sheet-body">
+        <div class="row2">
+          <label>Format<select id="expFormat"><option>CSV</option><option>JSON</option><option>SQL INSERT</option><option>Markdown</option></select></label>
+          <label>Scope<select id="expScope"><option>Current page</option><option>Filtered</option><option>All rows</option></select></label>
+        </div>
+        <label class="check"><input type="checkbox" id="expHeader" checked> Include header</label>
+        <pre class="log" id="expPreview">— preview —</pre>
+      </div>
+      <div class="sheet-foot">
+        <button class="btn btn-soft" id="expCancel">Cancel</button>
+        <button class="btn btn-primary" id="expCopy">Copy to clipboard</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Cell expand modal -->
+  <div class="sheet-scrim" id="cellScrim" hidden>
+    <div class="sheet sheet-wide" role="dialog">
+      <div class="sheet-head"><h3 id="cellTitle">Cell</h3><button class="tb-icon" id="cellClose">✕</button></div>
+      <div class="sheet-body">
+        <pre class="log" id="cellBody"></pre>
+      </div>
+      <div class="sheet-foot">
+        <button class="btn btn-soft" id="cellCopy">Copy</button>
+        <button class="btn btn-primary" id="cellOk">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Confirm sheet -->
+  <div class="sheet-scrim" id="confirmScrim" hidden>
+    <div class="sheet" role="dialog">
+      <div class="sheet-head"><h3 id="cfTitle">Confirm</h3></div>
+      <div class="sheet-body"><p id="cfBody"></p></div>
+      <div class="sheet-foot">
+        <button class="btn btn-soft" id="cfCancel">Cancel</button>
+        <button class="btn btn-primary danger" id="cfOk">Continue</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Command palette -->
+  <div class="palette-scrim" id="paletteScrim" hidden>
+    <div class="palette">
+      <div class="pal-input">
+        <svg viewBox="0 0 16 16" width="13" height="13"><path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1ZM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0Z"/></svg>
+          <input type="text" id="palInput" placeholder="Type a command or jump to anything…" />
+        <kbd>esc</kbd>
+      </div>
+      <ul class="pal-list" id="palList"></ul>
+    </div>
+  </div>
+
+  <!-- Toast layer -->
+  <div class="toast-layer" id="toastLayer"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

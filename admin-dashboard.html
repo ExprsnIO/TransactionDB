@@ -1,0 +1,1014 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>TDB Admin Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script>
+  // Set theme before render to avoid a flash of the wrong palette
+  (function() {
+    try {
+      var saved = localStorage.getItem('tdb-theme');
+      var prefersLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+      var mode = saved || (prefersLight ? 'light' : 'dark');
+      document.documentElement.classList.toggle('light', mode === 'light');
+    } catch(e) {}
+  })();
+</script>
+<style>
+  html,body,#root { height:100%; }
+  body { background:#0b1020; color:#e5e7eb; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; transition: background-color .2s, color .2s; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  .scroll-thin::-webkit-scrollbar { width:8px; height:8px; }
+  .scroll-thin::-webkit-scrollbar-thumb { background:#1f2937; border-radius:4px; }
+  .scroll-thin::-webkit-scrollbar-track { background:transparent; }
+  .glass { background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01)); border:1px solid rgba(255,255,255,0.06); }
+  .chip { font-size:11px; padding:1px 8px; border-radius:9999px; }
+  .btn { padding:6px 12px; border-radius:6px; font-size:13px; font-weight:500; transition:all .15s; }
+  .btn-primary { background:#4f46e5; color:white; }
+  .btn-primary:hover { background:#4338ca; }
+  .btn-ghost { background:transparent; color:#cbd5e1; border:1px solid rgba(255,255,255,0.08); }
+  .btn-ghost:hover { background:rgba(255,255,255,0.04); }
+  .btn-danger { background:#7f1d1d; color:#fecaca; }
+  .btn-danger:hover { background:#991b1b; }
+  input,select,textarea { background:#0f172a; border:1px solid rgba(255,255,255,0.08); color:#e5e7eb; border-radius:6px; padding:6px 8px; font-size:13px; outline:none; }
+  input:focus,select:focus,textarea:focus { border-color:#6366f1; }
+  table.adm { width:100%; border-collapse:collapse; font-size:13px; }
+  table.adm th { text-align:left; font-weight:500; color:#94a3b8; padding:8px 10px; border-bottom:1px solid rgba(255,255,255,0.06); background:rgba(255,255,255,0.02); }
+  table.adm td { padding:8px 10px; border-bottom:1px solid rgba(255,255,255,0.04); vertical-align:middle; }
+  table.adm tr:hover td { background:rgba(99,102,241,0.04); }
+  .kbd { font-family: ui-monospace, monospace; font-size:11px; background:#0f172a; padding:1px 5px; border-radius:3px; border:1px solid rgba(255,255,255,0.08); }
+
+  /* ------------------------ LIGHT THEME OVERRIDES ------------------------ */
+  html.light body { background:#f5f7fb; color:#0f172a; }
+  html.light .scroll-thin::-webkit-scrollbar-thumb { background:#cbd5e1; }
+  html.light .glass { background:#ffffff; border-color:rgba(15,23,42,0.08); box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
+  html.light .btn-ghost { color:#334155; border-color:rgba(15,23,42,0.12); }
+  html.light .btn-ghost:hover { background:rgba(15,23,42,0.04); }
+  html.light .btn-danger { background:#fee2e2; color:#991b1b; }
+  html.light .btn-danger:hover { background:#fecaca; }
+  html.light input, html.light select, html.light textarea { background:#ffffff; border-color:rgba(15,23,42,0.12); color:#0f172a; }
+  html.light input:focus, html.light select:focus, html.light textarea:focus { border-color:#6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,0.15); }
+  html.light table.adm th { color:#475569; background:#f8fafc; border-bottom-color:rgba(15,23,42,0.08); }
+  html.light table.adm td { border-bottom-color:rgba(15,23,42,0.05); color:#0f172a; }
+  html.light table.adm tr:hover td { background:rgba(99,102,241,0.06); }
+  html.light .kbd { background:#f1f5f9; border-color:rgba(15,23,42,0.1); color:#0f172a; }
+
+  /* Tailwind utility overrides for light mode */
+  html.light .bg-slate-950\/40 { background:#ffffff !important; }
+  html.light .bg-slate-900\/50 { background:#f8fafc !important; }
+  html.light .text-slate-100 { color:#0f172a !important; }
+  html.light .text-slate-200 { color:#1e293b !important; }
+  html.light .text-slate-300 { color:#334155 !important; }
+  html.light .text-slate-400 { color:#64748b !important; }
+  html.light .text-slate-500 { color:#94a3b8 !important; }
+  html.light .text-slate-600 { color:#cbd5e1 !important; }
+  html.light .border-white\/5 { border-color:rgba(15,23,42,0.08) !important; }
+  html.light .border-white\/10 { border-color:rgba(15,23,42,0.12) !important; }
+  html.light .hover\:bg-white\/5:hover { background:rgba(15,23,42,0.04) !important; }
+  html.light .bg-white\/5 { background:rgba(15,23,42,0.04) !important; }
+  html.light .text-indigo-200 { color:#4338ca !important; }
+  html.light .bg-indigo-600\/30 { background:#e0e7ff !important; color:#3730a3 !important; }
+
+  /* Chip palette in light mode */
+  html.light .chip.bg-slate-700\/40 { background:#e2e8f0 !important; color:#334155 !important; }
+  html.light .chip.bg-indigo-600\/30 { background:#e0e7ff !important; color:#3730a3 !important; }
+  html.light .chip.bg-emerald-600\/30 { background:#d1fae5 !important; color:#065f46 !important; }
+  html.light .chip.bg-amber-600\/30 { background:#fef3c7 !important; color:#92400e !important; }
+  html.light .chip.bg-rose-600\/30 { background:#ffe4e6 !important; color:#9f1239 !important; }
+  html.light .chip.bg-sky-600\/30 { background:#e0f2fe !important; color:#075985 !important; }
+  html.light .chip.bg-fuchsia-600\/30 { background:#fae8ff !important; color:#86198f !important; }
+
+  /* Misc */
+  html.light .bg-black\/60 { background:rgba(15,23,42,0.4) !important; }
+  html.light pre.glass { background:#ffffff !important; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useEffect, useRef } = React;
+
+// ---- Sample TDB catalog -------------------------------------------------
+const TDB_TYPES = [
+  "INT64","INT32","INT16","FLOAT64","FLOAT32","DECIMAL(p,s)",
+  "VARCHAR(n)","TEXT","CHAR(n)","BOOL","DATE","TIMESTAMP","TIMESTAMPTZ",
+  "BLOB","UUID","JSON","XML","GEOMETRY","ARRAY","COMPOSITE","INTERVAL"
+];
+const INDEX_TYPES = ["BTREE","BPTREE","HASH","RTREE","RPTREE"];
+const PART_STRATS = ["NONE","RANGE","LIST","HASH"];
+const STORAGE_MODES = ["ROW","COLUMNAR"];
+const COMPRESSION = ["NONE","LZ4","ZSTD"];
+const ENCRYPTION = ["NONE","AES-256-GCM"];
+
+const seedCatalog = () => ({
+  schemas: ["public","analytics","audit"],
+  tables: [
+    {
+      id: "t_customers", schema:"public", name:"customers", rows: 184213,
+      storage:"ROW", compression:"LZ4", encryption:"NONE",
+      partition:{ strategy:"HASH", key:"customer_id", buckets:16, ranges:[] },
+      columns:[
+        { name:"customer_id", type:"INT64", nullable:false, default:"nextval('customers_seq')", pk:true, identity:true, computed:null, comment:"Surrogate key" },
+        { name:"email", type:"VARCHAR(320)", nullable:false, default:null, pk:false, unique:true, comment:"Lowercased on insert" },
+        { name:"full_name", type:"VARCHAR(200)", nullable:true, default:null, pk:false, comment:"" },
+        { name:"created_at", type:"TIMESTAMPTZ", nullable:false, default:"NOW()", pk:false, comment:"" },
+        { name:"status", type:"VARCHAR(16)", nullable:false, default:"'active'", pk:false, check:"status IN ('active','paused','closed')" },
+        { name:"lifetime_value", type:"DECIMAL(14,2)", nullable:false, default:"0", pk:false },
+        { name:"display_name", type:"VARCHAR(220)", nullable:true, default:null, pk:false, computed:"COALESCE(full_name, SPLIT_PART(email,'@',1))", stored:true },
+      ],
+      indexes:[
+        { name:"pk_customers", type:"BPTREE", cols:["customer_id"], unique:true, primary:true, where:null, include:[] },
+        { name:"ux_customers_email", type:"BPTREE", cols:["LOWER(email)"], unique:true, primary:false, where:null, include:["customer_id"] },
+        { name:"ix_customers_created", type:"BPTREE", cols:["created_at DESC"], unique:false, primary:false, where:"status = 'active'", include:[] },
+        { name:"hx_customers_status", type:"HASH", cols:["status"], unique:false, primary:false, where:null, include:[] },
+      ],
+      constraints:[
+        { kind:"PRIMARY KEY", name:"pk_customers", expr:"(customer_id)" },
+        { kind:"UNIQUE", name:"ux_customers_email", expr:"(email)" },
+        { kind:"CHECK", name:"ck_customers_status", expr:"status IN ('active','paused','closed')" },
+        { kind:"CHECK", name:"ck_customers_ltv", expr:"lifetime_value >= 0" },
+      ],
+    },
+    {
+      id: "t_orders", schema:"public", name:"orders", rows: 2401887,
+      storage:"ROW", compression:"ZSTD", encryption:"NONE",
+      partition:{ strategy:"RANGE", key:"order_date", buckets:0, ranges:[
+        { name:"orders_2024", from:"2024-01-01", to:"2025-01-01" },
+        { name:"orders_2025", from:"2025-01-01", to:"2026-01-01" },
+        { name:"orders_2026", from:"2026-01-01", to:"2027-01-01" },
+      ]},
+      columns:[
+        { name:"order_id", type:"UUID", nullable:false, default:"gen_random_uuid()", pk:true },
+        { name:"customer_id", type:"INT64", nullable:false, default:null, fk:{ table:"customers", col:"customer_id", onDelete:"RESTRICT", onUpdate:"CASCADE" } },
+        { name:"order_date", type:"DATE", nullable:false, default:"CURRENT_DATE", pk:true },
+        { name:"total_cents", type:"INT64", nullable:false, default:"0" },
+        { name:"currency", type:"CHAR(3)", nullable:false, default:"'USD'" },
+        { name:"tax_cents", type:"INT64", nullable:false, default:"0" },
+        { name:"grand_total_cents", type:"INT64", nullable:false, default:null, computed:"total_cents + tax_cents", stored:true },
+        { name:"metadata", type:"JSON", nullable:true, default:"'{}'" },
+      ],
+      indexes:[
+        { name:"pk_orders", type:"BPTREE", cols:["order_id","order_date"], unique:true, primary:true },
+        { name:"ix_orders_customer", type:"BPTREE", cols:["customer_id","order_date DESC"], unique:false, primary:false },
+        { name:"ix_orders_total", type:"BPTREE", cols:["grand_total_cents"], unique:false, primary:false, where:"grand_total_cents > 10000" },
+      ],
+      constraints:[
+        { kind:"PRIMARY KEY", name:"pk_orders", expr:"(order_id, order_date)" },
+        { kind:"FOREIGN KEY", name:"fk_orders_customer", expr:"(customer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT" },
+        { kind:"CHECK", name:"ck_orders_total", expr:"total_cents >= 0" },
+        { kind:"CHECK", name:"ck_orders_currency", expr:"currency IN ('USD','EUR','GBP','JPY')" },
+      ],
+    },
+    {
+      id:"t_events", schema:"analytics", name:"events", rows: 41200344,
+      storage:"COLUMNAR", compression:"ZSTD", encryption:"NONE",
+      partition:{ strategy:"RANGE", key:"event_ts", buckets:0, ranges:[
+        { name:"events_2026_q1", from:"2026-01-01", to:"2026-04-01" },
+        { name:"events_2026_q2", from:"2026-04-01", to:"2026-07-01" },
+      ]},
+      columns:[
+        { name:"event_id", type:"INT64", nullable:false, default:"nextval('event_seq')", pk:true, identity:true },
+        { name:"event_ts", type:"TIMESTAMPTZ", nullable:false, default:"NOW()", pk:true },
+        { name:"user_id", type:"INT64", nullable:true, default:null },
+        { name:"event_name", type:"VARCHAR(80)", nullable:false, default:null },
+        { name:"props", type:"JSON", nullable:true, default:"'{}'" },
+        { name:"geo", type:"GEOMETRY", nullable:true, default:null },
+      ],
+      indexes:[
+        { name:"pk_events", type:"BPTREE", cols:["event_id","event_ts"], unique:true, primary:true },
+        { name:"ix_events_name", type:"HASH", cols:["event_name"], unique:false, primary:false },
+        { name:"gx_events_geo", type:"RTREE", cols:["geo"], unique:false, primary:false },
+      ],
+      constraints:[
+        { kind:"PRIMARY KEY", name:"pk_events", expr:"(event_id, event_ts)" },
+      ],
+    },
+    {
+      id:"t_secrets", schema:"audit", name:"secrets", rows: 12,
+      storage:"ROW", compression:"NONE", encryption:"AES-256-GCM",
+      partition:{ strategy:"NONE", key:null, buckets:0, ranges:[] },
+      columns:[
+        { name:"secret_id", type:"UUID", nullable:false, default:"gen_random_uuid()", pk:true },
+        { name:"name", type:"VARCHAR(128)", nullable:false },
+        { name:"payload", type:"BLOB", nullable:false },
+        { name:"rotated_at", type:"TIMESTAMPTZ", nullable:false, default:"NOW()" },
+      ],
+      indexes:[
+        { name:"pk_secrets", type:"BPTREE", cols:["secret_id"], unique:true, primary:true },
+        { name:"ux_secrets_name", type:"BPTREE", cols:["name"], unique:true, primary:false },
+      ],
+      constraints:[
+        { kind:"PRIMARY KEY", name:"pk_secrets", expr:"(secret_id)" },
+        { kind:"UNIQUE", name:"ux_secrets_name", expr:"(name)" },
+      ],
+    },
+  ],
+});
+
+// ---- Sample rows for the data preview tab -------------------------------
+const SAMPLE_ROWS = {
+  t_customers: [
+    [1042,"ada@example.com","Ada Lovelace","2025-11-04 09:12:00+00","active",4218.50,"Ada Lovelace"],
+    [1043,"alan@example.com","Alan Turing","2025-12-01 14:23:11+00","active",812.00,"Alan Turing"],
+    [1044,"grace@example.com","Grace Hopper","2026-01-18 03:04:55+00","paused",0.00,"Grace Hopper"],
+    [1045,"edgar@example.com",null,"2026-02-20 22:00:00+00","active",94.20,"edgar"],
+    [1046,"linus@example.com","Linus Torvalds","2026-03-09 11:42:08+00","closed",17402.99,"Linus Torvalds"],
+  ],
+  t_orders: [
+    ["a1f0-...","1042","2026-05-20",4900,"USD",441,5341,"{\"ref\":\"web\"}"],
+    ["a1f1-...","1043","2026-05-21",1299,"USD",116,1415,"{\"ref\":\"mob\"}"],
+    ["a1f2-...","1046","2026-05-21",98000,"USD",8820,106820,"{\"vip\":true}"],
+  ],
+  t_events: [
+    [9001,"2026-05-28 06:14:09+00",1042,"page_view","{\"path\":\"/\"}", "POINT(-122.4 37.8)"],
+    [9002,"2026-05-28 06:14:12+00",1042,"click","{\"id\":\"cta\"}", null],
+    [9003,"2026-05-28 06:15:00+00",null,"signup","{\"src\":\"ad\"}", "POINT(-73.9 40.7)"],
+  ],
+  t_secrets: [
+    ["sec-1","stripe_api_key","<encrypted 248B>","2026-04-01 00:00:00+00"],
+    ["sec-2","sendgrid_key","<encrypted 232B>","2026-04-01 00:00:00+00"],
+  ],
+};
+
+// ---- Helpers ------------------------------------------------------------
+const fmtRows = n => n.toLocaleString();
+const cls = (...xs) => xs.filter(Boolean).join(" ");
+
+function Chip({ children, color="slate" }) {
+  const colors = {
+    slate:"bg-slate-700/40 text-slate-300",
+    indigo:"bg-indigo-600/30 text-indigo-200",
+    emerald:"bg-emerald-600/30 text-emerald-200",
+    amber:"bg-amber-600/30 text-amber-200",
+    rose:"bg-rose-600/30 text-rose-200",
+    sky:"bg-sky-600/30 text-sky-200",
+    fuchsia:"bg-fuchsia-600/30 text-fuchsia-200",
+  };
+  return <span className={cls("chip", colors[color] || colors.slate)}>{children}</span>;
+}
+
+function Modal({ open, onClose, title, children, footer, wide }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
+      <div className={cls("glass rounded-lg shadow-2xl", wide ? "w-[860px]" : "w-[560px]", "max-h-[85vh] flex flex-col")} onClick={e=>e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-3 border-b border-white/5">
+          <h3 className="font-medium text-slate-100">{title}</h3>
+          <button className="text-slate-400 hover:text-slate-100" onClick={onClose}>✕</button>
+        </div>
+        <div className="px-5 py-4 overflow-auto scroll-thin">{children}</div>
+        {footer && <div className="px-5 py-3 border-t border-white/5 flex justify-end gap-2">{footer}</div>}
+      </div>
+    </div>
+  );
+}
+
+function SectionHeader({ title, subtitle, right }) {
+  return (
+    <div className="flex items-end justify-between mb-3">
+      <div>
+        <h2 className="text-lg font-semibold text-slate-100">{title}</h2>
+        {subtitle && <p className="text-sm text-slate-400 mt-0.5">{subtitle}</p>}
+      </div>
+      <div className="flex gap-2">{right}</div>
+    </div>
+  );
+}
+
+// ---- Columns panel ------------------------------------------------------
+function ColumnsPanel({ table, onUpdate }) {
+  const [editing, setEditing] = useState(null);
+  const addColumn = () => setEditing({ name:"", type:"VARCHAR(255)", nullable:true, default:null, pk:false, _new:true });
+  const save = (col) => {
+    const cols = [...table.columns];
+    if (col._new) { delete col._new; cols.push(col); }
+    else { const i = cols.findIndex(c=>c.name===editing._origName); cols[i] = col; }
+    onUpdate({ ...table, columns: cols });
+    setEditing(null);
+  };
+  const remove = (name) => onUpdate({ ...table, columns: table.columns.filter(c=>c.name!==name) });
+  return (
+    <div>
+      <SectionHeader title="Columns" subtitle={`${table.columns.length} columns · storage mode: ${table.storage}`}
+        right={<button className="btn btn-primary" onClick={addColumn}>+ Add column</button>} />
+      <div className="glass rounded-lg overflow-hidden">
+        <table className="adm">
+          <thead><tr>
+            <th>Name</th><th>Type</th><th>Nullable</th><th>Default</th><th>Flags</th><th></th>
+          </tr></thead>
+          <tbody>
+          {table.columns.map(c => (
+            <tr key={c.name}>
+              <td className="mono font-medium text-slate-100">{c.name}</td>
+              <td className="mono text-indigo-200">{c.type}</td>
+              <td>{c.nullable ? <Chip>YES</Chip> : <Chip color="rose">NOT NULL</Chip>}</td>
+              <td className="mono text-slate-300">{c.default || <span className="text-slate-500">—</span>}</td>
+              <td>
+                <div className="flex flex-wrap gap-1">
+                  {c.pk && <Chip color="amber">PK</Chip>}
+                  {c.unique && <Chip color="sky">UNIQUE</Chip>}
+                  {c.identity && <Chip color="indigo">IDENTITY</Chip>}
+                  {c.computed && <Chip color="fuchsia">{c.stored ? "STORED" : "VIRTUAL"}</Chip>}
+                  {c.fk && <Chip color="emerald">FK → {c.fk.table}.{c.fk.col}</Chip>}
+                  {c.check && <Chip color="rose" >CHECK</Chip>}
+                </div>
+              </td>
+              <td className="text-right">
+                <button className="btn btn-ghost mr-1" onClick={()=>setEditing({ ...c, _origName:c.name })}>Edit</button>
+                <button className="btn btn-danger" onClick={()=>remove(c.name)}>Drop</button>
+              </td>
+            </tr>
+          ))}
+          </tbody>
+        </table>
+      </div>
+      <ColumnEditor editing={editing} onCancel={()=>setEditing(null)} onSave={save} tables={["customers","orders","events"]} />
+    </div>
+  );
+}
+
+function ColumnEditor({ editing, onCancel, onSave, tables }) {
+  const [draft, setDraft] = useState(editing);
+  useEffect(()=>setDraft(editing), [editing]);
+  if (!draft) return null;
+  const set = (k,v) => setDraft({ ...draft, [k]:v });
+  const setFK = (k,v) => setDraft({ ...draft, fk:{ ...(draft.fk||{table:"",col:"",onDelete:"NO ACTION",onUpdate:"NO ACTION"}), [k]:v } });
+  return (
+    <Modal open={!!draft} onClose={onCancel} wide
+      title={draft._new ? "Add column" : `Edit column · ${draft._origName}`}
+      footer={<>
+        <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
+        <button className="btn btn-primary" onClick={()=>onSave(draft)}>Save</button>
+      </>}>
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Name"><input value={draft.name} onChange={e=>set("name", e.target.value)} className="w-full mono" /></Field>
+        <Field label="Type">
+          <select value={draft.type.split("(")[0].split(" ")[0] in {} ? draft.type : draft.type} onChange={e=>set("type", e.target.value)} className="w-full mono">
+            {TDB_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
+          </select>
+        </Field>
+        <Field label="Nullable">
+          <select value={draft.nullable ? "yes":"no"} onChange={e=>set("nullable", e.target.value==="yes")} className="w-full">
+            <option value="yes">YES — allow NULL</option>
+            <option value="no">NO — NOT NULL</option>
+          </select>
+        </Field>
+        <Field label="Default expression"><input value={draft.default||""} onChange={e=>set("default", e.target.value||null)} className="w-full mono" placeholder="e.g. NOW(), 0, 'active'" /></Field>
+        <Field label="Comment" full><input value={draft.comment||""} onChange={e=>set("comment", e.target.value)} className="w-full" /></Field>
+
+        <div className="col-span-2 border-t border-white/5 pt-3">
+          <h4 className="text-sm font-medium text-slate-200 mb-2">Constraints & flags</h4>
+          <div className="grid grid-cols-3 gap-3">
+            <Toggle label="Primary key" value={!!draft.pk} onChange={v=>set("pk",v)} />
+            <Toggle label="Unique" value={!!draft.unique} onChange={v=>set("unique",v)} />
+            <Toggle label="Identity / auto-increment" value={!!draft.identity} onChange={v=>set("identity",v)} />
+          </div>
+          <Field label="CHECK expression" full><input value={draft.check||""} onChange={e=>set("check", e.target.value||null)} className="w-full mono" placeholder="e.g. status IN ('active','paused')" /></Field>
+        </div>
+
+        <div className="col-span-2 border-t border-white/5 pt-3">
+          <h4 className="text-sm font-medium text-slate-200 mb-2">Calculated / generated column</h4>
+          <Field label="Computed expression" full>
+            <textarea value={draft.computed||""} onChange={e=>set("computed", e.target.value||null)} className="w-full mono" rows={2} placeholder="e.g. total_cents + tax_cents" />
+          </Field>
+          {draft.computed && (
+            <div className="flex gap-3 items-center text-sm text-slate-300">
+              <label className="flex items-center gap-2"><input type="radio" checked={!!draft.stored} onChange={()=>set("stored", true)} /> STORED (persisted, indexable)</label>
+              <label className="flex items-center gap-2"><input type="radio" checked={!draft.stored} onChange={()=>set("stored", false)} /> VIRTUAL (computed on read)</label>
+            </div>
+          )}
+        </div>
+
+        <div className="col-span-2 border-t border-white/5 pt-3">
+          <h4 className="text-sm font-medium text-slate-200 mb-2">Foreign key</h4>
+          <div className="grid grid-cols-4 gap-3">
+            <Field label="References table">
+              <select value={draft.fk?.table||""} onChange={e=>setFK("table", e.target.value)} className="w-full">
+                <option value="">— none —</option>
+                {tables.map(t=><option key={t} value={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Column"><input value={draft.fk?.col||""} onChange={e=>setFK("col", e.target.value)} className="w-full mono" /></Field>
+            <Field label="ON DELETE">
+              <select value={draft.fk?.onDelete||"NO ACTION"} onChange={e=>setFK("onDelete", e.target.value)} className="w-full">
+                {["NO ACTION","RESTRICT","CASCADE","SET NULL","SET DEFAULT"].map(o=><option key={o}>{o}</option>)}
+              </select>
+            </Field>
+            <Field label="ON UPDATE">
+              <select value={draft.fk?.onUpdate||"NO ACTION"} onChange={e=>setFK("onUpdate", e.target.value)} className="w-full">
+                {["NO ACTION","RESTRICT","CASCADE","SET NULL","SET DEFAULT"].map(o=><option key={o}>{o}</option>)}
+              </select>
+            </Field>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function Field({ label, children, full }) {
+  return (
+    <label className={cls("block", full && "col-span-2")}>
+      <span className="block text-xs uppercase tracking-wide text-slate-400 mb-1">{label}</span>
+      {children}
+    </label>
+  );
+}
+function Toggle({ label, value, onChange }) {
+  return (
+    <button onClick={()=>onChange(!value)} className={cls("w-full text-left btn", value ? "btn-primary" : "btn-ghost")}>
+      <span className="mr-2">{value ? "✓" : "○"}</span>{label}
+    </button>
+  );
+}
+
+// ---- Indexes panel ------------------------------------------------------
+function IndexesPanel({ table, onUpdate }) {
+  const [editing, setEditing] = useState(null);
+  const colNames = table.columns.map(c=>c.name);
+  const add = () => setEditing({ name:`ix_${table.name}_new`, type:"BPTREE", cols:[colNames[0]||""], unique:false, primary:false, where:"", include:[], _new:true });
+  const save = (idx) => {
+    const arr = [...table.indexes];
+    if (idx._new) { delete idx._new; arr.push(idx); }
+    else { const i = arr.findIndex(x=>x.name===editing._origName); arr[i] = idx; }
+    onUpdate({ ...table, indexes: arr }); setEditing(null);
+  };
+  const remove = (n) => onUpdate({ ...table, indexes: table.indexes.filter(x=>x.name!==n) });
+  return (
+    <div>
+      <SectionHeader title="Indexes" subtitle="B+Tree for ordered range scans · Hash for equality · R-Tree/R+Tree for spatial"
+        right={<button className="btn btn-primary" onClick={add}>+ Create index</button>} />
+      <div className="glass rounded-lg overflow-hidden">
+        <table className="adm">
+          <thead><tr>
+            <th>Name</th><th>Type</th><th>Columns</th><th>Properties</th><th>Predicate</th><th></th>
+          </tr></thead>
+          <tbody>
+            {table.indexes.map(i => (
+              <tr key={i.name}>
+                <td className="mono font-medium text-slate-100">{i.name}</td>
+                <td><Chip color="indigo">{i.type}</Chip></td>
+                <td className="mono text-slate-200">{i.cols.join(", ")}</td>
+                <td>
+                  <div className="flex gap-1">
+                    {i.primary && <Chip color="amber">PRIMARY</Chip>}
+                    {i.unique && <Chip color="sky">UNIQUE</Chip>}
+                    {i.include?.length>0 && <Chip color="slate">INCLUDE {i.include.join(",")}</Chip>}
+                  </div>
+                </td>
+                <td className="mono text-slate-400">{i.where || <span className="text-slate-600">—</span>}</td>
+                <td className="text-right">
+                  <button className="btn btn-ghost mr-1" onClick={()=>setEditing({ ...i, _origName:i.name })}>Edit</button>
+                  <button className="btn btn-danger" disabled={i.primary} onClick={()=>!i.primary && remove(i.name)}>Drop</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <IndexEditor editing={editing} cols={colNames} onCancel={()=>setEditing(null)} onSave={save} />
+    </div>
+  );
+}
+
+function IndexEditor({ editing, cols, onCancel, onSave }) {
+  const [draft, setDraft] = useState(editing);
+  useEffect(()=>setDraft(editing), [editing]);
+  if (!draft) return null;
+  const set = (k,v) => setDraft({ ...draft, [k]:v });
+  return (
+    <Modal open={!!draft} onClose={onCancel} wide
+      title={draft._new ? "Create index" : `Edit index · ${draft._origName}`}
+      footer={<>
+        <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
+        <button className="btn btn-primary" onClick={()=>onSave(draft)}>Save</button>
+      </>}>
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Name"><input value={draft.name} onChange={e=>set("name",e.target.value)} className="w-full mono" /></Field>
+        <Field label="Type">
+          <select value={draft.type} onChange={e=>set("type",e.target.value)} className="w-full">
+            {INDEX_TYPES.map(t=><option key={t}>{t}</option>)}
+          </select>
+        </Field>
+        <Field label="Key columns / expressions" full>
+          <textarea rows={2} value={draft.cols.join(", ")}
+            onChange={e=>set("cols", e.target.value.split(",").map(s=>s.trim()).filter(Boolean))}
+            className="w-full mono" placeholder="e.g. customer_id, created_at DESC, LOWER(email)" />
+          <p className="text-xs text-slate-500 mt-1">Comma-separated. Supports expressions and {`{ASC|DESC}`}. Available: {cols.join(", ")}</p>
+        </Field>
+        <Field label="INCLUDE (covering) columns" full>
+          <input value={(draft.include||[]).join(", ")}
+            onChange={e=>set("include", e.target.value.split(",").map(s=>s.trim()).filter(Boolean))}
+            className="w-full mono" placeholder="non-key payload columns" />
+        </Field>
+        <Field label="Partial-index predicate (WHERE)" full>
+          <input value={draft.where||""} onChange={e=>set("where", e.target.value||null)} className="w-full mono" placeholder="e.g. status = 'active'" />
+        </Field>
+        <Toggle label="Unique" value={!!draft.unique} onChange={v=>set("unique",v)} />
+        <Toggle label="Primary key" value={!!draft.primary} onChange={v=>set("primary",v)} />
+      </div>
+      <div className="mt-4 p-3 rounded bg-slate-900/50 border border-white/5 text-xs text-slate-400 mono whitespace-pre-wrap">
+        {previewIndexDDL(draft)}
+      </div>
+    </Modal>
+  );
+}
+function previewIndexDDL(i) {
+  if (!i) return "";
+  const u = i.unique ? "UNIQUE " : "";
+  const usingMap = { BPTREE:"BPTREE", BTREE:"BTREE", HASH:"HASH", RTREE:"RTREE", RPTREE:"RPTREE" };
+  const include = i.include?.length ? ` INCLUDE (${i.include.join(", ")})` : "";
+  const where = i.where ? `\n  WHERE ${i.where}` : "";
+  return `CREATE ${u}INDEX ${i.name}\n  ON <table> USING ${usingMap[i.type]||"BPTREE"} (${i.cols.join(", ")})${include}${where};`;
+}
+
+// ---- Calculated columns -------------------------------------------------
+function CalculatedPanel({ table, onUpdate }) {
+  const calcs = table.columns.filter(c=>c.computed);
+  return (
+    <div>
+      <SectionHeader title="Calculated / generated columns"
+        subtitle="Expressions evaluated at insert/update (STORED) or query time (VIRTUAL)" />
+      {calcs.length === 0 ? (
+        <div className="glass rounded-lg p-6 text-center text-slate-400">
+          No calculated columns. Add one via the <span className="kbd">Columns</span> tab — set the <span className="kbd">Computed expression</span>.
+        </div>
+      ) : (
+        <div className="glass rounded-lg overflow-hidden">
+          <table className="adm">
+            <thead><tr><th>Column</th><th>Type</th><th>Mode</th><th>Expression</th></tr></thead>
+            <tbody>
+              {calcs.map(c => (
+                <tr key={c.name}>
+                  <td className="mono font-medium">{c.name}</td>
+                  <td className="mono text-indigo-200">{c.type}</td>
+                  <td>{c.stored ? <Chip color="fuchsia">STORED</Chip> : <Chip color="slate">VIRTUAL</Chip>}</td>
+                  <td className="mono text-slate-300">{c.computed}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div className="mt-4 p-4 glass rounded-lg text-sm text-slate-300">
+        <div className="font-medium text-slate-100 mb-2">Tips</div>
+        <ul className="list-disc list-inside space-y-1 text-slate-400">
+          <li><b>STORED</b> columns persist on disk — indexable, faster reads, more write cost.</li>
+          <li><b>VIRTUAL</b> columns are computed at query time — zero storage, recomputed per scan.</li>
+          <li>Expressions may reference other (non-computed) columns and most built-in scalar functions.</li>
+          <li>Updates to source columns cascade automatically to STORED computed columns.</li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+// ---- Constraints --------------------------------------------------------
+function ConstraintsPanel({ table, onUpdate }) {
+  const [draft, setDraft] = useState(null);
+  const add = () => setDraft({ kind:"CHECK", name:`ck_${table.name}_new`, expr:"", _new:true });
+  const save = () => {
+    const arr = [...table.constraints];
+    if (draft._new) { const d = { ...draft }; delete d._new; arr.push(d); }
+    else { const i = arr.findIndex(c=>c.name===draft._origName); arr[i] = draft; }
+    onUpdate({ ...table, constraints: arr }); setDraft(null);
+  };
+  const remove = (n) => onUpdate({ ...table, constraints: table.constraints.filter(c=>c.name!==n) });
+  return (
+    <div>
+      <SectionHeader title="Constraints" subtitle="PRIMARY KEY · FOREIGN KEY · UNIQUE · CHECK · DOMAIN"
+        right={<button className="btn btn-primary" onClick={add}>+ Add constraint</button>} />
+      <div className="glass rounded-lg overflow-hidden">
+        <table className="adm">
+          <thead><tr><th>Kind</th><th>Name</th><th>Expression</th><th></th></tr></thead>
+          <tbody>
+            {table.constraints.map(c => (
+              <tr key={c.name}>
+                <td><Chip color={c.kind==="PRIMARY KEY"?"amber":c.kind==="FOREIGN KEY"?"emerald":c.kind==="UNIQUE"?"sky":"rose"}>{c.kind}</Chip></td>
+                <td className="mono">{c.name}</td>
+                <td className="mono text-slate-300">{c.expr}</td>
+                <td className="text-right">
+                  <button className="btn btn-ghost mr-1" onClick={()=>setDraft({ ...c, _origName:c.name })}>Edit</button>
+                  <button className="btn btn-danger" onClick={()=>remove(c.name)}>Drop</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <Modal open={!!draft} onClose={()=>setDraft(null)} wide
+        title={draft?._new ? "Add constraint" : `Edit constraint · ${draft?._origName}`}
+        footer={<><button className="btn btn-ghost" onClick={()=>setDraft(null)}>Cancel</button>
+                  <button className="btn btn-primary" onClick={save}>Save</button></>}>
+        {draft && (
+          <div className="grid grid-cols-2 gap-4">
+            <Field label="Kind">
+              <select value={draft.kind} onChange={e=>setDraft({ ...draft, kind:e.target.value })} className="w-full">
+                {["PRIMARY KEY","FOREIGN KEY","UNIQUE","CHECK","DOMAIN"].map(k=><option key={k}>{k}</option>)}
+              </select>
+            </Field>
+            <Field label="Name"><input value={draft.name} onChange={e=>setDraft({ ...draft, name:e.target.value })} className="w-full mono" /></Field>
+            <Field label="Expression / definition" full>
+              <textarea rows={3} value={draft.expr} onChange={e=>setDraft({ ...draft, expr:e.target.value })}
+                className="w-full mono" placeholder={draft.kind==="FOREIGN KEY"?"(col) REFERENCES other(col) ON DELETE CASCADE":"(col) or boolean expression"} />
+            </Field>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}
+
+// ---- Partitioning -------------------------------------------------------
+function PartitionPanel({ table, onUpdate }) {
+  const p = table.partition;
+  const set = (k,v) => onUpdate({ ...table, partition:{ ...p, [k]:v } });
+  const addRange = () => set("ranges", [...p.ranges, { name:`${table.name}_p${p.ranges.length+1}`, from:"", to:"" }]);
+  const setRange = (i,k,v) => { const r=[...p.ranges]; r[i]={...r[i],[k]:v}; set("ranges", r); };
+  const delRange = (i) => set("ranges", p.ranges.filter((_,j)=>j!==i));
+  return (
+    <div>
+      <SectionHeader title="Partitioning" subtitle="Split a logical table into physical partitions for pruning and parallelism" />
+      <div className="grid grid-cols-3 gap-4 mb-4">
+        <Field label="Strategy">
+          <select value={p.strategy} onChange={e=>set("strategy", e.target.value)} className="w-full">
+            {PART_STRATS.map(s=><option key={s}>{s}</option>)}
+          </select>
+        </Field>
+        {p.strategy !== "NONE" && (
+          <Field label="Partition key">
+            <select value={p.key||""} onChange={e=>set("key", e.target.value)} className="w-full">
+              <option value="">— select column —</option>
+              {table.columns.map(c=><option key={c.name} value={c.name}>{c.name} ({c.type})</option>)}
+            </select>
+          </Field>
+        )}
+        {p.strategy === "HASH" && (
+          <Field label="Bucket count">
+            <input type="number" min="2" max="1024" value={p.buckets||16} onChange={e=>set("buckets", parseInt(e.target.value)||0)} className="w-full" />
+          </Field>
+        )}
+      </div>
+
+      {p.strategy === "RANGE" && (
+        <div className="glass rounded-lg overflow-hidden">
+          <div className="flex items-center justify-between px-4 py-2 border-b border-white/5">
+            <span className="text-sm text-slate-300">{p.ranges.length} range partitions</span>
+            <button className="btn btn-primary" onClick={addRange}>+ Add partition</button>
+          </div>
+          <table className="adm">
+            <thead><tr><th>Name</th><th>From (inclusive)</th><th>To (exclusive)</th><th></th></tr></thead>
+            <tbody>
+              {p.ranges.map((r,i)=>(
+                <tr key={i}>
+                  <td><input value={r.name} onChange={e=>setRange(i,"name",e.target.value)} className="w-full mono"/></td>
+                  <td><input value={r.from} onChange={e=>setRange(i,"from",e.target.value)} className="w-full mono"/></td>
+                  <td><input value={r.to} onChange={e=>setRange(i,"to",e.target.value)} className="w-full mono"/></td>
+                  <td className="text-right"><button className="btn btn-danger" onClick={()=>delRange(i)}>Drop</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {p.strategy === "HASH" && (
+        <div className="glass rounded-lg p-4 text-sm text-slate-300">
+          Rows distributed across <span className="mono text-indigo-200">{p.buckets}</span> buckets via <span className="mono">hash({p.key||"<key>"}) % {p.buckets}</span>.
+        </div>
+      )}
+
+      {p.strategy === "NONE" && (
+        <div className="glass rounded-lg p-4 text-sm text-slate-400">Table is not partitioned. Pick a strategy to enable partition pruning.</div>
+      )}
+    </div>
+  );
+}
+
+// ---- Storage panel ------------------------------------------------------
+function StoragePanel({ table, onUpdate }) {
+  const set = (k,v) => onUpdate({ ...table, [k]:v });
+  return (
+    <div>
+      <SectionHeader title="Storage options" subtitle="Row vs columnar layout, compression, encryption" />
+      <div className="grid grid-cols-3 gap-4">
+        <Field label="Storage layout">
+          <select value={table.storage} onChange={e=>set("storage",e.target.value)} className="w-full">
+            {STORAGE_MODES.map(s=><option key={s}>{s}</option>)}
+          </select>
+          <p className="text-xs text-slate-500 mt-1">{table.storage==="COLUMNAR" ? "Per-column storage — fast for analytics, slower point reads." : "Per-row storage — good general purpose."}</p>
+        </Field>
+        <Field label="Page compression">
+          <select value={table.compression} onChange={e=>set("compression",e.target.value)} className="w-full">
+            {COMPRESSION.map(c=><option key={c}>{c}</option>)}
+          </select>
+          <p className="text-xs text-slate-500 mt-1">ZSTD requires <span className="mono">TDB_WITH_ZSTD=ON</span>.</p>
+        </Field>
+        <Field label="Encryption at rest">
+          <select value={table.encryption} onChange={e=>set("encryption",e.target.value)} className="w-full">
+            {ENCRYPTION.map(c=><option key={c}>{c}</option>)}
+          </select>
+          <p className="text-xs text-slate-500 mt-1">AES requires <span className="mono">TDB_WITH_OPENSSL=ON</span>. Encrypted tables cannot participate in JOINs.</p>
+        </Field>
+      </div>
+      <div className="mt-6 grid grid-cols-2 gap-4">
+        <StatCard label="Estimated rows" value={fmtRows(table.rows)} />
+        <StatCard label="Storage mode" value={table.storage} subtle={`${table.compression} compression`} />
+      </div>
+    </div>
+  );
+}
+function StatCard({ label, value, subtle }) {
+  return (
+    <div className="glass rounded-lg p-4">
+      <div className="text-xs uppercase tracking-wide text-slate-400">{label}</div>
+      <div className="text-2xl font-semibold text-slate-100 mt-1">{value}</div>
+      {subtle && <div className="text-xs text-slate-500 mt-1">{subtle}</div>}
+    </div>
+  );
+}
+
+// ---- Data preview -------------------------------------------------------
+function DataPreviewPanel({ table }) {
+  const rows = SAMPLE_ROWS[table.id] || [];
+  return (
+    <div>
+      <SectionHeader title="Data preview"
+        subtitle={`First ${rows.length} of ${fmtRows(table.rows)} rows`}
+        right={<>
+          <input placeholder="WHERE clause…" className="mono w-72"/>
+          <button className="btn btn-ghost">Run</button>
+        </>} />
+      <div className="glass rounded-lg overflow-auto scroll-thin">
+        <table className="adm">
+          <thead><tr>{table.columns.map(c=>(
+            <th key={c.name}><div className="mono">{c.name}</div><div className="text-[10px] text-slate-500 mono">{c.type}</div></th>
+          ))}</tr></thead>
+          <tbody>
+            {rows.map((r,i)=>(
+              <tr key={i}>
+                {r.map((v,j)=>(
+                  <td key={j} className="mono text-slate-200">
+                    {v===null ? <span className="text-slate-600 italic">NULL</span> : String(v)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr><td colSpan={table.columns.length} className="text-center text-slate-500 py-8">No sample rows available</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ---- SQL preview --------------------------------------------------------
+function generateCreateSQL(t) {
+  const cols = t.columns.map(c => {
+    let s = `  ${c.name} ${c.type}`;
+    if (c.computed) s += ` GENERATED ALWAYS AS (${c.computed}) ${c.stored ? "STORED" : "VIRTUAL"}`;
+    if (!c.nullable) s += " NOT NULL";
+    if (c.default && !c.computed) s += ` DEFAULT ${c.default}`;
+    if (c.identity) s += " GENERATED BY DEFAULT AS IDENTITY";
+    if (c.unique) s += " UNIQUE";
+    if (c.check) s += ` CHECK (${c.check})`;
+    return s;
+  });
+  const pks = t.columns.filter(c=>c.pk).map(c=>c.name);
+  if (pks.length) cols.push(`  PRIMARY KEY (${pks.join(", ")})`);
+  t.columns.filter(c=>c.fk).forEach(c=>{
+    cols.push(`  FOREIGN KEY (${c.name}) REFERENCES ${c.fk.table}(${c.fk.col}) ON DELETE ${c.fk.onDelete} ON UPDATE ${c.fk.onUpdate}`);
+  });
+  let opts = [];
+  if (t.storage === "COLUMNAR") opts.push("COLUMNAR");
+  if (t.compression && t.compression !== "NONE") opts.push(`COMPRESSION ${t.compression}`);
+  if (t.encryption && t.encryption !== "NONE") opts.push(`ENCRYPTED WITH ${t.encryption}`);
+  let part = "";
+  if (t.partition.strategy === "RANGE") part = `\nPARTITION BY RANGE (${t.partition.key})`;
+  else if (t.partition.strategy === "HASH") part = `\nPARTITION BY HASH (${t.partition.key}) BUCKETS ${t.partition.buckets}`;
+  else if (t.partition.strategy === "LIST") part = `\nPARTITION BY LIST (${t.partition.key})`;
+  return `CREATE TABLE ${t.schema}.${t.name} (\n${cols.join(",\n")}\n)${opts.length ? " " + opts.join(" ") : ""}${part};`;
+}
+
+function SQLPanel({ table }) {
+  const sql = useMemo(()=>generateCreateSQL(table), [table]);
+  const idxSql = table.indexes.filter(i=>!i.primary).map(i=>previewIndexDDL(i).replace("<table>", `${table.schema}.${table.name}`)).join("\n\n");
+  const [copied, setCopied] = useState(false);
+  const copy = (text) => { navigator.clipboard?.writeText(text); setCopied(true); setTimeout(()=>setCopied(false), 1200); };
+  const full = sql + (idxSql ? "\n\n" + idxSql : "");
+  return (
+    <div>
+      <SectionHeader title="Generated DDL" subtitle="Live SQL preview reflecting your current schema edits"
+        right={<button className="btn btn-primary" onClick={()=>copy(full)}>{copied ? "Copied!" : "Copy DDL"}</button>} />
+      <pre className="glass rounded-lg p-4 mono text-xs text-slate-200 whitespace-pre-wrap overflow-auto scroll-thin">{full}</pre>
+    </div>
+  );
+}
+
+// ---- App ----------------------------------------------------------------
+const TABS = [
+  { id:"columns", label:"Columns" },
+  { id:"indexes", label:"Indexes" },
+  { id:"calculated", label:"Calculated" },
+  { id:"constraints", label:"Constraints" },
+  { id:"partition", label:"Partitioning" },
+  { id:"storage", label:"Storage" },
+  { id:"preview", label:"Data preview" },
+  { id:"sql", label:"DDL" },
+];
+
+function useTheme() {
+  const [theme, setTheme] = useState(() =>
+    document.documentElement.classList.contains("light") ? "light" : "dark"
+  );
+  useEffect(() => {
+    document.documentElement.classList.toggle("light", theme === "light");
+    try { localStorage.setItem("tdb-theme", theme); } catch(e) {}
+  }, [theme]);
+  return [theme, () => setTheme(t => t === "light" ? "dark" : "light")];
+}
+
+function ThemeToggle({ theme, toggle }) {
+  return (
+    <button onClick={toggle} title={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
+      className="btn btn-ghost flex items-center gap-1.5" aria-label="Toggle theme">
+      {theme === "light" ? (
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      ) : (
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+        </svg>
+      )}
+      <span className="text-xs uppercase tracking-wider">{theme}</span>
+    </button>
+  );
+}
+
+function App() {
+  const [catalog, setCatalog] = useState(seedCatalog());
+  const [selectedId, setSelectedId] = useState(catalog.tables[0].id);
+  const [tab, setTab] = useState("columns");
+  const [filter, setFilter] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [theme, toggleTheme] = useTheme();
+
+  const selected = catalog.tables.find(t=>t.id===selectedId) || catalog.tables[0];
+  const updateTable = (next) => {
+    setCatalog({ ...catalog, tables: catalog.tables.map(t=>t.id===next.id?next:t) });
+  };
+  const dropTable = () => {
+    if (!confirm(`Drop table ${selected.schema}.${selected.name}? This is a mockup — your real DB is fine.`)) return;
+    const rest = catalog.tables.filter(t=>t.id!==selected.id);
+    setCatalog({ ...catalog, tables: rest });
+    if (rest.length) setSelectedId(rest[0].id);
+  };
+  const createTable = (def) => {
+    const id = `t_${def.name}_${Math.random().toString(36).slice(2,7)}`;
+    const t = { id, schema:def.schema, name:def.name, rows:0,
+      storage:def.storage, compression:def.compression, encryption:def.encryption,
+      partition:{ strategy:"NONE", key:null, buckets:0, ranges:[] },
+      columns:[{ name:"id", type:"INT64", nullable:false, default:"nextval('seq')", pk:true, identity:true }],
+      indexes:[{ name:`pk_${def.name}`, type:"BPTREE", cols:["id"], unique:true, primary:true }],
+      constraints:[{ kind:"PRIMARY KEY", name:`pk_${def.name}`, expr:"(id)" }],
+    };
+    setCatalog({ ...catalog, tables:[...catalog.tables, t] });
+    setSelectedId(id); setCreating(false); setTab("columns");
+  };
+
+  const filtered = catalog.tables.filter(t => `${t.schema}.${t.name}`.toLowerCase().includes(filter.toLowerCase()));
+
+  return (
+    <div className="h-full flex">
+      {/* Sidebar */}
+      <aside className="w-72 border-r border-white/5 flex flex-col bg-slate-950/40">
+        <div className="px-4 py-4 border-b border-white/5">
+          <div className="flex items-center gap-2">
+            <div className="w-7 h-7 rounded bg-gradient-to-br from-indigo-500 to-fuchsia-500 flex items-center justify-center font-bold text-sm">T</div>
+            <div>
+              <div className="font-semibold text-slate-100 leading-none">TDB Admin</div>
+              <div className="text-[11px] text-slate-500 mt-0.5">SQL engine · v0.9-dev</div>
+            </div>
+          </div>
+          <div className="mt-3"><input value={filter} onChange={e=>setFilter(e.target.value)} placeholder="Filter tables…" className="w-full" /></div>
+        </div>
+        <div className="flex-1 overflow-auto scroll-thin px-2 py-2">
+          {catalog.schemas.map(s => {
+            const ts = filtered.filter(t=>t.schema===s);
+            if (!ts.length) return null;
+            return (
+              <div key={s} className="mb-2">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500 px-2 py-1">{s}</div>
+                {ts.map(t => (
+                  <button key={t.id} onClick={()=>setSelectedId(t.id)}
+                    className={cls("w-full text-left px-2 py-1.5 rounded text-sm flex items-center justify-between",
+                      t.id===selected.id ? "bg-indigo-600/30 text-slate-100" : "text-slate-300 hover:bg-white/5")}>
+                    <span className="mono truncate">{t.name}</span>
+                    <span className="text-[10px] text-slate-500">{fmtRows(t.rows)}</span>
+                  </button>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+        <div className="px-3 py-3 border-t border-white/5">
+          <button className="btn btn-primary w-full" onClick={()=>setCreating(true)}>+ Create table</button>
+        </div>
+      </aside>
+
+      {/* Main */}
+      <main className="flex-1 flex flex-col min-w-0">
+        <header className="border-b border-white/5 px-6 py-4 flex items-center justify-between">
+          <div>
+            <div className="text-xs text-slate-500 mono">{selected.schema}</div>
+            <h1 className="text-xl font-semibold text-slate-100 mono">{selected.name}</h1>
+            <div className="flex gap-2 mt-2">
+              <Chip color="slate">{fmtRows(selected.rows)} rows</Chip>
+              <Chip color={selected.storage==="COLUMNAR"?"fuchsia":"slate"}>{selected.storage}</Chip>
+              {selected.compression!=="NONE" && <Chip color="emerald">{selected.compression}</Chip>}
+              {selected.encryption!=="NONE" && <Chip color="rose">ENCRYPTED</Chip>}
+              {selected.partition.strategy!=="NONE" && <Chip color="indigo">{selected.partition.strategy} on {selected.partition.key}</Chip>}
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <ThemeToggle theme={theme} toggle={toggleTheme} />
+            <button className="btn btn-ghost">Truncate</button>
+            <button className="btn btn-danger" onClick={dropTable}>Drop table</button>
+          </div>
+        </header>
+
+        <nav className="border-b border-white/5 px-6 flex gap-1">
+          {TABS.map(t => (
+            <button key={t.id} onClick={()=>setTab(t.id)}
+              className={cls("px-3 py-2 text-sm border-b-2 -mb-px transition-colors",
+                tab===t.id ? "border-indigo-500 text-slate-100" : "border-transparent text-slate-400 hover:text-slate-200")}>
+              {t.label}
+            </button>
+          ))}
+        </nav>
+
+        <div className="flex-1 overflow-auto scroll-thin p-6">
+          {tab==="columns"     && <ColumnsPanel table={selected} onUpdate={updateTable} />}
+          {tab==="indexes"     && <IndexesPanel table={selected} onUpdate={updateTable} />}
+          {tab==="calculated"  && <CalculatedPanel table={selected} onUpdate={updateTable} />}
+          {tab==="constraints" && <ConstraintsPanel table={selected} onUpdate={updateTable} />}
+          {tab==="partition"   && <PartitionPanel table={selected} onUpdate={updateTable} />}
+          {tab==="storage"     && <StoragePanel table={selected} onUpdate={updateTable} />}
+          {tab==="preview"     && <DataPreviewPanel table={selected} />}
+          {tab==="sql"         && <SQLPanel table={selected} />}
+        </div>
+      </main>
+
+      <CreateTableModal open={creating} onClose={()=>setCreating(false)} onCreate={createTable} schemas={catalog.schemas} />
+    </div>
+  );
+}
+
+function CreateTableModal({ open, onClose, onCreate, schemas }) {
+  const [d, setD] = useState({ schema:"public", name:"", storage:"ROW", compression:"NONE", encryption:"NONE" });
+  const set = (k,v) => setD({ ...d, [k]:v });
+  return (
+    <Modal open={open} onClose={onClose} title="Create table"
+      footer={<><button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+                 <button className="btn btn-primary" disabled={!d.name} onClick={()=>onCreate(d)}>Create</button></>}>
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Schema">
+          <select value={d.schema} onChange={e=>set("schema",e.target.value)} className="w-full">
+            {schemas.map(s=><option key={s}>{s}</option>)}
+          </select>
+        </Field>
+        <Field label="Table name"><input value={d.name} onChange={e=>set("name",e.target.value)} className="w-full mono" placeholder="my_table"/></Field>
+        <Field label="Storage layout">
+          <select value={d.storage} onChange={e=>set("storage",e.target.value)} className="w-full">
+            {STORAGE_MODES.map(s=><option key={s}>{s}</option>)}
+          </select>
+        </Field>
+        <Field label="Compression">
+          <select value={d.compression} onChange={e=>set("compression",e.target.value)} className="w-full">
+            {COMPRESSION.map(s=><option key={s}>{s}</option>)}
+          </select>
+        </Field>
+        <Field label="Encryption" full>
+          <select value={d.encryption} onChange={e=>set("encryption",e.target.value)} className="w-full">
+            {ENCRYPTION.map(s=><option key={s}>{s}</option>)}
+          </select>
+        </Field>
+      </div>
+      <p className="text-xs text-slate-500 mt-4">A primary key column <span className="mono">id INT64 IDENTITY</span> is created by default. Add more columns from the Columns tab.</p>
+    </Modal>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

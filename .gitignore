@@ -1,5 +1,6 @@
 # Build output
 build/
+build_v2/
 cmake-build-*/
 
 # IDE

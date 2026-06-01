@@ -380,6 +380,65 @@ int tdb_catalog_acl_persist(tdb_catalog *c, const tdb_acl_entry *e) {
   return rc;
 }
 
+/* Matching rules mirror tdb_acl_revoke: NULL/empty filters are wildcards,
+** "ALL" matches any priv, "PUBLIC" grantee matches any entry. */
+static int acl_match(const tdb_acl_entry *e,
+                     const char *grantee, const char *priv,
+                     int kind, const char *object) {
+  if (grantee && *grantee && strcasecmp(grantee, "PUBLIC") != 0) {
+    if (!e->grantee || strcasecmp(grantee, e->grantee) != 0) return 0;
+  }
+  if (priv && *priv && strcasecmp(priv, "ALL") != 0) {
+    if (!e->priv || strcasecmp(priv, e->priv) != 0) return 0;
+  }
+  if (kind != 0 && kind != e->kind) return 0;
+  if (object && *object) {
+    if (!e->object || strcasecmp(object, e->object) != 0) return 0;
+  }
+  return 1;
+}
+
+int tdb_catalog_acl_unpersist(tdb_catalog *c, const char *grantee,
+                              const char *priv, int kind,
+                              const char *object, int *removed) {
+  if (removed) *removed = 0;
+  tdb_btree *bt;
+  int rc = tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt);
+  if (rc) return rc;
+
+  tdb_rowid *ids = NULL; int nid = 0, capid = 0;
+  tdb_cursor *cur;
+  rc = tdb_cursor_open(bt, &cur);
+  if (rc) { tdb_btree_close(bt); return rc; }
+  for (tdb_cursor_first(cur); !tdb_cursor_eof(cur); tdb_cursor_next(cur)) {
+    const uint8_t *v; int n;
+    if (tdb_cursor_data(cur, &v, &n)) break;
+    if (n < 1 || v[0] != CAT_GRANT) continue;
+    tdb_acl_entry ent;
+    if (tdb_acl_entry_deserialize(v, n, &ent) != TDB_OK) continue;
+    int hit = acl_match(&ent, grantee, priv, kind, object);
+    tdb_mfree(ent.grantee); tdb_mfree(ent.priv); tdb_mfree(ent.object);
+    if (!hit) continue;
+    if (nid == capid) {
+      capid = capid ? capid * 2 : 8;
+      ids = (tdb_rowid *)tdb_realloc(ids, sizeof(tdb_rowid) * (size_t)capid);
+    }
+    tdb_cursor_rowid(cur, &ids[nid++]);
+  }
+  tdb_cursor_close(cur);
+
+  int nrem = 0;
+  for (int i = 0; i < nid && !rc; i++) {
+    int found = 0;
+    rc = tdb_btree_del(bt, ids[i], &found);
+    if (!rc && found) nrem++;
+  }
+  tdb_btree_close(bt);
+  tdb_mfree(ids);
+  if (removed) *removed = nrem;
+  return rc;
+}
+
 tdb_table *tdb_catalog_find_table(tdb_catalog *c, const char *name) {
   for (int i = 0; i < c->ntable; i++)
     if (strcasecmp(c->tables[i]->name, name) == 0) return c->tables[i];

@@ -55,5 +55,11 @@ int        tdb_catalog_update_table_as(tdb_catalog *c, const char *find_name, td
 ** catalog b-tree under CAT_GRANT records). */
 tdb_acl   *tdb_catalog_acl(tdb_catalog *c);
 int        tdb_catalog_acl_persist(tdb_catalog *c, const tdb_acl_entry *e);
+/* Remove every persisted CAT_GRANT row matching the (grantee, priv, kind,
+** object) tuple. NULL fields are wildcards (same matching rules as
+** tdb_acl_revoke). Returns the number of rows deleted on success. */
+int        tdb_catalog_acl_unpersist(tdb_catalog *c, const char *grantee,
+                                     const char *priv, int kind,
+                                     const char *object, int *removed);
 
 #endif /* TDB_CATALOG_H */

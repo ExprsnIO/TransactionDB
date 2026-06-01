@@ -1026,13 +1026,9 @@ static int exec_grant(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       }
     }
   } else {
-    for (int i = 0; i < npriv; i++) {
+    for (int i = 0; i < npriv && !rc; i++) {
       tdb_acl_revoke(acl, grantee, privs[i], kind, obj);
-      /* persistent revoke: append a tombstone? For simplicity, we leave the
-      ** old GRANT records on disk but skip them on next open via a scan-time
-      ** filter — kept simple: the catalog reload will re-add them, then this
-      ** REVOKE in-memory removes them. So a process restart loses REVOKEs.
-      ** TODO: catalog row deletion for true persistence. */
+      rc = tdb_catalog_acl_unpersist(db->cat, grantee, privs[i], kind, obj, NULL);
     }
   }
   for (int i = 0; i < npriv; i++) tdb_mfree(privs[i]);

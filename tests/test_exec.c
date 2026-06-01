@@ -1718,6 +1718,16 @@ static void test_acl_grant_revoke(void) {
   tdb_set_user(db, "dave");                 /* unrelated user — still denied */
   TDB_CHECK(exec(db, "SELECT v FROM x") != TDB_OK);
   tdb_close(db);
+
+  /* persistence: a REVOKE also survives reopening (no zombie grants on disk) */
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "REVOKE SELECT ON TABLE x FROM carol"), TDB_OK);
+  tdb_close(db);
+
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  tdb_set_user(db, "carol");
+  TDB_CHECK(exec(db, "SELECT v FROM x") != TDB_OK);  /* GRANT was reclaimed */
+  tdb_close(db);
   remove(path); remove("test_acl_persist.db-wal");
 }
 

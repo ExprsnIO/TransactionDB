@@ -50,6 +50,12 @@ tdb_table *tdb_ast_to_table(const tdb_create_table *ct, char **err) {
     for (int i = 0; i < ct->npart_col; i++) t->partition_cols[i] = tdb_strdup(ct->partition_cols[i]);
     t->npart_col = ct->npart_col;
   }
+  /* Default partition count for HASH partitioning is 4 if unspecified. */
+  if (ct->partition_kind == TDB_PART_HASH) {
+    t->partition_count = ct->partition_count > 0 ? ct->partition_count : 4;
+  } else if (ct->partition_kind != TDB_PART_NONE) {
+    t->partition_count = ct->partition_count;
+  }
 
   /* system-versioned temporal table: add hidden period bound columns */
   if (ct->system_versioning) {

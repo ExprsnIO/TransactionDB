@@ -1606,6 +1606,54 @@ static void test_stream_distinct(void) {
   tdb_close(db);
 }
 
+static void test_hash_partitioning(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+
+  /* CREATE TABLE ... PARTITION BY HASH (id) PARTITIONS 4 spawns 4 child
+  ** tables named "evt__p0..3". */
+  TDB_CHECK_EQ(exec(db,
+    "CREATE TABLE evt (id INTEGER PRIMARY KEY, k TEXT) "
+    "PARTITION BY HASH (id) PARTITIONS 4"), TDB_OK);
+  for (int i = 0; i < 4; i++) {
+    char q[80]; snprintf(q, sizeof(q), "SELECT COUNT(*) FROM evt__p%d", i);
+    TDB_CHECK_EQ(scalar(db, q), 0);
+  }
+
+  /* Insert 12 rows; HASH should distribute them across the 4 children. */
+  for (int i = 1; i <= 12; i++) {
+    char q[100]; snprintf(q, sizeof(q), "INSERT INTO evt VALUES (%d, 'r%d')", i, i);
+    TDB_CHECK_EQ(exec(db, q), TDB_OK);
+  }
+  /* Parent SELECT unions all children. */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM evt"), 12);
+  /* Children are non-empty and total back up to 12. */
+  int64_t sum = 0;
+  for (int i = 0; i < 4; i++) {
+    char q[80]; snprintf(q, sizeof(q), "SELECT COUNT(*) FROM evt__p%d", i);
+    int64_t n = scalar(db, q);
+    TDB_CHECK(n > 0);
+    sum += n;
+  }
+  TDB_CHECK_EQ(sum, 12);
+
+  /* DELETE WHERE id=N — applies to the correct child, parent SELECT reflects it. */
+  TDB_CHECK_EQ(exec(db, "DELETE FROM evt WHERE id = 3"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM evt"), 11);
+
+  /* UPDATE k — value visible through parent SELECT regardless of which child holds the row */
+  TDB_CHECK_EQ(exec(db, "UPDATE evt SET k = 'X' WHERE id = 5"), TDB_OK);
+  tdb_stmt *s = NULL;
+  TDB_CHECK_EQ(tdb_prepare_v2(db, "SELECT k FROM evt WHERE id = 5", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_STR(tdb_column_text(s, 0), "X");
+  tdb_finalize(s);
+
+  /* TRUNCATE empties every child. */
+  TDB_CHECK_EQ(exec(db, "TRUNCATE TABLE evt"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM evt"), 0);
+  tdb_close(db);
+}
+
 static void test_acl_grant_revoke(void) {
   tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
   TDB_CHECK_EQ(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"), TDB_OK);
@@ -1812,6 +1860,7 @@ static tdb_test_case cases[] = {
   {"returning", test_returning},
   {"cte", test_cte},
   {"ddl_dml_select", test_ddl_dml_select},
+  {"hash_partitioning", test_hash_partitioning},
   {"acl_grant_revoke", test_acl_grant_revoke},
   {"window_functions", test_window_functions},
   {"recursive_cte", test_recursive_cte},

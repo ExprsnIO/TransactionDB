@@ -160,7 +160,10 @@ static int from_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   for (tdb_src *s = q->from; s; s = s->next) {
     if (s->subquery || !s->table || s->as_of) return 0;
     if (find_cte(st, s->table)) return 0;                /* CTE name shadows a table */
-    if (!tdb_catalog_find_table(db->cat, s->table)) return 0;   /* view / missing */
+    tdb_table *_st_t = tdb_catalog_find_table(db->cat, s->table);
+    if (!_st_t) return 0;   /* view / missing */
+    if (_st_t->partition_kind == TDB_PART_HASH && _st_t->partition_count > 0)
+      return 0;             /* partitioned parents must materialize */
     if (n > 0 && s->join != JOIN_INNER && s->join != JOIN_CROSS && s->join != JOIN_LEFT) return 0;
     if ((s->join == JOIN_INNER || s->join == JOIN_LEFT) && expr_blocks_stream(s->on)) return 0;
     if (++n > MAXSRC) return 0;

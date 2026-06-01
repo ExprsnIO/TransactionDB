@@ -84,12 +84,10 @@ static tdb_value *row_alloc(int ncol) {
 
 /* ---------------------------- materialize ----------------------------- */
 
-/* Materialize the rows of `t` visible to txn into `rs` (deep copies). If
-** `idx` is non-NULL the scan is index-driven over `range`. */
-static int mat_table(tdb_db *db, tdb_table *t, tdb_index *idx,
-                     const tdb_keyrange *range, tdb_txnid as_of,
-                     const uint8_t *colmask, rowset *rs) {
-  rowset_init(rs, t->ncol);
+/* Scan a single physical table into `rs` (caller initializes rs). */
+static int mat_scan_one(tdb_db *db, tdb_table *t, tdb_index *idx,
+                        const tdb_keyrange *range, tdb_txnid as_of,
+                        const uint8_t *colmask, rowset *rs) {
   tdb_scan *sc;
   int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, idx, range, as_of, colmask, &sc);
   if (rc) return rc;
@@ -105,6 +103,28 @@ static int mat_table(tdb_db *db, tdb_table *t, tdb_index *idx,
   }
   db->engine->vtab->scan_close(sc);
   return (rc == TDB_DONE) ? TDB_OK : rc;
+}
+
+/* Materialize the rows of `t` visible to txn into `rs` (deep copies). For a
+** HASH-partitioned parent this unions all child partitions; for an ordinary
+** table it scans `t` itself. Index hints are ignored on a partitioned scan
+** (each child has its own indexes). */
+static int mat_table(tdb_db *db, tdb_table *t, tdb_index *idx,
+                     const tdb_keyrange *range, tdb_txnid as_of,
+                     const uint8_t *colmask, rowset *rs) {
+  rowset_init(rs, t->ncol);
+  if (t->partition_kind != TDB_PART_HASH || t->partition_count <= 0)
+    return mat_scan_one(db, t, idx, range, as_of, colmask, rs);
+
+  for (int k = 0; k < t->partition_count; k++) {
+    char child[256];
+    snprintf(child, sizeof(child), "%s__p%d", t->name, k);
+    tdb_table *ct = tdb_catalog_find_table(db->cat, child);
+    if (!ct) continue;        /* partition missing (e.g. older db); skip */
+    int rc = mat_scan_one(db, ct, NULL, NULL, as_of, colmask, rs);
+    if (rc) return rc;
+  }
+  return TDB_OK;
 }
 
 /* ----------------------------- resolution ----------------------------- */

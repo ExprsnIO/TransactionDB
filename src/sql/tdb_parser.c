@@ -762,6 +762,12 @@ static tdb_ast_stmt *parse_create_table(P *p) {
       expect(p, TK_LP, "expected ( after partition kind");
       ct->partition_cols = parse_name_list(p, &ct->npart_col);
       expect(p, TK_RP, "expected ) after partition columns");
+      /* optional PARTITIONS N — count of child partitions (HASH default 4) */
+      if (id_is(&p->cur, "PARTITIONS")) {
+        advance(p);
+        if (p->cur.kind == TK_INTEGER) { ct->partition_count = (int)p->cur.ival; advance(p); }
+        else set_err(p, "expected integer after PARTITIONS");
+      }
       continue;
     }
     break;

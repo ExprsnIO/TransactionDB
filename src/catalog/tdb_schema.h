@@ -132,6 +132,7 @@ typedef struct tdb_table {
   int      partition_kind;      /* tdb_partition_kind: 0 none, 1 RANGE, 2 LIST, 3 HASH */
   char   **partition_cols;
   int      npart_col;
+  int      partition_count;     /* number of children (HASH); 0 = unpartitioned */
 } tdb_table;
 
 typedef struct tdb_view {

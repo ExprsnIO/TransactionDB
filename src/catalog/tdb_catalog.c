@@ -120,6 +120,7 @@ static void ser_table(const tdb_table *t, tdb_buf *b) {
   w_u8(b, (uint8_t)t->partition_kind);
   w_var(b, (uint64_t)t->npart_col);
   for (int i = 0; i < t->npart_col; i++) w_str(b, t->partition_cols[i]);
+  w_var(b, (uint64_t)t->partition_count);
 }
 
 static tdb_table *deser_table(rd *r) {
@@ -202,6 +203,7 @@ static tdb_table *deser_table(rd *r) {
       for (int i = 0; i < npc && !r->err; i++) t->partition_cols[i] = r_str(r);
       t->npart_col = npc;
     }
+    if (r->pos < r->len && !r->err) t->partition_count = (int)r_var(r);
   }
   return t;
 }

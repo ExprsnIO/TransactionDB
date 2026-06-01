@@ -3,6 +3,46 @@
 #include "../catalog/tdb_acl.h"
 static int acl_check_or_err(tdb_db *db, const char *priv, int kind, const char *name);
 
+/* -------------------- HASH partitioning helpers ----------------------- */
+
+/* Hash a single tdb_value into 64 bits — used by partition routing. */
+static uint64_t pv_hash(const tdb_value *v) {
+  switch (v->type) {
+    case TDB_VAL_NULL: return 0x9e3779b97f4a7c15ULL;
+    case TDB_VAL_INT:  return (uint64_t)v->u.i * 0x100000001b3ULL ^ 0xcbf29ce484222325ULL;
+    case TDB_VAL_REAL: { uint64_t u; memcpy(&u, &v->u.r, 8); return u * 0x100000001b3ULL; }
+    default:
+      if (!v->u.s.p) return 0;
+      return tdb_fnv1a(v->u.s.p, (size_t)v->u.s.n);
+  }
+}
+
+/* Pick the child partition table for `t` given the row's partition-key
+** column values. Returns the catalog-resolved tdb_table or NULL on error. */
+static tdb_table *partition_pick_child(tdb_db *db, tdb_table *t, const tdb_value *row) {
+  if (t->partition_kind != TDB_PART_HASH || t->partition_count <= 0) return t;
+  uint64_t h = 1469598103934665603ULL;
+  for (int i = 0; i < t->npart_col; i++) {
+    int ci = tdb_table_find_column(t, t->partition_cols[i]);
+    if (ci < 0) {
+      tdb_db_seterr(db, "partition column %s missing on %s", t->partition_cols[i], t->name);
+      return NULL;
+    }
+    h = (h ^ pv_hash(&row[ci])) * 1099511628211ULL;
+  }
+  int k = (int)(h % (uint64_t)t->partition_count);
+  char child[256];
+  snprintf(child, sizeof(child), "%s__p%d", t->name, k);
+  tdb_table *ct = tdb_catalog_find_table(db->cat, child);
+  if (!ct) tdb_db_seterr(db, "missing partition %s", child);
+  return ct;
+}
+
+/* Return non-zero if `t` is the parent of HASH-partitioned children. */
+static int is_hash_partitioned(const tdb_table *t) {
+  return t && t->partition_kind == TDB_PART_HASH && t->partition_count > 0;
+}
+
 /* parse + resolve a column expression (generated/DEFAULT) against `t` */
 static tdb_expr *prepare_col_expr(tdb_db *db, tdb_stmt *st, tdb_table *t,
                                   const char *sql) {
@@ -58,10 +98,16 @@ static int store_full(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_value *row,
                       tdb_rowid rowid, tdb_buf *rec, int is_update) {
   int rc = finalize_row(db, st, t, row);
   if (rc) return rc;
+  /* Route to the correct child for HASH-partitioned parents. */
+  tdb_table *target = t;
+  if (is_hash_partitioned(t)) {
+    target = partition_pick_child(db, t, row);
+    if (!target) return TDB_ERROR;
+  }
   tdb_buf_reset(rec);
-  tdb_record_encode(row, t->ncol, rec);
-  return is_update ? db->engine->vtab->update(db->engine, db->txn, t, rowid, rec->data, (int)rec->len)
-                   : db->engine->vtab->insert(db->engine, db->txn, t, rowid, rec->data, (int)rec->len);
+  tdb_record_encode(row, target->ncol, rec);
+  return is_update ? db->engine->vtab->update(db->engine, db->txn, target, rowid, rec->data, (int)rec->len)
+                   : db->engine->vtab->insert(db->engine, db->txn, target, rowid, rec->data, (int)rec->len);
 }
 
 /* ---- RETURNING projection support -------------------------------------- */
@@ -289,10 +335,17 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   return rc;
 }
 
-/* materialize (rowid, values) pairs for UPDATE/DELETE */
-typedef struct { tdb_rowid *rids; tdb_value **rows; int n, cap, ncol; } rrowset;
-static int mat_rid(tdb_db *db, tdb_table *t, rrowset *rr) {
-  memset(rr, 0, sizeof(*rr)); rr->ncol = t->ncol;
+/* materialize (rowid, values) pairs for UPDATE/DELETE. For a HASH-partitioned
+** parent we sweep every child, tagging each row with its source table so the
+** caller can hand the update/delete back to the right b-tree. */
+typedef struct {
+  tdb_rowid *rids;
+  tdb_value **rows;
+  tdb_table **srcs;       /* per-row source table (== caller's `t` for unpartitioned) */
+  int n, cap, ncol;
+} rrowset;
+
+static int mat_rid_one(tdb_db *db, tdb_table *t, tdb_table *parent, rrowset *rr) {
   tdb_scan *sc;
   int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, 0, NULL, &sc);
   if (rc) return rc;
@@ -300,22 +353,40 @@ static int mat_rid(tdb_db *db, tdb_table *t, rrowset *rr) {
   while ((rc = db->engine->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {
     tdb_value tmp[64]; int nc = 0;
     if (tdb_record_decode(rec, (size_t)reclen, tmp, 64, &nc)) { rc = TDB_CORRUPT; break; }
-    tdb_value *row = row_alloc(t->ncol);
-    for (int i = 0; i < t->ncol && i < nc; i++) tdb_value_copy(&row[i], &tmp[i]);
+    tdb_value *row = row_alloc(parent->ncol);
+    for (int i = 0; i < parent->ncol && i < nc; i++) tdb_value_copy(&row[i], &tmp[i]);
     for (int i = 0; i < nc; i++) tdb_value_clear(&tmp[i]);
     if (rr->n == rr->cap) {
       rr->cap = rr->cap ? rr->cap * 2 : 16;
       rr->rids = (tdb_rowid *)tdb_realloc(rr->rids, sizeof(tdb_rowid) * (size_t)rr->cap);
       rr->rows = (tdb_value **)tdb_realloc(rr->rows, sizeof(void *) * (size_t)rr->cap);
+      rr->srcs = (tdb_table **)tdb_realloc(rr->srcs, sizeof(void *) * (size_t)rr->cap);
     }
-    rr->rids[rr->n] = rid; rr->rows[rr->n] = row; rr->n++;
+    rr->rids[rr->n] = rid; rr->rows[rr->n] = row; rr->srcs[rr->n] = t; rr->n++;
   }
   db->engine->vtab->scan_close(sc);
   return (rc == TDB_DONE) ? TDB_OK : rc;
 }
+
+static int mat_rid(tdb_db *db, tdb_table *t, rrowset *rr) {
+  memset(rr, 0, sizeof(*rr)); rr->ncol = t->ncol;
+  if (is_hash_partitioned(t)) {
+    for (int k = 0; k < t->partition_count; k++) {
+      char child[256];
+      snprintf(child, sizeof(child), "%s__p%d", t->name, k);
+      tdb_table *ct = tdb_catalog_find_table(db->cat, child);
+      if (!ct) continue;
+      int rc = mat_rid_one(db, ct, t, rr);
+      if (rc) return rc;
+    }
+    return TDB_OK;
+  }
+  return mat_rid_one(db, t, t, rr);
+}
+
 static void rrowset_free(rrowset *rr) {
   for (int i = 0; i < rr->n; i++) free_row(rr->rows[i], rr->ncol);
-  tdb_mfree(rr->rows); tdb_mfree(rr->rids);
+  tdb_mfree(rr->rows); tdb_mfree(rr->rids); tdb_mfree(rr->srcs);
 }
 
 static int exec_update(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
@@ -357,7 +428,23 @@ static int exec_update(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     if (rc) { free_row(full, t->ncol); break; }
     tdb_buf_reset(&rec);
     tdb_record_encode(full, t->ncol, &rec);
-    rc = db->engine->vtab->update(db->engine, db->txn, t, rr.rids[r], rec.data, (int)rec.len);
+    /* For HASH-partitioned parents the row may need to migrate between
+    ** children if the update changed a partition key. We always remove
+    ** from the row's current source and let store_full route the new
+    ** value to the (possibly different) target child. */
+    tdb_table *src = rr.srcs[r];
+    if (is_hash_partitioned(t)) {
+      tdb_table *target = partition_pick_child(db, t, full);
+      if (!target) { free_row(full, t->ncol); rc = TDB_ERROR; break; }
+      if (target == src) {
+        rc = db->engine->vtab->update(db->engine, db->txn, src, rr.rids[r], rec.data, (int)rec.len);
+      } else {
+        rc = db->engine->vtab->remove(db->engine, db->txn, src, rr.rids[r]);
+        if (!rc) rc = db->engine->vtab->insert(db->engine, db->txn, target, rr.rids[r], rec.data, (int)rec.len);
+      }
+    } else {
+      rc = db->engine->vtab->update(db->engine, db->txn, src, rr.rids[r], rec.data, (int)rec.len);
+    }
     if (!rc) { st->changes++; returning_emit(db, st, &rp, full, t->ncol); }
     free_row(full, t->ncol);
     if (rc) break;
@@ -388,7 +475,7 @@ static int exec_delete(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       int ok = val_true(&w); tdb_value_clear(&w);
       if (!ok) continue;
     }
-    rc = db->engine->vtab->remove(db->engine, db->txn, t, rr.rids[r]);
+    rc = db->engine->vtab->remove(db->engine, db->txn, rr.srcs[r], rr.rids[r]);
     if (rc) break;
     st->changes++;
     returning_emit(db, st, &rp, rr.rows[r], t->ncol);  /* RETURNING old row */
@@ -414,6 +501,34 @@ static int exec_create_table(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   rc = tdb_catalog_add_table(db->cat, t);
   if (rc) { tdb_table_free(t); return rc; }
   tdb_pager_set_schema_cookie(db->pager, tdb_pager_schema_cookie(db->pager) + 1);
+
+  /* HASH-partitioned parents own their data through N child tables named
+  ** "<parent>__pK". Each child has the parent's column schema but no
+  ** partitioning metadata of its own (data lives only in children). */
+  if (t->partition_kind == TDB_PART_HASH && t->partition_count > 0) {
+    for (int k = 0; k < t->partition_count; k++) {
+      char child[256];
+      snprintf(child, sizeof(child), "%s__p%d", t->name, k);
+      if (tdb_catalog_find_table(db->cat, child)) continue;
+      tdb_table *ck = tdb_table_new(child);
+      if (!ck) return TDB_NOMEM;
+      for (int i = 0; i < t->ncol; i++) {
+        tdb_column col;
+        tdb_column_init(&col, t->cols[i].name, t->cols[i].type);
+        col.coll = t->cols[i].coll;
+        col.notnull = t->cols[i].notnull;
+        col.pk = t->cols[i].pk;
+        col.unique = t->cols[i].unique;
+        col.hidden = t->cols[i].hidden;
+        if (t->cols[i].default_sql) col.default_sql = tdb_strdup(t->cols[i].default_sql);
+        if (t->cols[i].check_sql) col.check_sql = tdb_strdup(t->cols[i].check_sql);
+        if (tdb_table_add_column(ck, &col) != TDB_OK) { tdb_table_free(ck); return TDB_NOMEM; }
+      }
+      int rc2 = db->engine->vtab->create_table(db->engine, db->txn, ck);
+      if (!rc2) rc2 = tdb_catalog_add_table(db->cat, ck);
+      if (rc2) { tdb_table_free(ck); return rc2; }
+    }
+  }
   return TDB_OK;
 }
 
@@ -674,10 +789,7 @@ static int exec_alter(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 
 /* TRUNCATE TABLE — delete every visible row. (Identity reset / CASCADE
 ** are parsed and remembered on the AST but not yet executed.) */
-static int exec_truncate(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
-  TDB_UNUSED(st);
-  tdb_table *t = tdb_catalog_find_table(db->cat, a->u.truncate.name);
-  if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.truncate.name); return TDB_ERROR; }
+static int truncate_one(tdb_db *db, tdb_stmt *st, tdb_table *t) {
   tdb_scan *sc;
   int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, 0, NULL, &sc);
   if (rc) return rc;
@@ -699,6 +811,23 @@ static int exec_truncate(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   }
   tdb_mfree(ids);
   return TDB_OK;
+}
+
+static int exec_truncate(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  tdb_table *t = tdb_catalog_find_table(db->cat, a->u.truncate.name);
+  if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.truncate.name); return TDB_ERROR; }
+  if (is_hash_partitioned(t)) {
+    for (int k = 0; k < t->partition_count; k++) {
+      char child[256];
+      snprintf(child, sizeof(child), "%s__p%d", t->name, k);
+      tdb_table *ct = tdb_catalog_find_table(db->cat, child);
+      if (!ct) continue;
+      int rc = truncate_one(db, st, ct);
+      if (rc) return rc;
+    }
+    return TDB_OK;
+  }
+  return truncate_one(db, st, t);
 }
 
 /* ANALYZE / REINDEX / COMMENT / LOCK / GRANT / REVOKE / ATTACH / DETACH —

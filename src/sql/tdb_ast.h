@@ -176,6 +176,7 @@ typedef struct tdb_create_table {
   tdb_partition_kind partition_kind;
   char      **partition_cols;       /* PARTITION BY <kind>(col, ...) */
   int         npart_col;
+  int         partition_count;      /* PARTITIONS N (HASH only); default 4 */
 } tdb_create_table;
 
 typedef struct tdb_create_index {

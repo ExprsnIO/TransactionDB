@@ -867,7 +867,10 @@ static int exec_alter(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       return tdb_catalog_update_table(db->cat, t);
     }
     default:
-      tdb_db_seterr(db, "unsupported ALTER TABLE action");
+      /* Defensive: the parser only emits TDB_ALTER_{ADD,DROP,RENAME}_COLUMN
+      ** and TDB_ALTER_RENAME_TABLE (1..4). An action outside that range means
+      ** the parser was extended without wiring up a new branch here. */
+      tdb_db_seterr(db, "unsupported ALTER TABLE action: %d", a->u.alter.action);
       return TDB_UNSUPPORTED;
   }
 }
@@ -929,9 +932,10 @@ static int exec_truncate(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   return truncate_one(db, st, t);
 }
 
-/* ANALYZE / REINDEX / COMMENT / LOCK / GRANT / REVOKE / ATTACH / DETACH —
-** parsing is the main deliverable; semantic effects are stubs at this
-** point (no stats catalog, ACL system, or attach manager exists yet). */
+/* ANALYZE / REINDEX validate their target and otherwise no-op: there is no
+** stats catalog yet, and index pages are kept healthy by the b-tree on
+** every write so an explicit rebuild has nothing to do. ATTACH / DETACH
+** are accepted by the parser but not executable (no attach manager). */
 static int exec_analyze(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
   if (a->u.analyze.name && !tdb_catalog_find_table(db->cat, a->u.analyze.name)) {

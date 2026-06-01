@@ -1444,6 +1444,168 @@ static void test_stream_join_index(void) {
   tdb_close(db);
 }
 
+static void test_stream_left_join(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept INTEGER)");
+  exec(db, "INSERT INTO emp VALUES (1,10),(2,20),(3,99),(4,NULL)");
+  exec(db, "CREATE TABLE dept (did INTEGER, dname TEXT)");
+  exec(db, "INSERT INTO dept VALUES (10,'eng'),(20,'sales')");
+  int ids[16], n;
+
+  /* every outer row is preserved: 4 emp rows, two unmatched -> still 4 */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp e LEFT JOIN dept d ON e.dept = d.did"), 4);
+
+  /* unmatched outer rows carry NULL inner columns: COUNT(d.did) skips them */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(d.did) FROM emp e LEFT JOIN dept d ON e.dept = d.did"), 2);
+
+  /* anti-join idiom: outer rows with no match (dept 99 and NULL) -> ids 3,4 */
+  n = collect_ints(db,
+    "SELECT e.id FROM emp e LEFT JOIN dept d ON e.dept = d.did WHERE d.did IS NULL ORDER BY e.id", ids, 16);
+  TDB_CHECK_EQ(n, 2);
+  TDB_CHECK_EQ(ids[0], 3); TDB_CHECK_EQ(ids[1], 4);
+
+  /* matched rows still project the inner value */
+  check_text(db,
+    "SELECT d.dname FROM emp e LEFT JOIN dept d ON e.dept = d.did WHERE e.id = 1", "eng");
+
+  /* index-driven LEFT JOIN with duplicate inner keys: emp 1 (dept 10) matches
+  ** two dept rows, the unmatched/NULL-dept emps each emit one NULL row */
+  exec(db, "CREATE TABLE d2 (did INTEGER, dname TEXT)");
+  exec(db, "CREATE INDEX d2i ON d2(did)");
+  exec(db, "INSERT INTO d2 VALUES (10,'eng'),(10,'eng2'),(20,'sales')");
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM emp e LEFT JOIN d2 d ON e.dept = d.did"), 5);  /* 2+1+1+1 */
+
+  /* LEFT JOIN feeding GROUP BY: the unmatched group counts 0 inner rows */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT c FROM (SELECT e.dept dp, COUNT(d.did) c FROM emp e LEFT JOIN dept d ON e.dept=d.did "
+    "GROUP BY e.dept) WHERE dp = 99"), 0);
+
+  /* chained LEFT JOIN: a missing middle row NULLs the rest of the chain */
+  exec(db, "CREATE TABLE c3 (cid INTEGER, v TEXT)");
+  exec(db, "INSERT INTO c3 VALUES (10,'hit')");
+  n = collect_ints(db,
+    "SELECT e.id FROM emp e LEFT JOIN dept d ON e.dept=d.did "
+    "LEFT JOIN c3 c ON d.did=c.cid ORDER BY e.id", ids, 16);
+  TDB_CHECK_EQ(n, 4);   /* all four emp rows survive both left joins */
+
+  tdb_close(db);
+}
+
+static void test_stream_agg(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,3,50)");
+  int ids[16], n;
+
+  /* scalar aggregates with no GROUP BY -> one row */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 5);
+  TDB_CHECK_EQ(scalar(db, "SELECT SUM(v) FROM t"), 150);
+  TDB_CHECK_EQ(scalar(db, "SELECT MIN(v) FROM t"), 10);
+  TDB_CHECK_EQ(scalar(db, "SELECT MAX(v) FROM t"), 50);
+  TDB_CHECK_EQ((int)(scalar_real(db, "SELECT AVG(v) FROM t") + 0.5), 30);
+
+  /* scalar aggregate over an empty input still yields one row */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE v > 1000"), 0);
+
+  /* WHERE applies before grouping */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t WHERE v > 25"), 3);
+
+  /* GROUP BY: one row per group */
+  n = collect_ints(db, "SELECT grp FROM t GROUP BY grp ORDER BY grp", ids, 16);
+  TDB_CHECK_EQ(n, 3);
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 2); TDB_CHECK_EQ(ids[2], 3);
+  /* per-group SUM via the grp=2 row */
+  TDB_CHECK_EQ(scalar(db, "SELECT s FROM (SELECT grp, SUM(v) AS s FROM t GROUP BY grp) WHERE grp = 2"), 70);
+
+  /* HAVING filters grouped rows */
+  n = collect_ints(db,
+    "SELECT grp FROM t GROUP BY grp HAVING SUM(v) > 30 ORDER BY grp", ids, 16);
+  TDB_CHECK_EQ(n, 2);   /* grp 2 (70) and grp 3 (50); grp 1 (30) excluded */
+  TDB_CHECK_EQ(ids[0], 2); TDB_CHECK_EQ(ids[1], 3);
+
+  /* GROUP BY + ORDER BY on an aggregate + LIMIT */
+  n = collect_ints(db,
+    "SELECT grp FROM t GROUP BY grp ORDER BY SUM(v) DESC LIMIT 2", ids, 16);
+  TDB_CHECK_EQ(n, 2);
+  TDB_CHECK_EQ(ids[0], 2); TDB_CHECK_EQ(ids[1], 3);   /* 70, 50 */
+
+  /* COUNT(DISTINCT ...) */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(DISTINCT grp) FROM t"), 3);
+
+  /* aggregate over a join, grouped by an inner-table column */
+  exec(db, "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept INTEGER, sal INTEGER)");
+  exec(db, "INSERT INTO emp VALUES (1,10,100),(2,10,200),(3,20,300)");
+  exec(db, "CREATE TABLE dept (did INTEGER, dname TEXT)");
+  exec(db, "INSERT INTO dept VALUES (10,'eng'),(20,'sales')");
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT t FROM (SELECT d.dname dn, SUM(e.sal) t FROM emp e JOIN dept d ON e.dept=d.did "
+    "GROUP BY d.dname) WHERE dn = 'eng'"), 300);
+
+  /* abandon a partially consumed aggregate stream (groups buffered, freed) */
+  {
+    tdb_stmt *s = NULL;
+    tdb_prepare_v2(db, "SELECT grp, SUM(v) FROM t GROUP BY grp ORDER BY grp", -1, &s, NULL);
+    TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+    tdb_finalize(s);
+  }
+
+  tdb_close(db);
+}
+
+static void test_stream_distinct(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)");
+  exec(db, "INSERT INTO t VALUES (1,1,10),(2,1,10),(3,2,30),(4,2,30),(5,3,30)");
+  int ids[16], n;
+
+  /* single-column DISTINCT preserves first-seen order */
+  n = collect_ints(db, "SELECT DISTINCT grp FROM t", ids, 16);
+  TDB_CHECK_EQ(n, 3);
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 2); TDB_CHECK_EQ(ids[2], 3);
+
+  n = collect_ints(db, "SELECT DISTINCT v FROM t", ids, 16);
+  TDB_CHECK_EQ(n, 2);   /* 10, 30 */
+  TDB_CHECK_EQ(ids[0], 10); TDB_CHECK_EQ(ids[1], 30);
+
+  /* multi-column DISTINCT: (1,10),(2,30),(3,30) = 3 distinct rows */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM (SELECT DISTINCT grp, v FROM t)"), 3);
+
+  /* LIMIT applies to the deduplicated stream */
+  n = collect_ints(db, "SELECT DISTINCT grp FROM t LIMIT 2", ids, 16);
+  TDB_CHECK_EQ(n, 2);
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 2);
+
+  /* DISTINCT after a WHERE filter */
+  n = collect_ints(db, "SELECT DISTINCT v FROM t WHERE grp >= 2", ids, 16);
+  TDB_CHECK_EQ(n, 1);
+  TDB_CHECK_EQ(ids[0], 30);
+
+  /* NULLs compare equal: {NULL,NULL,5,5} -> 2 distinct values */
+  exec(db, "CREATE TABLE n (id INTEGER PRIMARY KEY, v INTEGER)");
+  exec(db, "INSERT INTO n VALUES (1,NULL),(2,NULL),(3,5),(4,5)");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM (SELECT DISTINCT v FROM n)"), 2);
+
+  /* DISTINCT over a join */
+  exec(db, "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)");
+  exec(db, "CREATE TABLE b (k INTEGER, tag INTEGER)");
+  exec(db, "INSERT INTO a VALUES (1,100),(2,100),(3,200)");
+  exec(db, "INSERT INTO b VALUES (100,7),(200,7)");
+  /* a.k -> b.tag: rows (1,7),(2,7),(3,7); DISTINCT tag = 1 */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM (SELECT DISTINCT b.tag FROM a JOIN b ON a.k = b.k)"), 1);
+
+  /* abandon a partially consumed distinct stream (seen-set freed) */
+  {
+    tdb_stmt *s = NULL;
+    tdb_prepare_v2(db, "SELECT DISTINCT grp FROM t", -1, &s, NULL);
+    TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+    tdb_finalize(s);
+  }
+
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"geospatial", test_geospatial},
   {"spatial_index", test_spatial_index},
@@ -1453,6 +1615,9 @@ static tdb_test_case cases[] = {
   {"stream_sort", test_stream_sort},
   {"stream_join", test_stream_join},
   {"stream_join_index", test_stream_join_index},
+  {"stream_left_join", test_stream_left_join},
+  {"stream_agg", test_stream_agg},
+  {"stream_distinct", test_stream_distinct},
   {"upsert", test_upsert},
   {"returning", test_returning},
   {"cte", test_cte},

@@ -62,6 +62,10 @@ include:
 - The full SQL keyword set is introspectable via `tdb_keyword_count` /
   `tdb_keyword_name` / `tdb_keyword_check` (à la SQLite)
 
+For a feature-by-feature comparison against SQLite — including what's supported,
+what's parsed-but-not-yet-enforced, and tdb-only extensions — see
+[`docs/SQL_COMPATIBILITY.md`](docs/SQL_COMPATIBILITY.md).
+
 ## Building
 
 TransactionDB uses **CMake (≥ 3.16)** with an out-of-source build. The default build

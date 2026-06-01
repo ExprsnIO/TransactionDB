@@ -1,16 +1,21 @@
 /* tdb_exec_stream.inc — pull-based (volcano) operator tree.
 **
 ** Included by tdb_exec.c after the materializing executor, this introduces a
-** small family of demand-driven operators — Scan, Join, Filter, Sort, Project,
-** Limit — wired child-to-parent so each next() pulls one row from below. A
-** SELECT over one or more base tables (INNER/CROSS joins, left-deep) with an
-** optional WHERE / ORDER BY / projection / LIMIT is compiled into such a tree;
-** the row at a time pull means a LIMIT stops the scan early instead of
-** materializing the whole result first. Join is a nested loop: it re-scans the
-** inner table for each outer row, or seeks it via an index when the ON predicate
-** is an equijoin on an indexed inner column. Sort is the one blocking operator: it drains
-** its child once, but when ORDER BY is paired with LIMIT it keeps only the top
-** (OFFSET+LIMIT) rows in a bounded heap rather than buffering the entire input.
+** small family of demand-driven operators — Scan, Join, Filter, Agg, Sort,
+** Distinct, Project, Limit — wired child-to-parent so each next() pulls one row
+** from below. A SELECT over one or more base tables (INNER/LEFT/CROSS joins,
+** left-deep) with an optional WHERE / GROUP BY+aggregates / HAVING / ORDER BY /
+** projection / DISTINCT / LIMIT is compiled into such a tree; the row at a time pull means a LIMIT
+** stops the scan early instead of materializing the whole result first. Join is
+** a nested loop: it re-scans the inner table for each outer row (or seeks it via
+** an index when the ON predicate is an equijoin on an indexed inner column), and
+** for a LEFT JOIN emits a NULL-extended row when an outer row matches nothing. Agg
+** and Sort are the blocking operators: Agg drains its child to group + reduce,
+** Sort to order — but when ORDER BY is paired with LIMIT, Sort keeps only the
+** top (OFFSET+LIMIT) rows in a bounded heap rather than buffering all input.
+** Operators above an Agg are agg-aware: the grouped row carries the aggregate
+** values appended after the group's representative columns, exposed through
+** ectx.aggvals so HAVING / ORDER BY / projection resolve EX_AGG references.
 **
 ** tdb_step() pulls one row per call straight through the tree (see
 ** tdb_stmt_stream_next): nothing is collected into st->rows, so memory stays
@@ -20,7 +25,7 @@
 ** even as the connection commits other writes.
 */
 
-typedef enum { OP_SCAN, OP_JOIN, OP_FILTER, OP_SORT, OP_PROJECT, OP_LIMIT } op_kind;
+typedef enum { OP_SCAN, OP_JOIN, OP_FILTER, OP_AGG, OP_SORT, OP_DISTINCT, OP_PROJECT, OP_LIMIT } op_kind;
 
 /* one buffered row inside a Sort operator: the (owned) source row and its
 ** computed sort-key vector */
@@ -46,17 +51,19 @@ typedef struct tdb_op {
   /* OP_FILTER */
   tdb_expr      *pred;
 
-  /* OP_JOIN (left-deep nested loop over INNER/CROSS base-table joins). `child`
-  ** is the outer (left) subtree; `inner` is the right Scan, re-scanned per
-  ** outer row. The join emits a combined row of `joinncol` values: the outer
+  /* OP_JOIN (left-deep nested loop over INNER/LEFT/CROSS base-table joins).
+  ** `child` is the outer (left) subtree; `inner` is the right Scan, re-scanned
+  ** per outer row. The join emits a combined row of `joinncol` values: the outer
   ** row's columns followed by the inner table's, at offset `inner_base`. */
   struct tdb_op *inner;
-  tdb_expr      *on;          /* INNER join ON predicate (NULL for CROSS) */
+  tdb_expr      *on;          /* INNER/LEFT join ON predicate (NULL for CROSS) */
   tdb_value     *joinrow;     /* reused combined row (joinncol values) */
   int            joinncol;
   int            inner_base;  /* column offset of the inner table in joinrow */
   int            join_started;/* outer row pulled at least once */
   int            join_eof;
+  int            left_join;   /* LEFT JOIN: emit a NULL-extended row if no match */
+  int            outer_matched;/* current outer row matched some inner row */
   /* index-driven inner lookup: when the ON predicate has an equijoin on an
   ** indexed inner column, seek the inner table to the outer value each pass
   ** instead of full-scanning. `idx_join_key` is the outer expression supplying
@@ -83,15 +90,45 @@ typedef struct tdb_op {
   int            sorted;      /* input consumed + ordered */
   int            emit;        /* next index to emit */
   int            srcncol;     /* width of buffered source rows */
+
+  /* aggregate awareness: when agg_n > 0, this operator sits above an OP_AGG and
+  ** its child rows carry `agg_n` aggregate values appended at offset agg_base.
+  ** Expression evaluation here exposes columns [0,agg_base) and the aggregates
+  ** via ectx.aggvals so EX_AGG / group-key references resolve. */
+  int            agg_base;
+  int            agg_n;
+
+  /* OP_AGG (blocking hash/linear aggregate). Drains its child, groups rows by
+  ** the GROUP BY keys, and emits one combined row per group: the group's
+  ** representative source columns [0,gbase) followed by the aggregate result
+  ** values [gbase, gbase+nagg). HAVING / projection / ORDER BY run above it,
+  ** agg-aware. */
+  tdb_expr     **gkeys;       /* GROUP BY key expressions (AST), or NULL */
+  int            ngkey;
+  tdb_expr     **aggx;        /* aggregate expressions to compute (heap array) */
+  int            naggx;
+  int            gbase;       /* width of a child source row */
+  group         *grps;
+  int            ngrp, grpcap;
+  tdb_value     *aggrow;      /* reused emitted combined row (gbase+naggx) */
+  int            agg_done;    /* child drained + groups built */
+  int            agg_emit;    /* next group index to emit */
+
+  /* OP_DISTINCT: emit only rows not seen before. `seen` retains one owned copy
+  ** of every distinct row already emitted (each `dwidth` values); a new child
+  ** row is compared against them (NULLs compare equal) and kept if unique. */
+  tdb_value    **seen_rows;
+  int            nseen_rows, seencap;
+  int            dwidth;
 } tdb_op;
 
 /* ---- eligibility: reject anything the simple operators can't stream ---- */
 
-/* True if `e` contains an aggregate or a subquery (which Stage 1 won't stream). */
+/* True if `e` contains a subquery — the streaming operators don't run those. */
 static int expr_blocks_stream(const tdb_expr *e) {
   if (!e) return 0;
   switch (e->kind) {
-    case EX_AGG: case EX_SUBQUERY: case EX_EXISTS:
+    case EX_SUBQUERY: case EX_EXISTS:
       return 1;
     case EX_IN:
       if (e->subquery) return 1;
@@ -104,31 +141,51 @@ static int expr_blocks_stream(const tdb_expr *e) {
   return 0;
 }
 
-/* A streamable FROM is one or more base tables joined left-deep by INNER or
-** CROSS joins (no derived tables, views, outer joins, AS OF, or CTE shadowing).
-** Returns the source count (>=1) or 0 if not streamable. */
+/* True if `e` contains an aggregate (COUNT/SUM/…) anywhere. */
+static int expr_has_agg(const tdb_expr *e) {
+  if (!e) return 0;
+  if (e->kind == EX_AGG) return 1;
+  if (expr_has_agg(e->left) || expr_has_agg(e->right)) return 1;
+  if (e->args) for (int i = 0; i < e->args->n; i++)
+    if (expr_has_agg(e->args->items[i])) return 1;
+  return 0;
+}
+
+/* A streamable FROM is one or more base tables joined left-deep by INNER, LEFT,
+** or CROSS joins (no derived tables, views, RIGHT/FULL joins, AS OF, or CTE
+** shadowing). Returns the source count (>=1) or 0 if not streamable. */
 static int from_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   int n = 0;
   for (tdb_src *s = q->from; s; s = s->next) {
     if (s->subquery || !s->table || s->as_of) return 0;
     if (find_cte(st, s->table)) return 0;                /* CTE name shadows a table */
     if (!tdb_catalog_find_table(db->cat, s->table)) return 0;   /* view / missing */
-    if (n > 0 && s->join != JOIN_INNER && s->join != JOIN_CROSS) return 0;
-    if (s->join == JOIN_INNER && expr_blocks_stream(s->on)) return 0;
+    if (n > 0 && s->join != JOIN_INNER && s->join != JOIN_CROSS && s->join != JOIN_LEFT) return 0;
+    if ((s->join == JOIN_INNER || s->join == JOIN_LEFT) && expr_blocks_stream(s->on)) return 0;
     if (++n > MAXSRC) return 0;
   }
   return n;
 }
 
 static int select_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q) {
-  if (q->setop || q->group || q->having || q->distinct) return 0;
+  if (q->setop) return 0;
+  /* DISTINCT streams via a dedup operator on the projected output. With ORDER
+  ** BY the sort runs below projection (keys may reference source columns), so
+  ** dedup-then-sort would need the sort above the projection — leave that to
+  ** the materializing path. */
+  if (q->distinct && q->order) return 0;
   if (q->with) return 0;        /* its CTEs (which may shadow a table) aren't in scope here */
   if (from_streamable(db, st, q) < 1) return 0;
-  if (expr_blocks_stream(q->where)) return 0;
+  /* no subqueries anywhere (those still need the materializing executor) */
+  if (expr_blocks_stream(q->where) || expr_blocks_stream(q->having)) return 0;
   if (q->cols) for (int i = 0; i < q->cols->n; i++)
     if (expr_blocks_stream(q->cols->items[i])) return 0;
-  if (q->order) for (int i = 0; i < q->order->n; i++)   /* ORDER BY streams via a Sort op */
+  if (q->group) for (int i = 0; i < q->group->n; i++)
+    if (expr_blocks_stream(q->group->items[i]) || expr_has_agg(q->group->items[i])) return 0;
+  if (q->order) for (int i = 0; i < q->order->n; i++)
     if (expr_blocks_stream(q->order->exprs[i])) return 0;
+  /* WHERE is applied before grouping, so it must not reference aggregates */
+  if (expr_has_agg(q->where)) return 0;
   return 1;
 }
 
@@ -176,9 +233,20 @@ static int scan_rewind_seek(tdb_op *op, tdb_index *idx, const tdb_value *key) {
   return rc;
 }
 
+/* Set the inner table's columns in the combined row to NULL (the unmatched side
+** of a LEFT JOIN). */
+static void join_null_inner(tdb_op *op) {
+  for (int i = 0; i < op->inner->tbl->ncol; i++) {
+    tdb_value_clear(&op->joinrow[op->inner_base + i]);
+    tdb_value_set_null(&op->joinrow[op->inner_base + i]);
+  }
+}
+
 /* Nested-loop join: for each outer (left) row, scan the inner (right) table and
-** emit the combined rows that satisfy the ON predicate (all rows for CROSS).
-** The combined row is the outer row's columns followed by the inner table's. */
+** emit the combined rows that satisfy the ON predicate (all rows for CROSS). The
+** combined row is the outer row's columns followed by the inner table's. For a
+** LEFT JOIN, an outer row that matches no inner row still emits once, with the
+** inner columns NULL. */
 static int join_next(tdb_op *op, tdb_value **row, int *ncol) {
   for (;;) {
     if (!op->join_started || op->join_eof) {
@@ -190,27 +258,39 @@ static int join_next(tdb_op *op, tdb_value **row, int *ncol) {
         tdb_value_clear(&op->joinrow[i]);
         if (i < onc) tdb_value_copy(&op->joinrow[i], &orow[i]);
       }
+      op->join_started = 1; op->join_eof = 0; op->outer_matched = 0;
       if (op->inner_idx) {
         /* index-driven probe: seek the inner table to the outer key value */
         ectx ec = { op->joinrow, op->inner_base, NULL, 0, op->st, NULL, NULL };
         tdb_value probe; tdb_value_init(&probe);
         eval(op->db, &ec, op->idx_join_key, &probe);
-        if (probe.type == TDB_VAL_NULL) {       /* NULL never equals: skip outer row */
-          tdb_value_clear(&probe);
-          op->join_eof = 1; op->join_started = 1; continue;
-        }
-        rc = scan_rewind_seek(op->inner, op->inner_idx, &probe);
+        int is_null = (probe.type == TDB_VAL_NULL);
+        if (!is_null) rc = scan_rewind_seek(op->inner, op->inner_idx, &probe);
         tdb_value_clear(&probe);
+        if (is_null) {                          /* NULL never equals: no inner match */
+          op->join_eof = 1;
+          if (op->left_join) { join_null_inner(op); op->outer_matched = 1;
+            *row = op->joinrow; *ncol = op->joinncol; return TDB_ROW; }
+          continue;
+        }
       } else {
         rc = scan_rewind(op->inner);
       }
       if (rc) return rc;
-      op->join_started = 1; op->join_eof = 0;
     }
     /* pull the next inner row */
     tdb_value *irow; int inc;
     int rc = scan_next(op->inner, &irow, &inc);
-    if (rc == TDB_DONE) { op->join_eof = 1; continue; }   /* outer advances */
+    if (rc == TDB_DONE) {
+      op->join_eof = 1;
+      if (op->left_join && !op->outer_matched) {   /* unmatched outer row -> NULL row */
+        join_null_inner(op);
+        op->outer_matched = 1;
+        *row = op->joinrow; *ncol = op->joinncol;
+        return TDB_ROW;
+      }
+      continue;                                    /* outer advances */
+    }
     if (rc != TDB_ROW) return rc;
     for (int i = 0; i < op->inner->tbl->ncol; i++) {
       tdb_value_clear(&op->joinrow[op->inner_base + i]);
@@ -224,9 +304,20 @@ static int join_next(tdb_op *op, tdb_value **row, int *ncol) {
       tdb_value_clear(&v);
       if (!ok) continue;
     }
+    op->outer_matched = 1;
     *row = op->joinrow; *ncol = op->joinncol;
     return TDB_ROW;
   }
+}
+
+/* Build an evaluation context for a child row `r`. Above an OP_AGG the child
+** row carries `agg_n` aggregate values appended at `agg_base`, which must be
+** exposed through ectx.aggvals so EX_AGG references resolve; plain columns
+** still read from r[0..agg_base). */
+static ectx agg_ectx(tdb_op *op, tdb_value *r, int nc) {
+  ectx ec = { r, nc, NULL, 0, op->st, NULL, NULL };
+  if (op->agg_n > 0) { ec.aggvals = r + op->agg_base; ec.naggvals = op->agg_n; }
+  return ec;
 }
 
 static int filter_next(tdb_op *op, tdb_value **row, int *ncol) {
@@ -234,7 +325,7 @@ static int filter_next(tdb_op *op, tdb_value **row, int *ncol) {
     tdb_value *r; int nc;
     int rc = op_next(op->child, &r, &nc);
     if (rc != TDB_ROW) return rc;
-    ectx ec = { r, nc, NULL, 0, op->st, NULL, NULL };
+    ectx ec = agg_ectx(op, r, nc);
     tdb_value v; tdb_value_init(&v);
     eval(op->db, &ec, op->pred, &v);
     int ok = val_true(&v);
@@ -247,7 +338,7 @@ static int project_next(tdb_op *op, tdb_value **row, int *ncol) {
   tdb_value *r; int nc;
   int rc = op_next(op->child, &r, &nc);
   if (rc != TDB_ROW) return rc;
-  ectx ec = { r, nc, NULL, 0, op->st, NULL, NULL };
+  ectx ec = agg_ectx(op, r, nc);
   for (int i = 0; i < op->nout; i++) {
     tdb_value_clear(&op->outrow[i]);
     eval(op->db, &ec, op->oexpr[i], &op->outrow[i]);
@@ -316,7 +407,7 @@ static int sort_materialize(tdb_op *op) {
     if (rc == TDB_DONE) break;
     if (rc != TDB_ROW) return rc;
     op->srcncol = nc;
-    ectx ec = { r, nc, NULL, 0, op->st, NULL, NULL };
+    ectx ec = agg_ectx(op, r, nc);
     tdb_value *key = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(op->nkey ? op->nkey : 1));
     for (int k = 0; k < op->nkey; k++) { tdb_value_init(&key[k]); eval(op->db, &ec, op->okeys[k], &key[k]); }
 
@@ -363,14 +454,111 @@ static int sort_next(tdb_op *op, tdb_value **row, int *ncol) {
   return TDB_ROW;
 }
 
+/* Blocking aggregate: drain the child, bucket rows into groups by the GROUP BY
+** keys (linear probe — small group counts), accumulate each aggregate, then
+** emit one row per group of [group-rep source cols | aggregate values]. With no
+** GROUP BY and no input rows, one row is still emitted (SQL scalar aggregate).
+** The accum / accum_update / accum_result helpers are shared with the
+** materializing executor. */
+static int agg_materialize(tdb_op *op) {
+  for (;;) {
+    tdb_value *r; int nc;
+    int rc = op_next(op->child, &r, &nc);
+    if (rc == TDB_DONE) break;
+    if (rc != TDB_ROW) return rc;
+    op->gbase = nc;
+    ectx ec = { r, nc, NULL, 0, op->st, NULL, NULL };
+
+    /* compute the group key, then find or create its bucket */
+    tdb_value *key = op->ngkey ? row_alloc(op->ngkey) : NULL;
+    for (int i = 0; i < op->ngkey; i++) eval(op->db, &ec, op->gkeys[i], &key[i]);
+    int gi = -1;
+    for (int g = 0; g < op->ngrp; g++) {
+      int same = 1;
+      for (int i = 0; i < op->ngkey; i++)
+        if (tdb_value_compare(&op->grps[g].key[i], &key[i], TDB_COLL_BINARY) != 0) { same = 0; break; }
+      if (same) { gi = g; break; }
+    }
+    if (gi < 0) {
+      if (op->ngrp == op->grpcap) {
+        op->grpcap = op->grpcap ? op->grpcap * 2 : 8;
+        op->grps = (group *)tdb_realloc(op->grps, sizeof(group) * (size_t)op->grpcap);
+      }
+      gi = op->ngrp++;
+      op->grps[gi].key = key; key = NULL;
+      op->grps[gi].rep = dup_row(r, nc);     /* own a copy: child row is reused */
+      op->grps[gi].acc = (accum *)tdb_calloc(sizeof(accum) * (size_t)(op->naggx ? op->naggx : 1));
+      for (int j = 0; j < op->naggx; j++) {
+        op->grps[gi].acc[j].sum_is_int = 1;
+        tdb_value_init(&op->grps[gi].acc[j].mn); tdb_value_init(&op->grps[gi].acc[j].mx);
+      }
+    }
+    if (key) { for (int i = 0; i < op->ngkey; i++) tdb_value_clear(&key[i]); tdb_mfree(key); }
+    for (int j = 0; j < op->naggx; j++) accum_update(&op->grps[gi].acc[j], op->aggx[j], op->db, &ec);
+  }
+  /* scalar aggregate over an empty input still yields one (all-NULL-rep) row */
+  if (op->ngrp == 0 && op->ngkey == 0) {
+    op->grps = (group *)tdb_calloc(sizeof(group));
+    op->grps[0].acc = (accum *)tdb_calloc(sizeof(accum) * (size_t)(op->naggx ? op->naggx : 1));
+    for (int j = 0; j < op->naggx; j++) op->grps[0].acc[j].sum_is_int = 1;
+    op->grps[0].rep = NULL;
+    op->ngrp = 1;
+    if (op->gbase == 0) op->gbase = 0;     /* no source row seen: rep cols are empty */
+  }
+  op->aggrow = row_alloc(op->gbase + op->naggx);
+  op->agg_done = 1; op->agg_emit = 0;
+  return TDB_OK;
+}
+
+static int agg_next(tdb_op *op, tdb_value **row, int *ncol) {
+  if (!op->agg_done) { int rc = agg_materialize(op); if (rc) return rc; }
+  if (op->agg_emit >= op->ngrp) return TDB_DONE;
+  group *g = &op->grps[op->agg_emit++];
+  /* [0,gbase): the group's representative source columns; [gbase,+naggx): aggs */
+  for (int i = 0; i < op->gbase; i++) {
+    tdb_value_clear(&op->aggrow[i]);
+    if (g->rep) tdb_value_copy(&op->aggrow[i], &g->rep[i]);
+  }
+  for (int j = 0; j < op->naggx; j++) {
+    tdb_value_clear(&op->aggrow[op->gbase + j]);
+    accum_result(&g->acc[j], op->aggx[j], &op->aggrow[op->gbase + j]);
+  }
+  *row = op->aggrow; *ncol = op->gbase + op->naggx;
+  return TDB_ROW;
+}
+
+/* Emit only rows distinct from those already emitted. Retains one owned copy of
+** each distinct row (NULLs compare equal, matching the materializing path). */
+static int distinct_next(tdb_op *op, tdb_value **row, int *ncol) {
+  for (;;) {
+    tdb_value *r; int nc;
+    int rc = op_next(op->child, &r, &nc);
+    if (rc != TDB_ROW) return rc;
+    op->dwidth = nc;
+    int dup = 0;
+    for (int i = 0; i < op->nseen_rows; i++)
+      if (row_equal(op->seen_rows[i], r, nc)) { dup = 1; break; }
+    if (dup) continue;
+    if (op->nseen_rows == op->seencap) {
+      op->seencap = op->seencap ? op->seencap * 2 : 16;
+      op->seen_rows = (tdb_value **)tdb_realloc(op->seen_rows, sizeof(void *) * (size_t)op->seencap);
+    }
+    op->seen_rows[op->nseen_rows++] = dup_row(r, nc);
+    *row = r; *ncol = nc;
+    return TDB_ROW;
+  }
+}
+
 static int op_next(tdb_op *op, tdb_value **row, int *ncol) {
   switch (op->kind) {
-    case OP_SCAN:    return scan_next(op, row, ncol);
-    case OP_JOIN:    return join_next(op, row, ncol);
-    case OP_FILTER:  return filter_next(op, row, ncol);
-    case OP_SORT:    return sort_next(op, row, ncol);
-    case OP_PROJECT: return project_next(op, row, ncol);
-    case OP_LIMIT:   return limit_next(op, row, ncol);
+    case OP_SCAN:     return scan_next(op, row, ncol);
+    case OP_JOIN:     return join_next(op, row, ncol);
+    case OP_FILTER:   return filter_next(op, row, ncol);
+    case OP_AGG:      return agg_next(op, row, ncol);
+    case OP_SORT:     return sort_next(op, row, ncol);
+    case OP_DISTINCT: return distinct_next(op, row, ncol);
+    case OP_PROJECT:  return project_next(op, row, ncol);
+    case OP_LIMIT:    return limit_next(op, row, ncol);
   }
   return TDB_DONE;
 }
@@ -392,6 +580,24 @@ static void op_close(tdb_op *op) {
   } else if (op->kind == OP_JOIN) {
     if (op->inner) op_close(op->inner);
     if (op->joinrow) { for (int i = 0; i < op->joinncol; i++) tdb_value_clear(&op->joinrow[i]); tdb_mfree(op->joinrow); }
+  } else if (op->kind == OP_AGG) {
+    for (int g = 0; g < op->ngrp; g++) {
+      group *gp = &op->grps[g];
+      if (gp->key) { for (int i = 0; i < op->ngkey; i++) tdb_value_clear(&gp->key[i]); tdb_mfree(gp->key); }
+      if (gp->rep) { for (int i = 0; i < op->gbase; i++) tdb_value_clear(&gp->rep[i]); tdb_mfree(gp->rep); }
+      for (int j = 0; j < op->naggx; j++) {
+        tdb_value_clear(&gp->acc[j].mn); tdb_value_clear(&gp->acc[j].mx);
+        for (int k = 0; k < gp->acc[j].nseen; k++) tdb_value_clear(&gp->acc[j].seen[k]);
+        tdb_mfree(gp->acc[j].seen);
+      }
+      tdb_mfree(gp->acc);
+    }
+    tdb_mfree(op->grps);
+    if (op->aggrow) { for (int i = 0; i < op->gbase + op->naggx; i++) tdb_value_clear(&op->aggrow[i]); tdb_mfree(op->aggrow); }
+    tdb_mfree(op->aggx);     /* the array (its exprs are arena-owned) */
+  } else if (op->kind == OP_DISTINCT) {
+    for (int i = 0; i < op->nseen_rows; i++) free_row(op->seen_rows[i], op->dwidth);
+    tdb_mfree(op->seen_rows);
   }
   tdb_mfree(op);
 }
@@ -468,12 +674,17 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
   }
   tdb_table *t = Q.src[0].tbl;   /* the (left-most) driving table */
 
-  /* ON conditions, WHERE, ORDER BY all resolve against the full row */
+  /* ON / WHERE / GROUP BY / HAVING / ORDER BY resolve against the full row;
+  ** resolve_expr collects any aggregates into Q.aggs[] (assigning agg_index). */
   for (int s = 0; s < Q.nsrc; s++)
     if (Q.src[s].on && resolve_expr(db, &Q, Q.src[s].on)) return NULL;
   if (q->where && resolve_expr(db, &Q, q->where)) return NULL;
+  if (q->group) for (int i = 0; i < q->group->n; i++)
+    if (resolve_expr(db, &Q, q->group->items[i])) return NULL;
+  if (q->having && resolve_expr(db, &Q, q->having)) return NULL;
   if (q->order) for (int i = 0; i < q->order->n; i++)
     if (resolve_expr(db, &Q, q->order->exprs[i])) return NULL;
+  const int totalcols = Q.totalcols;   /* width of a child source row */
 
   /* projection: expand '*', resolve exprs, collect output names */
   tdb_expr **oexpr = NULL; char **onames = NULL; int nout = 0, ocap = 0;
@@ -550,7 +761,8 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
     tdb_op *join = op_new(OP_JOIN, db, st);
     join->child = src;
     join->inner = inner;
-    join->on = (s->join == JOIN_INNER) ? s->on : NULL;   /* CROSS has no ON */
+    join->on = (s->join == JOIN_CROSS) ? NULL : s->on;   /* CROSS has no ON */
+    join->left_join = (s->join == JOIN_LEFT);
     join->inner_base = qs->base;
     join->joinncol = qs->base + qs->tbl->ncol;
     join->joinrow = row_alloc(join->joinncol);
@@ -564,13 +776,43 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
     src = join;
   }
 
+  /* WHERE applies to raw source rows, before any grouping */
   if (q->where) {
     tdb_op *flt = op_new(OP_FILTER, db, st);
     flt->child = src; flt->pred = q->where;
     src = flt;
   }
 
-  /* ORDER BY: sort before projection so keys can reference any source column.
+  /* GROUP BY / aggregates: a blocking aggregate emits one combined row per
+  ** group ([source rep cols | aggregate values]); HAVING / ORDER BY / projection
+  ** above it are agg-aware (they read the appended aggregate slots). */
+  int aggregated = (Q.nagg > 0 || q->group != NULL);
+  int agg_base = 0, agg_n = 0;
+  if (aggregated) {
+    tdb_op *agg = op_new(OP_AGG, db, st);
+    agg->child = src;
+    agg->gbase = totalcols;
+    agg->ngkey = q->group ? q->group->n : 0;
+    agg->gkeys = q->group ? q->group->items : NULL;
+    agg->naggx = Q.nagg;
+    if (Q.nagg) {
+      agg->aggx = (tdb_expr **)tdb_malloc(sizeof(tdb_expr *) * (size_t)Q.nagg);
+      for (int j = 0; j < Q.nagg; j++) agg->aggx[j] = Q.aggs[j];
+    }
+    src = agg;
+    agg_base = totalcols; agg_n = Q.nagg;   /* stamp the agg-aware operators above */
+  }
+
+  /* HAVING filters grouped rows (agg-aware) — below the sort so a bounded
+  ** top-N sort doesn't spend LIMIT slots on rows HAVING would drop. */
+  if (q->having) {
+    tdb_op *hav = op_new(OP_FILTER, db, st);
+    hav->child = src; hav->pred = q->having;
+    hav->agg_base = agg_base; hav->agg_n = agg_n;
+    src = hav;
+  }
+
+  /* ORDER BY: sort before projection so keys can reference any source/agg value.
   ** With a LIMIT the sort is bounded to the top (OFFSET+LIMIT) rows. */
   if (q->order) {
     tdb_op *sort = op_new(OP_SORT, db, st);
@@ -578,6 +820,7 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
     sort->okeys = q->order->exprs;
     sort->odesc = q->order->desc;
     sort->nkey  = q->order->n;
+    sort->agg_base = agg_base; sort->agg_n = agg_n;
     if (q->has_limit) {
       int64_t lim = const_int(db, st, q->limit, -1);
       int64_t off = q->offset ? const_int(db, st, q->offset, 0) : 0;
@@ -591,7 +834,16 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
   tdb_op *proj = op_new(OP_PROJECT, db, st);
   proj->child = src; proj->oexpr = oexpr; proj->nout = nout;
   proj->outrow = row_alloc(nout);
+  proj->agg_base = agg_base; proj->agg_n = agg_n;
   src = proj;
+
+  /* DISTINCT dedups the projected output (no ORDER BY in the streamed case);
+  ** LIMIT below applies to the deduplicated stream. */
+  if (q->distinct) {
+    tdb_op *dis = op_new(OP_DISTINCT, db, st);
+    dis->child = src;
+    src = dis;
+  }
 
   if (q->has_limit || q->offset) {
     tdb_op *lim = op_new(OP_LIMIT, db, st);

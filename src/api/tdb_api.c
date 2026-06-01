@@ -18,7 +18,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #endif
 
@@ -116,6 +118,19 @@ int tdb_set_user(tdb_db *db, const char *name) {
 
 const char *tdb_get_user(tdb_db *db) {
   return db ? db->current_user : NULL;
+}
+
+int tdb_set_max_recursive_iters(tdb_db *db, int max_iters) {
+  if (!db) return TDB_MISUSE;
+  db_lock(db);
+  if (max_iters > 0) db->max_recursive_iters = max_iters;
+  db_unlock(db);
+  return TDB_OK;
+}
+
+int tdb_get_max_recursive_iters(tdb_db *db) {
+  if (!db) return 0;
+  return db->max_recursive_iters > 0 ? db->max_recursive_iters : 8192;
 }
 
 const char *tdb_errmsg(tdb_db *db) {
@@ -474,11 +489,23 @@ int tdb_load_extension(tdb_db *db, const char *path, const char *entry,
                        char **errmsg) {
   if (errmsg) *errmsg = NULL;
   if (!db || !path) return TDB_MISUSE;
+  const char *sym = entry && *entry ? entry : "tdb_extension_init";
+  union { void *p; tdb_ext_init_fn f; } cast;
 #ifdef _WIN32
-  (void)entry;
-  tdb_db_seterr(db, "extension loading is not supported on this platform");
-  if (errmsg) *errmsg = tdb_strdup(db->errmsg);
-  return TDB_UNSUPPORTED;
+  HMODULE h = LoadLibraryA(path);
+  if (!h) {
+    tdb_db_seterr(db, "LoadLibrary failed: error %lu", (unsigned long)GetLastError());
+    if (errmsg) *errmsg = tdb_strdup(db->errmsg);
+    return TDB_ERROR;
+  }
+  FARPROC pfn = GetProcAddress(h, sym);
+  cast.p = (void *)pfn;
+  if (!cast.p) {
+    tdb_db_seterr(db, "extension entry point '%s' not found", sym);
+    if (errmsg) *errmsg = tdb_strdup(db->errmsg);
+    FreeLibrary(h);
+    return TDB_ERROR;
+  }
 #else
   void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
   if (!h) {
@@ -487,10 +514,8 @@ int tdb_load_extension(tdb_db *db, const char *path, const char *entry,
     if (errmsg) *errmsg = tdb_strdup(db->errmsg);
     return TDB_ERROR;
   }
-  const char *sym = entry && *entry ? entry : "tdb_extension_init";
   /* object-pointer to function-pointer cast via a union to stay strictly
   ** conforming under -Wpedantic */
-  union { void *p; tdb_ext_init_fn f; } cast;
   cast.p = dlsym(h, sym);
   if (!cast.p) {
     tdb_db_seterr(db, "extension entry point '%s' not found", sym);
@@ -498,31 +523,46 @@ int tdb_load_extension(tdb_db *db, const char *path, const char *entry,
     dlclose(h);
     return TDB_ERROR;
   }
+#endif
   char *emsg = NULL;
   int rc = cast.f(db, &emsg);
   if (rc != TDB_OK) {
     tdb_db_seterr(db, "extension init failed: %s", emsg ? emsg : "error");
     if (errmsg) *errmsg = emsg; else tdb_free(emsg);
+#ifdef _WIN32
+    FreeLibrary(h);
+#else
     dlclose(h);
+#endif
     return rc;
   }
   tdb_free(emsg);
   tdb_ext_handle *eh = (tdb_ext_handle *)tdb_calloc(sizeof(*eh));
-  if (!eh) { dlclose(h); return TDB_NOMEM; }
+  if (!eh) {
+#ifdef _WIN32
+    FreeLibrary(h);
+#else
+    dlclose(h);
+#endif
+    return TDB_NOMEM;
+  }
   eh->dl = h;
   eh->next = db->exts;
   db->exts = eh;
   return TDB_OK;
-#endif
 }
 
 static void tdb_db_free_extensions(tdb_db *db) {
   tdb_ext_handle *e = db->exts;
   while (e) {
     tdb_ext_handle *n = e->next;
-#ifndef _WIN32
-    if (e->dl) dlclose(e->dl);
+    if (e->dl) {
+#ifdef _WIN32
+      FreeLibrary((HMODULE)e->dl);
+#else
+      dlclose(e->dl);
 #endif
+    }
     tdb_mfree(e);
     e = n;
   }

@@ -220,11 +220,47 @@ static void test_destroy_reclaim(void) {
   tdb_pager_close(p);
 }
 
+/* Reverse traversal across leaf boundaries: tdb_cursor_last + repeated
+** tdb_cursor_prev must visit every row in descending rowid order. */
+static void test_cursor_prev_across_leaves(void) {
+  tdb_pager *p = open_mem();
+  tdb_pgno root;
+  TDB_CHECK_EQ(tdb_btree_create(p, TDB_BT_TABLE, &root), TDB_OK);
+  tdb_btree *bt; tdb_btree_open(p, root, TDB_BT_TABLE, NULL, &bt);
+
+  const int N = 2000; /* enough rows to force a multi-level tree */
+  for (int i = 0; i < N; i++) {
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "row-%d", i);
+    TDB_CHECK_EQ(tdb_btree_put(bt, (tdb_rowid)(i + 1), buf, n), TDB_OK);
+  }
+
+  tdb_cursor *cur; tdb_cursor_open(bt, &cur);
+  TDB_CHECK_EQ(tdb_cursor_last(cur), TDB_OK);
+
+  int count = 0;
+  tdb_rowid prev = (tdb_rowid)(N + 1);
+  while (!tdb_cursor_eof(cur)) {
+    tdb_rowid rid; TDB_CHECK_EQ(tdb_cursor_rowid(cur, &rid), TDB_OK);
+    TDB_CHECK(rid < prev);
+    prev = rid;
+    count++;
+    TDB_CHECK_EQ(tdb_cursor_prev(cur), TDB_OK);
+  }
+  TDB_CHECK_EQ(count, N);
+  TDB_CHECK_EQ((int)prev, 1);
+  tdb_cursor_close(cur);
+
+  tdb_btree_close(bt);
+  tdb_pager_close(p);
+}
+
 static tdb_test_case cases[] = {
   {"table_many", test_table_many},
   {"table_fuzz", test_table_fuzz},
   {"overflow", test_overflow},
   {"index", test_index},
   {"destroy_reclaim", test_destroy_reclaim},
+  {"cursor_prev_across_leaves", test_cursor_prev_across_leaves},
 };
 TDB_MAIN(cases)

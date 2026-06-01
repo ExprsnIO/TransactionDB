@@ -44,6 +44,7 @@ tdb_routine *tdb_catalog_routine_at(tdb_catalog *c, int i);
 ** row reclamation is left to a future vacuum/rewrite). */
 void       tdb_catalog_drop_table(tdb_catalog *c, const char *name);
 void       tdb_catalog_drop_view(tdb_catalog *c, const char *name);
+void       tdb_catalog_drop_routine(tdb_catalog *c, const char *name);
 
 /* Rewrite a table's persisted catalog row (e.g. after CREATE INDEX adds an
 ** index to an existing table). The *_as variant locates the row by a given
@@ -55,5 +56,31 @@ int        tdb_catalog_update_table_as(tdb_catalog *c, const char *find_name, td
 ** catalog b-tree under CAT_GRANT records). */
 tdb_acl   *tdb_catalog_acl(tdb_catalog *c);
 int        tdb_catalog_acl_persist(tdb_catalog *c, const tdb_acl_entry *e);
+/* Remove every persisted CAT_GRANT row matching the (grantee, priv, kind,
+** object) tuple. NULL fields are wildcards (same matching rules as
+** tdb_acl_revoke). Returns the number of rows deleted on success. */
+int        tdb_catalog_acl_unpersist(tdb_catalog *c, const char *grantee,
+                                     const char *priv, int kind,
+                                     const char *object, int *removed);
+
+/* Schema-object comments (COMMENT ON ...). `kind` mirrors the parser's
+** on_kind (1=TABLE, 2=COLUMN, 3=INDEX, 4=VIEW, 5=DATABASE). Persisted as
+** CAT_COMMENT catalog rows; replacing an existing comment overwrites it,
+** and a NULL `body` deletes the comment. Returns TDB_OK on success. */
+int        tdb_catalog_set_comment(tdb_catalog *c, int kind,
+                                   const char *target, const char *body);
+/* Returns a malloc'd copy of the body (caller frees) or NULL if none. */
+char      *tdb_catalog_get_comment(tdb_catalog *c, int kind, const char *target);
+
+/* Tablespace registry — metadata only (placement is not implemented; the
+** entries only constrain CREATE TABLE TABLESPACE <name> validation). Both
+** create and drop are idempotent under the matching IF clause. */
+int          tdb_catalog_tablespace_create(tdb_catalog *c, const char *name,
+                                           const char *location, int if_not_exists);
+int          tdb_catalog_tablespace_drop(tdb_catalog *c, const char *name, int if_exists);
+int          tdb_catalog_tablespace_exists(tdb_catalog *c, const char *name);
+int          tdb_catalog_tablespace_count(tdb_catalog *c);
+const char  *tdb_catalog_tablespace_name_at(tdb_catalog *c, int i);
+const char  *tdb_catalog_tablespace_location_at(tdb_catalog *c, int i);
 
 #endif /* TDB_CATALOG_H */

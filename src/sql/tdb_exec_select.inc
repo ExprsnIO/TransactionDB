@@ -535,7 +535,8 @@ static int materialize_recursive_cte(tdb_db *db, tdb_stmt *st, tdb_cte *c) {
   /* Iterate: each step's reference to the CTE sees `wset` only (the frontier),
   ** not the full accumulated result — this is what gives recursive CTEs
   ** correct termination semantics for UNION ALL recursion. */
-  for (int it = 0; it < TDB_CTE_MAX_ITERS; it++) {
+  int max_iters = db->max_recursive_iters > 0 ? db->max_recursive_iters : TDB_CTE_MAX_ITERS;
+  for (int it = 0; it < max_iters; it++) {
     c->rows = wset;
     tdb_stmt step;
     rc = run_subselect(db, st, saved_next, &step, NULL);
@@ -581,7 +582,7 @@ static int materialize_recursive_cte(tdb_db *db, tdb_stmt *st, tdb_cte *c) {
   }
   cte_rows_free(wset);
   c->rows = acc;
-  tdb_db_seterr(db, "WITH RECURSIVE did not converge within %d iterations", TDB_CTE_MAX_ITERS);
+  tdb_db_seterr(db, "WITH RECURSIVE did not converge within %d iterations", max_iters);
   return TDB_ERROR;
 }
 
@@ -984,10 +985,16 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer
   int rc = TDB_OK;
   int ngroup = q->group ? q->group->n : 0;
 
-  /* Window functions are only supported in non-aggregated queries: they
-  ** evaluate after WHERE filtering and any joins, in the projection step. */
+  /* Window functions evaluate after WHERE/JOIN, in the projection step,
+  ** over the pre-aggregation rowset. Combining them with GROUP BY or
+  ** scalar aggregates would require windowing over the post-aggregation
+  ** rows, which the executor does not yet build a frame for. Reject
+  ** clearly so callers know to wrap the aggregate in a subquery. */
   if (Q.nwin > 0 && aggregated) {
-    tdb_db_seterr(db, "window functions over an aggregated query are not supported");
+    tdb_db_seterr(db,
+      "window functions are not allowed alongside GROUP BY or scalar "
+      "aggregates; wrap the aggregated query in a subquery and apply the "
+      "window over its result");
     rowset_free(&in); FAILP;
   }
 

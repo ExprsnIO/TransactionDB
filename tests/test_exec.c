@@ -1718,6 +1718,16 @@ static void test_acl_grant_revoke(void) {
   tdb_set_user(db, "dave");                 /* unrelated user — still denied */
   TDB_CHECK(exec(db, "SELECT v FROM x") != TDB_OK);
   tdb_close(db);
+
+  /* persistence: a REVOKE also survives reopening (no zombie grants on disk) */
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "REVOKE SELECT ON TABLE x FROM carol"), TDB_OK);
+  tdb_close(db);
+
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  tdb_set_user(db, "carol");
+  TDB_CHECK(exec(db, "SELECT v FROM x") != TDB_OK);  /* GRANT was reclaimed */
+  tdb_close(db);
   remove(path); remove("test_acl_persist.db-wal");
 }
 
@@ -1811,6 +1821,19 @@ static void test_recursive_cte(void) {
     "  SELECT 'a' UNION "
     "  SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node) "
     "SELECT COUNT(*) FROM reach"), 4);
+
+  /* The iteration cap is configurable per connection. Lowering it below
+  ** the recursion depth makes the query fail with the convergence error. */
+  TDB_CHECK_EQ(tdb_get_max_recursive_iters(db), 8192);  /* default */
+  TDB_CHECK_EQ(tdb_set_max_recursive_iters(db, 3), TDB_OK);
+  TDB_CHECK_EQ(tdb_get_max_recursive_iters(db), 3);
+  tdb_stmt *st = NULL;
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL "
+    "  SELECT n+1 FROM t WHERE n < 100) "
+    "SELECT COUNT(*) FROM t", -1, &st, NULL), TDB_OK);
+  TDB_CHECK(tdb_step(st) != TDB_ROW);   /* aborts before convergence */
+  tdb_finalize(st);
   tdb_close(db);
 }
 
@@ -1824,24 +1847,76 @@ static void test_phase11_utility(void) {
   TDB_CHECK_EQ(exec(db, "INSERT INTO log VALUES (1,'a'),(2,'b'),(3,'c')"), TDB_OK);
   TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 3);
 
-  /* TRUNCATE empties the table */
+  /* TRUNCATE empties the table; CASCADE is a recognized no-op (no FK
+  ** enforcement) and RESTART IDENTITY is explicitly rejected since rowid
+  ** generation cannot actually reset without a hard b-tree rebuild. */
   TDB_CHECK_EQ(exec(db, "TRUNCATE TABLE log"), TDB_OK);
   TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 0);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO log VALUES (4,'d')"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "TRUNCATE TABLE log CASCADE"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 0);
+  TDB_CHECK(exec(db, "TRUNCATE TABLE log RESTART IDENTITY") != TDB_OK);
 
-  /* ANALYZE / REINDEX / COMMENT are accepted; they do not error on a valid
-  ** table even though their internal effects are stubbed. */
+  /* ANALYZE is accepted; it does not error on a valid table even though
+  ** its internal effects are stubbed. */
   TDB_CHECK_EQ(exec(db, "ANALYZE log"), TDB_OK);
   TDB_CHECK_EQ(exec(db, "REINDEX TABLE log"), TDB_OK);
-  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE log IS 'truncated'"), TDB_OK);
   TDB_CHECK_EQ(exec(db, "LOCK TABLE log IN EXCLUSIVE MODE"), TDB_OK);
 
-  /* CREATE TABLESPACE / DROP TABLESPACE are parsed and accepted. */
+  /* REINDEX actually rebuilds: drop the index pages and recreate from rows.
+  ** Use a non-partitioned table so we can also exercise REINDEX INDEX. */
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE bag (id INTEGER PRIMARY KEY, k INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE INDEX bag_k ON bag(k)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO bag VALUES (1,10),(2,20),(3,30),(4,40)"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM bag WHERE k = 30"), 1);
+  TDB_CHECK_EQ(exec(db, "REINDEX INDEX bag_k"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM bag WHERE k = 30"), 1);
+  TDB_CHECK_EQ(exec(db, "REINDEX TABLE bag"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM bag WHERE k = 20"), 1);
+  TDB_CHECK(exec(db, "REINDEX INDEX nope") != TDB_OK);
+  /* REINDEX with no target rebuilds every index in the database. */
+  TDB_CHECK_EQ(exec(db, "REINDEX"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM bag WHERE k = 40"), 1);
+
+  /* COMMENT validates the target object exists and persists the body. */
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE log IS 'truncated'"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "COMMENT ON COLUMN log.msg IS 'message text'"), TDB_OK);
+  TDB_CHECK(exec(db, "COMMENT ON TABLE nope IS 'x'")   != TDB_OK);
+  TDB_CHECK(exec(db, "COMMENT ON COLUMN log.nope IS 'x'") != TDB_OK);
+  TDB_CHECK(exec(db, "COMMENT ON COLUMN bareword IS 'x'") != TDB_OK);
+  /* Replacing an existing comment, and clearing with NULL, both succeed. */
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE log IS 'second'"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "COMMENT ON COLUMN log.msg IS NULL"), TDB_OK);
+
+  /* CREATE / DROP TABLESPACE persist a registry entry. The log table was
+  ** created with TABLESPACE warm, so DROP refuses while it's in use. */
   TDB_CHECK_EQ(exec(db, "CREATE TABLESPACE warm LOCATION '/tmp/warm'"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLESPACE warm LOCATION '/tmp/warm'"), TDB_ERROR);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLESPACE IF NOT EXISTS warm"), TDB_OK);
+  TDB_CHECK(exec(db, "DROP TABLESPACE warm") != TDB_OK);     /* in use by log */
+  TDB_CHECK(exec(db, "DROP TABLESPACE nope") != TDB_OK);
+  TDB_CHECK_EQ(exec(db, "DROP TABLESPACE IF EXISTS nope"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "DROP TABLE log"), TDB_OK);
   TDB_CHECK_EQ(exec(db, "DROP TABLESPACE warm"), TDB_OK);
 
   /* Unknown target rejected */
   TDB_CHECK(exec(db, "TRUNCATE TABLE nope") != TDB_OK);
   tdb_close(db);
+
+  /* COMMENT persistence survives a close/reopen. */
+  const char *path = "test_phase11_comment.db";
+  remove(path); remove("test_phase11_comment.db-wal");
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE notes (id INTEGER PRIMARY KEY, t TEXT)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE notes IS 'persistent'"), TDB_OK);
+  tdb_close(db);
+
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  /* clearing the body removes the row; setting it again writes a fresh one */
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE notes IS NULL"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE notes IS 'restored'"), TDB_OK);
+  tdb_close(db);
+  remove(path); remove("test_phase11_comment.db-wal");
 }
 
 static tdb_test_case cases[] = {

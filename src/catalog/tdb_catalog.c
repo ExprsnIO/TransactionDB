@@ -7,10 +7,17 @@
 
 #include <string.h>
 
-#define CAT_TABLE   'T'
-#define CAT_VIEW    'V'
-#define CAT_ROUTINE 'R'
-#define CAT_GRANT   'G'
+#define CAT_TABLE      'T'
+#define CAT_VIEW       'V'
+#define CAT_ROUTINE    'R'
+#define CAT_GRANT      'G'
+#define CAT_COMMENT    'C'
+#define CAT_TABLESPACE 'S'
+
+typedef struct tdb_tablespace {
+  char *name;
+  char *location;
+} tdb_tablespace;
 
 struct tdb_catalog {
   tdb_pager   *pager;
@@ -18,6 +25,7 @@ struct tdb_catalog {
   tdb_table  **tables;  int ntable, captable;
   tdb_view   **views;   int nview, capview;
   tdb_routine**routines;int nroutine, caproutine;
+  tdb_tablespace *tspaces; int ntspace, captspace;
   tdb_acl      acl;
 };
 
@@ -327,6 +335,19 @@ static int catalog_load(tdb_catalog *c) {
         tdb_acl_grant(&c->acl, ent.grantee, ent.priv, ent.kind, ent.object);
         tdb_mfree(ent.grantee); tdb_mfree(ent.priv); tdb_mfree(ent.object);
       }
+    } else if (type == CAT_TABLESPACE) {
+      char *nm = r_str(&r);
+      char *loc = r_str(&r);
+      if (!r.err && nm) {
+        if (c->ntspace == c->captspace) {
+          int cap = c->captspace ? c->captspace * 2 : 4;
+          c->tspaces = (tdb_tablespace *)tdb_realloc(c->tspaces, sizeof(tdb_tablespace) * (size_t)cap);
+          c->captspace = cap;
+        }
+        c->tspaces[c->ntspace].name = nm;
+        c->tspaces[c->ntspace].location = loc;
+        c->ntspace++;
+      } else { tdb_mfree(nm); tdb_mfree(loc); }
     }
   }
   tdb_cursor_close(cur);
@@ -363,9 +384,13 @@ void tdb_catalog_close(tdb_catalog *c) {
   for (int i = 0; i < c->ntable; i++) tdb_table_free(c->tables[i]);
   for (int i = 0; i < c->nview; i++) tdb_view_free(c->views[i]);
   for (int i = 0; i < c->nroutine; i++) tdb_routine_free(c->routines[i]);
+  for (int i = 0; i < c->ntspace; i++) {
+    tdb_mfree(c->tspaces[i].name); tdb_mfree(c->tspaces[i].location);
+  }
   tdb_mfree(c->tables);
   tdb_mfree(c->views);
   tdb_mfree(c->routines);
+  tdb_mfree(c->tspaces);
   tdb_acl_free(&c->acl);
   tdb_mfree(c);
 }
@@ -377,6 +402,65 @@ int tdb_catalog_acl_persist(tdb_catalog *c, const tdb_acl_entry *e) {
   tdb_acl_entry_serialize(e, &b);
   int rc = catalog_put(c, &b);
   tdb_buf_free(&b);
+  return rc;
+}
+
+/* Matching rules mirror tdb_acl_revoke: NULL/empty filters are wildcards,
+** "ALL" matches any priv, "PUBLIC" grantee matches any entry. */
+static int acl_match(const tdb_acl_entry *e,
+                     const char *grantee, const char *priv,
+                     int kind, const char *object) {
+  if (grantee && *grantee && strcasecmp(grantee, "PUBLIC") != 0) {
+    if (!e->grantee || strcasecmp(grantee, e->grantee) != 0) return 0;
+  }
+  if (priv && *priv && strcasecmp(priv, "ALL") != 0) {
+    if (!e->priv || strcasecmp(priv, e->priv) != 0) return 0;
+  }
+  if (kind != 0 && kind != e->kind) return 0;
+  if (object && *object) {
+    if (!e->object || strcasecmp(object, e->object) != 0) return 0;
+  }
+  return 1;
+}
+
+int tdb_catalog_acl_unpersist(tdb_catalog *c, const char *grantee,
+                              const char *priv, int kind,
+                              const char *object, int *removed) {
+  if (removed) *removed = 0;
+  tdb_btree *bt;
+  int rc = tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt);
+  if (rc) return rc;
+
+  tdb_rowid *ids = NULL; int nid = 0, capid = 0;
+  tdb_cursor *cur;
+  rc = tdb_cursor_open(bt, &cur);
+  if (rc) { tdb_btree_close(bt); return rc; }
+  for (tdb_cursor_first(cur); !tdb_cursor_eof(cur); tdb_cursor_next(cur)) {
+    const uint8_t *v; int n;
+    if (tdb_cursor_data(cur, &v, &n)) break;
+    if (n < 1 || v[0] != CAT_GRANT) continue;
+    tdb_acl_entry ent;
+    if (tdb_acl_entry_deserialize(v, n, &ent) != TDB_OK) continue;
+    int hit = acl_match(&ent, grantee, priv, kind, object);
+    tdb_mfree(ent.grantee); tdb_mfree(ent.priv); tdb_mfree(ent.object);
+    if (!hit) continue;
+    if (nid == capid) {
+      capid = capid ? capid * 2 : 8;
+      ids = (tdb_rowid *)tdb_realloc(ids, sizeof(tdb_rowid) * (size_t)capid);
+    }
+    tdb_cursor_rowid(cur, &ids[nid++]);
+  }
+  tdb_cursor_close(cur);
+
+  int nrem = 0;
+  for (int i = 0; i < nid && !rc; i++) {
+    int found = 0;
+    rc = tdb_btree_del(bt, ids[i], &found);
+    if (!rc && found) nrem++;
+  }
+  tdb_btree_close(bt);
+  tdb_mfree(ids);
+  if (removed) *removed = nrem;
   return rc;
 }
 
@@ -438,6 +522,184 @@ int tdb_catalog_update_table(tdb_catalog *c, tdb_table *t) {
   return tdb_catalog_update_table_as(c, t->name, t);
 }
 
+/* ------------------------------ comments ----------------------------- */
+
+/* CAT_COMMENT layout: 'C' | kind:u8 | varint+bytes target | varint+bytes body */
+static void ser_comment(int kind, const char *target, const char *body, tdb_buf *b) {
+  w_u8(b, CAT_COMMENT);
+  w_u8(b, (uint8_t)kind);
+  w_str(b, target);
+  w_str(b, body);
+}
+
+/* Find every CAT_COMMENT row matching (kind, target) and return rowids. */
+static int find_comment_rows(tdb_catalog *c, int kind, const char *target,
+                             tdb_rowid **out, int *out_n) {
+  *out = NULL; *out_n = 0;
+  tdb_btree *bt;
+  int rc = tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt);
+  if (rc) return rc;
+  tdb_cursor *cur;
+  rc = tdb_cursor_open(bt, &cur);
+  if (rc) { tdb_btree_close(bt); return rc; }
+
+  tdb_rowid *ids = NULL; int nid = 0, cap = 0;
+  for (tdb_cursor_first(cur); !tdb_cursor_eof(cur); tdb_cursor_next(cur)) {
+    const uint8_t *v; int n;
+    if (tdb_cursor_data(cur, &v, &n)) break;
+    if (n < 2 || v[0] != CAT_COMMENT) continue;
+    rd r = { v, n, 0, 0 };
+    (void)r_u8(&r);
+    int ek = r_u8(&r);
+    char *etgt = r_str(&r);
+    int hit = (!r.err && ek == kind && etgt && target && strcasecmp(etgt, target) == 0);
+    tdb_mfree(etgt);
+    if (!hit) continue;
+    if (nid == cap) {
+      cap = cap ? cap * 2 : 4;
+      ids = (tdb_rowid *)tdb_realloc(ids, sizeof(tdb_rowid) * (size_t)cap);
+    }
+    tdb_cursor_rowid(cur, &ids[nid++]);
+  }
+  tdb_cursor_close(cur);
+  tdb_btree_close(bt);
+  *out = ids; *out_n = nid;
+  return TDB_OK;
+}
+
+int tdb_catalog_set_comment(tdb_catalog *c, int kind, const char *target,
+                            const char *body) {
+  if (!target) return TDB_MISUSE;
+  /* delete any prior comment for this object so we don't accumulate rows */
+  tdb_rowid *ids = NULL; int nid = 0;
+  int rc = find_comment_rows(c, kind, target, &ids, &nid);
+  if (rc) { tdb_mfree(ids); return rc; }
+  if (nid > 0) {
+    tdb_btree *bt;
+    rc = tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt);
+    if (!rc) {
+      for (int i = 0; i < nid && !rc; i++) {
+        int f = 0; rc = tdb_btree_del(bt, ids[i], &f);
+      }
+      tdb_btree_close(bt);
+    }
+  }
+  tdb_mfree(ids);
+  if (rc) return rc;
+  if (!body) return TDB_OK;            /* NULL body = drop the comment */
+  tdb_buf b; tdb_buf_init(&b);
+  ser_comment(kind, target, body, &b);
+  rc = catalog_put(c, &b);
+  tdb_buf_free(&b);
+  return rc;
+}
+
+char *tdb_catalog_get_comment(tdb_catalog *c, int kind, const char *target) {
+  if (!target) return NULL;
+  tdb_btree *bt;
+  if (tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt) != TDB_OK) return NULL;
+  tdb_cursor *cur;
+  if (tdb_cursor_open(bt, &cur) != TDB_OK) { tdb_btree_close(bt); return NULL; }
+  char *found = NULL;
+  for (tdb_cursor_first(cur); !tdb_cursor_eof(cur); tdb_cursor_next(cur)) {
+    const uint8_t *v; int n;
+    if (tdb_cursor_data(cur, &v, &n)) break;
+    if (n < 2 || v[0] != CAT_COMMENT) continue;
+    rd r = { v, n, 0, 0 };
+    (void)r_u8(&r);
+    int ek = r_u8(&r);
+    char *etgt = r_str(&r);
+    if (!r.err && ek == kind && etgt && strcasecmp(etgt, target) == 0) {
+      tdb_mfree(etgt);
+      found = r_str(&r);
+      break;
+    }
+    tdb_mfree(etgt);
+  }
+  tdb_cursor_close(cur);
+  tdb_btree_close(bt);
+  return found;
+}
+
+/* ----------------------------- tablespaces ---------------------------- */
+
+int tdb_catalog_tablespace_exists(tdb_catalog *c, const char *name) {
+  if (!name) return 0;
+  for (int i = 0; i < c->ntspace; i++)
+    if (strcasecmp(c->tspaces[i].name, name) == 0) return 1;
+  return 0;
+}
+
+int tdb_catalog_tablespace_count(tdb_catalog *c) { return c->ntspace; }
+const char *tdb_catalog_tablespace_name_at(tdb_catalog *c, int i) {
+  return (i >= 0 && i < c->ntspace) ? c->tspaces[i].name : NULL;
+}
+const char *tdb_catalog_tablespace_location_at(tdb_catalog *c, int i) {
+  return (i >= 0 && i < c->ntspace) ? c->tspaces[i].location : NULL;
+}
+
+int tdb_catalog_tablespace_create(tdb_catalog *c, const char *name,
+                                  const char *location, int if_not_exists) {
+  if (!name || !*name) return TDB_MISUSE;
+  if (tdb_catalog_tablespace_exists(c, name)) {
+    return if_not_exists ? TDB_OK : TDB_ERROR;
+  }
+  tdb_buf b; tdb_buf_init(&b);
+  w_u8(&b, CAT_TABLESPACE);
+  w_str(&b, name);
+  w_str(&b, location);
+  int rc = catalog_put(c, &b);
+  tdb_buf_free(&b);
+  if (rc) return rc;
+  if (c->ntspace == c->captspace) {
+    int cap = c->captspace ? c->captspace * 2 : 4;
+    c->tspaces = (tdb_tablespace *)tdb_realloc(c->tspaces, sizeof(tdb_tablespace) * (size_t)cap);
+    c->captspace = cap;
+  }
+  c->tspaces[c->ntspace].name = tdb_strdup(name);
+  c->tspaces[c->ntspace].location = location ? tdb_strdup(location) : NULL;
+  c->ntspace++;
+  return TDB_OK;
+}
+
+int tdb_catalog_tablespace_drop(tdb_catalog *c, const char *name, int if_exists) {
+  if (!name) return TDB_MISUSE;
+  int idx = -1;
+  for (int i = 0; i < c->ntspace; i++)
+    if (strcasecmp(c->tspaces[i].name, name) == 0) { idx = i; break; }
+  if (idx < 0) return if_exists ? TDB_OK : TDB_ERROR;
+
+  /* Find and delete the persisted row. */
+  tdb_btree *bt;
+  int rc = tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt);
+  if (rc) return rc;
+  tdb_cursor *cur;
+  rc = tdb_cursor_open(bt, &cur);
+  if (rc) { tdb_btree_close(bt); return rc; }
+  tdb_rowid rid = 0;
+  for (tdb_cursor_first(cur); !tdb_cursor_eof(cur); tdb_cursor_next(cur)) {
+    const uint8_t *v; int n;
+    if (tdb_cursor_data(cur, &v, &n)) break;
+    if (n < 2 || v[0] != CAT_TABLESPACE) continue;
+    rd r = { v, n, 0, 0 };
+    (void)r_u8(&r);
+    char *nm = r_str(&r);
+    int hit = (nm && strcasecmp(nm, name) == 0);
+    tdb_mfree(nm);
+    if (hit) { tdb_cursor_rowid(cur, &rid); break; }
+  }
+  tdb_cursor_close(cur);
+  if (rid) { int f = 0; rc = tdb_btree_del(bt, rid, &f); }
+  tdb_btree_close(bt);
+  if (rc) return rc;
+
+  tdb_mfree(c->tspaces[idx].name);
+  tdb_mfree(c->tspaces[idx].location);
+  for (int j = idx; j < c->ntspace - 1; j++) c->tspaces[j] = c->tspaces[j + 1];
+  c->ntspace--;
+  return TDB_OK;
+}
+
 /* Delete the persisted catalog row for `name` (any object type: the name is
 ** the first field after the type byte for tables, views, and routines). */
 static int del_row(tdb_catalog *c, const char *name) {
@@ -483,6 +745,18 @@ void tdb_catalog_drop_view(tdb_catalog *c, const char *name) {
       tdb_view_free(c->views[i]);
       for (int j = i; j < c->nview - 1; j++) c->views[j] = c->views[j + 1];
       c->nview--;
+      return;
+    }
+  }
+}
+
+void tdb_catalog_drop_routine(tdb_catalog *c, const char *name) {
+  del_row(c, name);
+  for (int i = 0; i < c->nroutine; i++) {
+    if (strcasecmp(c->routines[i]->name, name) == 0) {
+      tdb_routine_free(c->routines[i]);
+      for (int j = i; j < c->nroutine - 1; j++) c->routines[j] = c->routines[j + 1];
+      c->nroutine--;
       return;
     }
   }

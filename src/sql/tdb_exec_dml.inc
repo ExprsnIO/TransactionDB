@@ -732,7 +732,22 @@ static int exec_create_view(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 
 static int exec_create_routine(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
+  const char *name = a->u.create_routine.name;
   const char *lang = a->u.create_routine.lang;
+  /* Without OR REPLACE, reject collisions across both Lua-backed and PL/SQL
+  ** routines. With OR REPLACE, drop any existing definition first. */
+  int exists = tdb_catalog_find_routine(db->cat, name) != NULL ||
+               tdb_db_find_plsql(db, name) != NULL;
+  if (exists && !a->u.create_routine.or_replace) {
+    tdb_db_seterr(db, "routine %s already exists (use OR REPLACE)", name);
+    return TDB_ERROR;
+  }
+  if (exists) {
+    /* tdb_db_add_plsql already replaces in-place; only the Lua/catalog path
+    ** needs an explicit drop of the persisted routine row. */
+    if (tdb_catalog_find_routine(db->cat, name))
+      tdb_catalog_drop_routine(db->cat, name);
+  }
   if (lang && (!strcasecmp(lang, "plsql") || !strcasecmp(lang, "plpgsql"))) {
     tdb_plsql_proc *proc = NULL;
     char err[160] = {0};
@@ -740,7 +755,7 @@ static int exec_create_routine(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
                              (const char *const *)a->u.create_routine.params,
                              a->u.create_routine.nparams, &proc, err, sizeof(err));
     if (rc != TDB_OK) { tdb_db_seterr(db, "PL/SQL compile error: %s", err); return TDB_ERROR; }
-    return tdb_db_add_plsql(db, a->u.create_routine.name, proc,
+    return tdb_db_add_plsql(db, name, proc,
                             a->u.create_routine.is_function, a->u.create_routine.nparams);
   }
 #ifdef TDB_HAVE_LUA
@@ -867,15 +882,23 @@ static int exec_alter(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       return tdb_catalog_update_table(db->cat, t);
     }
     default:
-      tdb_db_seterr(db, "unsupported ALTER TABLE action");
+      /* Defensive: the parser only emits TDB_ALTER_{ADD,DROP,RENAME}_COLUMN
+      ** and TDB_ALTER_RENAME_TABLE (1..4). An action outside that range means
+      ** the parser was extended without wiring up a new branch here. */
+      tdb_db_seterr(db, "unsupported ALTER TABLE action: %d", a->u.alter.action);
       return TDB_UNSUPPORTED;
   }
 }
 
 /* ------------------------ Phase 11: utility DDL ------------------------ */
 
-/* TRUNCATE TABLE — delete every visible row. (Identity reset / CASCADE
-** are parsed and remembered on the AST but not yet executed.) */
+/* TRUNCATE TABLE — delete every visible row. CASCADE is a recognized
+** no-op (the engine does not enforce foreign keys, so there are no
+** dependent rows to follow). RESTART IDENTITY is rejected: rowid
+** generation tracks tdb_btree_max_rowid + 1 and TRUNCATE leaves
+** MVCC-tombstoned slots in the b-tree, so the counter cannot actually
+** reset without a hard rebuild (which would also break concurrent
+** snapshots — left for a future vacuum/AccessExclusive path). */
 static int truncate_one(tdb_db *db, tdb_stmt *st, tdb_table *t) {
   tdb_scan *sc;
   int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, 0, NULL, &sc);
@@ -903,6 +926,13 @@ static int truncate_one(tdb_db *db, tdb_stmt *st, tdb_table *t) {
 static int exec_truncate(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   tdb_table *t = tdb_catalog_find_table(db->cat, a->u.truncate.name);
   if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.truncate.name); return TDB_ERROR; }
+  if (a->u.truncate.restart) {
+    tdb_db_seterr(db,
+      "TRUNCATE ... RESTART IDENTITY is not supported: rowids are derived "
+      "from b-tree max + 1 and TRUNCATE leaves MVCC tombstones in place");
+    return TDB_UNSUPPORTED;
+  }
+  /* a->u.truncate.cascade is intentionally ignored: no FK enforcement. */
   if (is_hash_partitioned(t)) {
     for (int k = 0; k < t->partition_count; k++) {
       char child[256];
@@ -917,9 +947,9 @@ static int exec_truncate(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   return truncate_one(db, st, t);
 }
 
-/* ANALYZE / REINDEX / COMMENT / LOCK / GRANT / REVOKE / ATTACH / DETACH —
-** parsing is the main deliverable; semantic effects are stubs at this
-** point (no stats catalog, ACL system, or attach manager exists yet). */
+/* ANALYZE validates its target and otherwise no-ops: there is no stats
+** catalog yet. ATTACH / DETACH are accepted by the parser but not
+** executable (no attach manager). */
 static int exec_analyze(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
   if (a->u.analyze.name && !tdb_catalog_find_table(db->cat, a->u.analyze.name)) {
@@ -929,29 +959,119 @@ static int exec_analyze(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   return TDB_OK;
 }
 
+/* Drop and recreate one index's b-tree from the table's current rows. */
+static int reindex_one(tdb_db *db, tdb_table *t, tdb_index *ix) {
+  int rc = db->engine->vtab->drop_index(db->engine, db->txn, t, ix);
+  if (rc) return rc;
+  ix->root = 0;
+  rc = db->engine->vtab->create_index(db->engine, db->txn, t, ix);
+  if (rc) return rc;
+  return tdb_catalog_update_table(db->cat, t);
+}
+
+/* REINDEX rebuilds index b-trees from the current visible rows. With no
+** target it rebuilds every index on every table. REINDEX TABLE rebuilds
+** every index on one table. REINDEX INDEX rebuilds one named index. */
 static int exec_reindex(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
-  if (a->u.reindex.name && !a->u.reindex.is_index) {
-    if (!tdb_catalog_find_table(db->cat, a->u.reindex.name)) {
-      tdb_db_seterr(db, "no such table: %s", a->u.reindex.name);
-      return TDB_ERROR;
+  const char *name = a->u.reindex.name;
+
+  if (name && a->u.reindex.is_index) {
+    for (int i = 0; i < tdb_catalog_table_count(db->cat); i++) {
+      tdb_table *t = tdb_catalog_table_at(db->cat, i);
+      for (int k = 0; k < t->nindex; k++) {
+        if (strcasecmp(t->indexes[k].name, name) == 0)
+          return reindex_one(db, t, &t->indexes[k]);
+      }
+    }
+    tdb_db_seterr(db, "no such index: %s", name);
+    return TDB_ERROR;
+  }
+
+  if (name) {
+    tdb_table *t = tdb_catalog_find_table(db->cat, name);
+    if (!t) { tdb_db_seterr(db, "no such table: %s", name); return TDB_ERROR; }
+    for (int k = 0; k < t->nindex; k++) {
+      int rc = reindex_one(db, t, &t->indexes[k]);
+      if (rc) return rc;
+    }
+    return TDB_OK;
+  }
+
+  for (int i = 0; i < tdb_catalog_table_count(db->cat); i++) {
+    tdb_table *t = tdb_catalog_table_at(db->cat, i);
+    for (int k = 0; k < t->nindex; k++) {
+      int rc = reindex_one(db, t, &t->indexes[k]);
+      if (rc) return rc;
     }
   }
   return TDB_OK;
 }
 
 static int exec_comment(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
-  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
-  return TDB_OK;
+  TDB_UNUSED(st);
+  const char *target = a->u.comment_on.target;
+  int kind = a->u.comment_on.on_kind;
+  if (!target || !*target) {
+    tdb_db_seterr(db, "COMMENT ON requires a target name");
+    return TDB_ERROR;
+  }
+  /* For the kinds we can introspect, refuse comments on unknown objects so
+  ** typos surface immediately. INDEX/DATABASE pass through unchecked. */
+  if (kind == 1) {                                            /* TABLE */
+    if (!tdb_catalog_find_table(db->cat, target)) {
+      tdb_db_seterr(db, "no such table: %s", target); return TDB_ERROR;
+    }
+  } else if (kind == 4) {                                     /* VIEW */
+    if (!tdb_catalog_find_view(db->cat, target)) {
+      tdb_db_seterr(db, "no such view: %s", target); return TDB_ERROR;
+    }
+  } else if (kind == 2) {                                     /* COLUMN tbl.col */
+    const char *dot = strchr(target, '.');
+    if (!dot || dot == target || !dot[1]) {
+      tdb_db_seterr(db, "COMMENT ON COLUMN requires table.column"); return TDB_ERROR;
+    }
+    char *tbl = tdb_strndup(target, (size_t)(dot - target));
+    tdb_table *t = tdb_catalog_find_table(db->cat, tbl);
+    int rc = TDB_OK;
+    if (!t) { tdb_db_seterr(db, "no such table: %s", tbl); rc = TDB_ERROR; }
+    else if (tdb_table_find_column(t, dot + 1) < 0) {
+      tdb_db_seterr(db, "no such column: %s.%s", tbl, dot + 1); rc = TDB_ERROR;
+    }
+    tdb_mfree(tbl);
+    if (rc) return rc;
+  }
+  return tdb_catalog_set_comment(db->cat, kind, target, a->u.comment_on.body);
 }
 
 static int exec_tablespace_create(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
-  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
-  return TDB_OK;
+  TDB_UNUSED(st);
+  const char *name = a->u.create_tablespace.name;
+  const char *loc  = a->u.create_tablespace.location;
+  int if_not_exists = a->u.create_tablespace.if_not_exists;
+  if (!if_not_exists && tdb_catalog_tablespace_exists(db->cat, name)) {
+    tdb_db_seterr(db, "tablespace %s already exists", name);
+    return TDB_ERROR;
+  }
+  return tdb_catalog_tablespace_create(db->cat, name, loc, if_not_exists);
 }
 static int exec_tablespace_drop(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
-  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
-  return TDB_OK;
+  TDB_UNUSED(st);
+  const char *name = a->u.drop_tablespace.name;
+  int if_exists = a->u.drop_tablespace.if_exists;
+  if (!if_exists && !tdb_catalog_tablespace_exists(db->cat, name)) {
+    tdb_db_seterr(db, "no such tablespace: %s", name);
+    return TDB_ERROR;
+  }
+  /* Refuse to drop a tablespace that's still in use by a table. */
+  for (int i = 0; i < tdb_catalog_table_count(db->cat); i++) {
+    tdb_table *t = tdb_catalog_table_at(db->cat, i);
+    if (t->tablespace && strcasecmp(t->tablespace, name) == 0) {
+      tdb_db_seterr(db, "tablespace %s still in use by table %s", name, t->name);
+      return TDB_ERROR;
+    }
+  }
+  return tdb_catalog_tablespace_drop(db->cat, name, if_exists);
 }
 
 /* Split a comma/space-delimited privilege list into uppercase tokens. */
@@ -1026,13 +1146,9 @@ static int exec_grant(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       }
     }
   } else {
-    for (int i = 0; i < npriv; i++) {
+    for (int i = 0; i < npriv && !rc; i++) {
       tdb_acl_revoke(acl, grantee, privs[i], kind, obj);
-      /* persistent revoke: append a tombstone? For simplicity, we leave the
-      ** old GRANT records on disk but skip them on next open via a scan-time
-      ** filter — kept simple: the catalog reload will re-add them, then this
-      ** REVOKE in-memory removes them. So a process restart loses REVOKEs.
-      ** TODO: catalog row deletion for true persistence. */
+      rc = tdb_catalog_acl_unpersist(db->cat, grantee, privs[i], kind, obj, NULL);
     }
   }
   for (int i = 0; i < npriv; i++) tdb_mfree(privs[i]);
@@ -1066,13 +1182,22 @@ static int exec_detach(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 
 static int exec_lock(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
-  if (a->u.lock_tbl.table && !tdb_catalog_find_table(db->cat, a->u.lock_tbl.table)) {
+  tdb_table *t = tdb_catalog_find_table(db->cat, a->u.lock_tbl.table);
+  if (!t) {
     tdb_db_seterr(db, "no such table: %s", a->u.lock_tbl.table);
     return TDB_ERROR;
   }
-  /* pager is single-writer: the surrounding auto-txn already holds the write
-  ** slot, so LOCK TABLE is a no-op at this level. */
-  return TDB_OK;
+  /* Acquire a real lock through the lock manager so concurrent connections
+  ** see the contention. The pager already serializes writes, but readers in
+  ** SNAPSHOT/SERIALIZABLE isolation that touch this table need to wait or
+  ** abort under WAIT-DIE. The lock auto-releases when the txn ends. */
+  if (!db->txn) return TDB_OK;            /* no active txn → nothing to scope */
+  tdb_lockmode mode = a->u.lock_tbl.exclusive ? TDB_LOCK_EXCL : TDB_LOCK_SHARED;
+  int rc = tdb_lock_acquire(db->lm, db->txn->id, TDB_RES_TABLE,
+                            (uint64_t)t->root, 0, mode);
+  if (rc == TDB_BUSY) tdb_db_seterr(db, "LOCK TABLE: resource busy");
+  else if (rc == TDB_ABORT) tdb_db_seterr(db, "LOCK TABLE: deadlock prevention aborted");
+  return rc;
 }
 
 static int exec_txn(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {

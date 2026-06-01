@@ -199,6 +199,15 @@ int tdb_load_extension(tdb_db *db, const char *path, const char *entry,
 int tdb_set_user(tdb_db *db, const char *name);
 const char *tdb_get_user(tdb_db *db);
 
+/* ------------------------------------------------------------------ */
+/* Recursive-CTE iteration cap                                        */
+/* ------------------------------------------------------------------ */
+/* Maximum iterations of the WITH RECURSIVE working-set loop before
+** execution gives up and returns an error. Defaults to 8192. A value
+** of 0 keeps the current limit; negative values are clamped to 1. */
+int tdb_set_max_recursive_iters(tdb_db *db, int max_iters);
+int tdb_get_max_recursive_iters(tdb_db *db);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

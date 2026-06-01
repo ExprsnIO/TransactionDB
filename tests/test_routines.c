@@ -86,11 +86,33 @@ static void test_plsql_uses_sql_row(void) {
   tdb_close(db);
 }
 
+static void test_create_or_replace(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db,
+    "CREATE FUNCTION f(x INTEGER) RETURNS INTEGER LANGUAGE PLSQL AS "
+    "$$ BEGIN RETURN x + 1; END $$"), TDB_OK);
+  TDB_CHECK_EQ(scalar_int(db, "SELECT f(10)"), 11);
+
+  /* Plain CREATE on an existing name is rejected. */
+  TDB_CHECK(exec(db,
+    "CREATE FUNCTION f(x INTEGER) RETURNS INTEGER LANGUAGE PLSQL AS "
+    "$$ BEGIN RETURN x + 2; END $$") != TDB_OK);
+  TDB_CHECK_EQ(scalar_int(db, "SELECT f(10)"), 11);     /* unchanged */
+
+  /* CREATE OR REPLACE installs the new body. */
+  TDB_CHECK_EQ(exec(db,
+    "CREATE OR REPLACE FUNCTION f(x INTEGER) RETURNS INTEGER LANGUAGE PLSQL AS "
+    "$$ BEGIN RETURN x * 100; END $$"), TDB_OK);
+  TDB_CHECK_EQ(scalar_int(db, "SELECT f(10)"), 1000);
+  tdb_close(db);
+}
+
 static const tdb_test_case cases[] = {
   {"sequences", test_sequences},
   {"sequence_in_insert", test_sequence_in_insert},
   {"plsql_function", test_plsql_function},
   {"plsql_control_flow", test_plsql_control_flow},
   {"plsql_uses_sql_row", test_plsql_uses_sql_row},
+  {"create_or_replace", test_create_or_replace},
 };
 TDB_MAIN(cases)

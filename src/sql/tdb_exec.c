@@ -17,6 +17,7 @@
 #include "../lua/tdb_lua.h"
 #endif
 #include "../common/tdb_mem.h"
+#include "../plsql/tdb_plsql.h"
 #include "../value/tdb_record.h"
 #include "../value/tdb_sqltype.h"
 #include "../value/tdb_geom.h"
@@ -621,6 +622,39 @@ static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
         tdb_geom_bbox((const uint8_t *)v1.u.s.p, (int)v1.u.s.n, &bb)) tdb_value_set_null(out);
     else tdb_value_set_int(out, tdb_bbox_intersects(&ba, &bb) ? 1 : 0);
     tdb_value_clear(&v1);
+  } else if (!strcasecmp(fn, "nextval") && argc == 1) {
+    const char *nm = tdb_value_as_text(&a0);
+    tdb_sequence *s = nm ? tdb_db_seq_find(db, nm, 1) : NULL;
+    if (!s) { tdb_db_seterr(db, "nextval: invalid sequence name"); tdb_value_clear(&a0); return TDB_ERROR; }
+    if (!s->has_cur) { s->cur = 1; s->has_cur = 1; } else s->cur += s->inc;
+    tdb_value_set_int(out, s->cur);
+  } else if (!strcasecmp(fn, "currval") && argc == 1) {
+    const char *nm = tdb_value_as_text(&a0);
+    tdb_sequence *s = nm ? tdb_db_seq_find(db, nm, 0) : NULL;
+    if (!s || !s->has_cur) { tdb_db_seterr(db, "currval: nextval has not been called for this sequence"); tdb_value_clear(&a0); return TDB_ERROR; }
+    tdb_value_set_int(out, s->cur);
+  } else if (!strcasecmp(fn, "setval") && argc == 2) {
+    const char *nm = tdb_value_as_text(&a0);
+    tdb_value v1; tdb_value_init(&v1); eval(db, c, e->args->items[1], &v1);
+    int64_t n = tdb_value_as_int(&v1); tdb_value_clear(&v1);
+    tdb_sequence *s = nm ? tdb_db_seq_find(db, nm, 1) : NULL;
+    if (!s) { tdb_db_seterr(db, "setval: invalid sequence name"); tdb_value_clear(&a0); return TDB_ERROR; }
+    s->cur = n; s->has_cur = 1;
+    tdb_value_set_int(out, n);
+  } else if (tdb_db_find_plsql(db, fn)) {
+    /* stored LANGUAGE PLSQL function */
+    const tdb_plsql_routine *r = tdb_db_find_plsql(db, fn);
+    tdb_value *args = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(argc ? argc : 1));
+    for (int i = 0; i < argc; i++) { tdb_value_init(&args[i]); eval(db, c, e->args->items[i], &args[i]); }
+    tdb_value res; tdb_value_init(&res);
+    char perr[160] = {0};
+    int rc = tdb_plsql_exec(r->proc, args, argc, &res, perr, sizeof(perr));
+    for (int i = 0; i < argc; i++) tdb_value_clear(&args[i]);
+    tdb_mfree(args);
+    tdb_value_clear(&a0);
+    if (rc != TDB_OK) { tdb_db_seterr(db, "%s", perr); tdb_value_clear(&res); return TDB_ERROR; }
+    tdb_value_copy(out, &res); tdb_value_clear(&res);
+    return TDB_OK;
   } else if (tdb_db_find_function(db, fn, argc)) {
     /* user-defined / plugin scalar function (incl. built-in crypto) */
     const tdb_func_entry *fe = tdb_db_find_function(db, fn, argc);

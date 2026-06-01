@@ -788,7 +788,8 @@ static tdb_ast_stmt *parse_create_routine(P *p, int is_function) {
   }
   if (accept(p, TK_RETURNS)) (void)parse_type(p);
   expect(p, TK_LANGUAGE, "expected LANGUAGE");
-  expect(p, TK_ID, "expected language name (LUA)");
+  s->u.create_routine.lang = dup_tok(p, &p->cur);
+  expect(p, TK_ID, "expected language name (LUA / PLSQL)");
   expect(p, TK_AS, "expected AS");
   if (p->cur.kind != TK_STRING) { set_err(p, "expected $$...$$ body"); return s; }
   s->u.create_routine.lua_src = dupz(p, p->cur.z, p->cur.n);

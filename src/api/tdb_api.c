@@ -9,6 +9,7 @@
 #include "tdb_env.h"
 #include "../sql/tdb_parser.h"
 #include "../ext/tdb_crypto.h"
+#include "../plsql/tdb_plsql.h"
 #include "../common/tdb_mem.h"
 #ifdef TDB_HAVE_LUA
 #include "../lua/tdb_lua.h"
@@ -23,6 +24,8 @@
 
 static void tdb_db_free_functions(tdb_db *db);
 static void tdb_db_free_extensions(tdb_db *db);
+static void tdb_db_free_plsql(tdb_db *db);
+static void tdb_db_free_sequences(tdb_db *db);
 
 void tdb_db_seterr(tdb_db *db, const char *fmt, ...) {
   if (!db) return;
@@ -87,6 +90,8 @@ int tdb_close(tdb_db *db) {
   if (!db) return TDB_OK;
   if (db->txn) tdb_txn_rollback(db->txn);
   tdb_db_free_functions(db);
+  tdb_db_free_plsql(db);
+  tdb_db_free_sequences(db);
   tdb_db_free_extensions(db);
 #ifdef TDB_HAVE_LUA
   if (db->lua) tdb_lua_close(db->lua);
@@ -370,6 +375,74 @@ static void tdb_db_free_functions(tdb_db *db) {
   tdb_func_entry *e = db->funcs;
   while (e) { tdb_func_entry *n = e->next; tdb_mfree(e->name); tdb_mfree(e); e = n; }
   db->funcs = NULL;
+}
+
+/* ----------------------- PL/SQL routine registry ---------------------- */
+
+int tdb_db_add_plsql(tdb_db *db, const char *name, struct tdb_plsql_proc *proc,
+                     int is_function, int nparams) {
+  if (!db || !name || !proc) return TDB_MISUSE;
+  /* replace any existing routine of the same name */
+  tdb_plsql_routine **pp = &db->plroutines;
+  while (*pp) {
+    if (!strcasecmp((*pp)->name, name)) {
+      tdb_plsql_routine *old = *pp;
+      *pp = old->next;
+      tdb_plsql_free(old->proc);
+      tdb_mfree(old->name);
+      tdb_mfree(old);
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  tdb_plsql_routine *r = (tdb_plsql_routine *)tdb_calloc(sizeof(*r));
+  if (!r) return TDB_NOMEM;
+  r->name = tdb_strdup(name);
+  r->proc = proc;
+  r->is_function = is_function;
+  r->nparams = nparams;
+  r->next = db->plroutines;
+  db->plroutines = r;
+  return TDB_OK;
+}
+
+const tdb_plsql_routine *tdb_db_find_plsql(tdb_db *db, const char *name) {
+  for (tdb_plsql_routine *r = db->plroutines; r; r = r->next)
+    if (!strcasecmp(r->name, name)) return r;
+  return NULL;
+}
+
+static void tdb_db_free_plsql(tdb_db *db) {
+  tdb_plsql_routine *r = db->plroutines;
+  while (r) {
+    tdb_plsql_routine *n = r->next;
+    tdb_plsql_free(r->proc);
+    tdb_mfree(r->name);
+    tdb_mfree(r);
+    r = n;
+  }
+  db->plroutines = NULL;
+}
+
+/* --------------------------- sequence registry ------------------------ */
+
+tdb_sequence *tdb_db_seq_find(tdb_db *db, const char *name, int create) {
+  for (tdb_sequence *s = db->seqs; s; s = s->next)
+    if (!strcasecmp(s->name, name)) return s;
+  if (!create) return NULL;
+  tdb_sequence *s = (tdb_sequence *)tdb_calloc(sizeof(*s));
+  if (!s) return NULL;
+  s->name = tdb_strdup(name);
+  s->cur = 0; s->inc = 1; s->has_cur = 0;
+  s->next = db->seqs;
+  db->seqs = s;
+  return s;
+}
+
+static void tdb_db_free_sequences(tdb_db *db) {
+  tdb_sequence *s = db->seqs;
+  while (s) { tdb_sequence *n = s->next; tdb_mfree(s->name); tdb_mfree(s); s = n; }
+  db->seqs = NULL;
 }
 
 /*

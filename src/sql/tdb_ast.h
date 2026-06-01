@@ -203,7 +203,7 @@ typedef struct tdb_ast_stmt {
 
     struct {
       char *name; int is_function; int or_replace;
-      char **params; int nparams; char *lua_src;
+      char **params; int nparams; char *lua_src; char *lang;
     } create_routine;
 
     struct { char *name; tdb_exprlist *args; } call;

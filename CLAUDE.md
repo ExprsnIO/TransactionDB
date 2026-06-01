@@ -73,7 +73,8 @@ Bottom to top:
   instead runs through a pull-based **volcano operator tree** (`tdb_exec_stream.inc`: Scan → Join →
   Filter → Sort → Project → Limit) that `tdb_step()` pulls one row at a time, holding a
   statement-owned read snapshot open across steps; Join is a nested loop (inner table re-scanned per
-  outer row) and the Sort operator becomes a bounded top-N heap when ORDER BY is paired with LIMIT.
+  outer row, or index-seeked when the ON predicate is an equijoin on an indexed inner column) and the
+  Sort operator becomes a bounded top-N heap when ORDER BY is paired with LIMIT.
   Anything more complex
   falls back to materialization. Correlated subqueries are supported (unbound columns resolve outward
   through enclosing query contexts, re-run per outer row).

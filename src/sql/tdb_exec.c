@@ -621,6 +621,20 @@ static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
         tdb_geom_bbox((const uint8_t *)v1.u.s.p, (int)v1.u.s.n, &bb)) tdb_value_set_null(out);
     else tdb_value_set_int(out, tdb_bbox_intersects(&ba, &bb) ? 1 : 0);
     tdb_value_clear(&v1);
+  } else if (tdb_db_find_function(db, fn, argc)) {
+    /* user-defined / plugin scalar function (incl. built-in crypto) */
+    const tdb_func_entry *fe = tdb_db_find_function(db, fn, argc);
+    tdb_value *args = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(argc ? argc : 1));
+    tdb_value **argv = (tdb_value **)tdb_calloc(sizeof(tdb_value *) * (size_t)(argc ? argc : 1));
+    for (int i = 0; i < argc; i++) { tdb_value_init(&args[i]); eval(db, c, e->args->items[i], &args[i]); argv[i] = &args[i]; }
+    tdb_context fctx; memset(&fctx, 0, sizeof(fctx));
+    fctx.db = db; fctx.pApp = fe->pApp; fctx.out = out;
+    fe->fn(&fctx, argc, argv);
+    for (int i = 0; i < argc; i++) tdb_value_clear(&args[i]);
+    tdb_mfree(args); tdb_mfree(argv);
+    tdb_value_clear(&a0);
+    if (fctx.is_error) { tdb_db_seterr(db, "%s", fctx.errmsg); return TDB_ERROR; }
+    return TDB_OK;
   } else {
 #ifdef TDB_HAVE_LUA
     if (db->lua && tdb_catalog_find_routine(db->cat, fn)) {

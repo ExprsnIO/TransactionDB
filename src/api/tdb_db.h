@@ -22,6 +22,30 @@
 
 struct tdb_env;            /* shared environment (tdb_env.h) */
 
+/* A registered user-defined scalar function (C/C++ plugin entry). */
+typedef struct tdb_func_entry {
+  char                  *name;
+  int                    nArg;   /* required arity, or -1 for variadic */
+  tdb_func               fn;
+  void                  *pApp;
+  struct tdb_func_entry *next;
+} tdb_func_entry;
+
+/* A dynamically loaded extension shared object, kept so it can be closed. */
+typedef struct tdb_ext_handle {
+  void                  *dl;     /* dlopen handle */
+  struct tdb_ext_handle *next;
+} tdb_ext_handle;
+
+/* Context passed to a user function: it reads pApp and writes the result. */
+struct tdb_context {
+  tdb_db    *db;
+  void      *pApp;
+  tdb_value *out;      /* result destination (borrowed) */
+  int        is_error;
+  char       errmsg[256];
+};
+
 struct tdb_db {
   struct tdb_env *env;     /* shared resources (pager/catalog/locks/txn/engine) */
 
@@ -32,6 +56,9 @@ struct tdb_db {
   tdb_lockmgr *lm;
   tdb_txnmgr  *tm;
   tdb_storage *engine;
+
+  tdb_func_entry *funcs;   /* registered user-defined functions (C/C++ plugins) */
+  tdb_ext_handle *exts;    /* loaded extension shared objects */
 
   tdb_lua     *lua;        /* embedded Lua state (NULL if built without Lua); per-connection */
   tdb_txn     *txn;        /* the current transaction (auto or explicit); per-connection */
@@ -79,6 +106,9 @@ struct tdb_stmt {
 
 /* Set the connection error message. */
 void tdb_db_seterr(tdb_db *db, const char *fmt, ...);
+
+/* Look up a registered user function by name and arity (NULL if none). */
+const tdb_func_entry *tdb_db_find_function(tdb_db *db, const char *name, int argc);
 
 /* Execute a prepared statement: run DDL/DML to completion, or prepare a SELECT
 ** result — either materialized into stmt->rows or, for a streamable scan, armed

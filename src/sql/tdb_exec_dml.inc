@@ -524,6 +524,17 @@ static int exec_create_view(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 
 static int exec_create_routine(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
+  const char *lang = a->u.create_routine.lang;
+  if (lang && (!strcasecmp(lang, "plsql") || !strcasecmp(lang, "plpgsql"))) {
+    tdb_plsql_proc *proc = NULL;
+    char err[160] = {0};
+    int rc = tdb_plsql_parse(a->u.create_routine.lua_src ? a->u.create_routine.lua_src : "",
+                             (const char *const *)a->u.create_routine.params,
+                             a->u.create_routine.nparams, &proc, err, sizeof(err));
+    if (rc != TDB_OK) { tdb_db_seterr(db, "PL/SQL compile error: %s", err); return TDB_ERROR; }
+    return tdb_db_add_plsql(db, a->u.create_routine.name, proc,
+                            a->u.create_routine.is_function, a->u.create_routine.nparams);
+  }
 #ifdef TDB_HAVE_LUA
   /* wrap the body as a function value: function(<params>) <body> end */
   tdb_buf w; tdb_buf_init(&w);

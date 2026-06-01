@@ -1,5 +1,6 @@
 /* tdb_lexer.c — SQL tokenizer. */
 #include "tdb_lexer.h"
+#include "transactiondb.h"   /* TDB_OK / TDB_RANGE for the keyword API */
 
 #include <ctype.h>
 #include <string.h>
@@ -50,6 +51,61 @@ tdb_token_kind tdb_keyword_lookup(const char *z, int n) {
       return k_keywords[i].kind;
   }
   return TK_ID;
+}
+
+/* ------------------------- keyword introspection ---------------------- */
+
+/*
+** The complete set of SQL keywords TransactionDB recognizes, comparable to
+** SQLite's keyword list. Most are "non-reserved": the recursive-descent parser
+** accepts them as identifiers where a name is expected (matching them by text),
+** so they can still be used as table/column/function names. This table backs
+** the SQLite-style introspection API (tdb_keyword_count/name/check) and is kept
+** sorted for readability; lookup is a linear scan (the set is small).
+*/
+static const char *const k_all_keywords[] = {
+  "ABORT","ACTION","ADD","AFTER","ALL","ALTER","ALWAYS","ANALYZE","AND","AS",
+  "ASC","ATTACH","AUTOINCREMENT","BEFORE","BEGIN","BETWEEN","BY","CALL",
+  "CASCADE","CASE","CAST","CHECK","COLLATE","COLUMN","COMMIT","CONFLICT",
+  "CONSTRAINT","CREATE","CROSS","CURRENT","CURRENT_DATE","CURRENT_TIME",
+  "CURRENT_TIMESTAMP","DATABASE","DEFAULT","DEFERRABLE","DEFERRED","DELETE",
+  "DESC","DETACH","DISTINCT","DO","DROP","EACH","ELSE","ELSIF","END","ESCAPE",
+  "EXCEPT","EXCLUDE","EXCLUSIVE","EXISTS","EXPLAIN","FAIL","FILTER","FIRST",
+  "FOLLOWING","FOR","FOREIGN","FROM","FULL","FUNCTION","GENERATED","GLOB",
+  "GROUP","GROUPS","HAVING","IF","IGNORE","IMMEDIATE","IN","INDEX","INDEXED",
+  "INITIALLY","INNER","INSERT","INSTEAD","INTERSECT","INTO","IS","ISNULL",
+  "JOIN","KEY","LANGUAGE","LAST","LEFT","LIKE","LIMIT","LOOP","MATCH",
+  "MATERIALIZED","NATURAL","NO","NOT","NOTHING","NOTNULL","NULL","NULLS","OF",
+  "OFFSET","ON","OR","ORDER","OTHERS","OUTER","OVER","PARTITION","PERIOD",
+  "PLAN","PRAGMA","PRECEDING","PREPARE","PRIMARY","PROCEDURE","QUERY","RAISE",
+  "RANGE","RECURSIVE","REFERENCES","REGEXP","REINDEX","RELEASE","RENAME",
+  "REPLACE","RESTRICT","RETURNING","RETURNS","RIGHT","ROLLBACK","ROW","ROWS",
+  "SAVEPOINT","SELECT","SEQUENCE","SET","STORED","SYSTEM","TABLE","TEMP",
+  "TEMPORARY","THEN","TIES","TO","TRANSACTION","TRIGGER","UNBOUNDED","UNION",
+  "UNIQUE","UPDATE","USING","VACUUM","VALUES","VERSIONING","VIEW","VIRTUAL",
+  "WHEN","WHERE","WHILE","WINDOW","WITH","WITHOUT",
+};
+
+int tdb_keyword_count(void) {
+  return (int)(sizeof(k_all_keywords) / sizeof(k_all_keywords[0]));
+}
+
+int tdb_keyword_name(int i, const char **pzName, int *pnName) {
+  if (i < 0 || i >= tdb_keyword_count()) return TDB_RANGE;
+  if (pzName) *pzName = k_all_keywords[i];
+  if (pnName) *pnName = (int)strlen(k_all_keywords[i]);
+  return TDB_OK;
+}
+
+int tdb_keyword_check(const char *z, int n) {
+  if (!z) return 0;
+  if (n < 0) n = (int)strlen(z);
+  for (int i = 0; i < tdb_keyword_count(); i++) {
+    if ((int)strlen(k_all_keywords[i]) == n &&
+        strncasecmp(z, k_all_keywords[i], (size_t)n) == 0)
+      return 1;
+  }
+  return 0;
 }
 
 /* ------------------------------- helpers ------------------------------ */

@@ -17,6 +17,7 @@
 #include "../lua/tdb_lua.h"
 #endif
 #include "../common/tdb_mem.h"
+#include "../plsql/tdb_plsql.h"
 #include "../value/tdb_record.h"
 #include "../value/tdb_sqltype.h"
 #include "../value/tdb_geom.h"
@@ -471,8 +472,29 @@ static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     tdb_value_clear(&v);
   } else if (!strcasecmp(fn, "typeof") && argc == 1) {
     const char *t = a0.type == TDB_VAL_NULL ? "null" : a0.type == TDB_VAL_INT ? "integer"
-                  : a0.type == TDB_VAL_REAL ? "real" : a0.type == TDB_VAL_BLOB ? "blob" : "text";
+                  : a0.type == TDB_VAL_REAL ? "real" : a0.type == TDB_VAL_BLOB ? "blob"
+                  : a0.type == TDB_VAL_COMPOSITE ? "composite" : "text";
     tdb_value_set_text(out, t, -1, 1);
+  } else if (!strcasecmp(fn, "row") || !strcasecmp(fn, "composite")) {
+    /* ROW(a, b, ...) — build a composite value from the arguments */
+    tdb_value *fs = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(argc ? argc : 1));
+    for (int i = 0; i < argc; i++) { tdb_value_init(&fs[i]); eval(db, c, e->args->items[i], &fs[i]); }
+    tdb_value_composite_pack(out, fs, argc);
+    for (int i = 0; i < argc; i++) tdb_value_clear(&fs[i]);
+    tdb_mfree(fs);
+  } else if (!strcasecmp(fn, "composite_extract") && argc == 2) {
+    /* composite_extract(c, i) — 1-based field access */
+    tdb_value idxv; tdb_value_init(&idxv); eval(db, c, e->args->items[1], &idxv);
+    int idx = (int)tdb_value_as_int(&idxv); tdb_value_clear(&idxv);
+    tdb_value comp; tdb_value_init(&comp); tdb_value_copy(&comp, &a0);
+    if (comp.type == TDB_VAL_BLOB) comp.type = TDB_VAL_COMPOSITE; /* re-tag stored bytes */
+    if (tdb_value_composite_field(&comp, idx - 1, out) != TDB_OK) tdb_value_set_null(out);
+    tdb_value_clear(&comp);
+  } else if (!strcasecmp(fn, "composite_count") && argc == 1) {
+    tdb_value comp; tdb_value_init(&comp); tdb_value_copy(&comp, &a0);
+    if (comp.type == TDB_VAL_BLOB) comp.type = TDB_VAL_COMPOSITE;
+    tdb_value_set_int(out, tdb_value_composite_count(&comp));
+    tdb_value_clear(&comp);
   } else if (!strcasecmp(fn, "round") && (argc == 1 || argc == 2)) {
     double x = tdb_value_as_real(&a0); int nd = 0;
     if (argc == 2) { tdb_value v; tdb_value_init(&v); eval(db, c, e->args->items[1], &v); nd = (int)tdb_value_as_int(&v); tdb_value_clear(&v); }
@@ -600,6 +622,53 @@ static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
         tdb_geom_bbox((const uint8_t *)v1.u.s.p, (int)v1.u.s.n, &bb)) tdb_value_set_null(out);
     else tdb_value_set_int(out, tdb_bbox_intersects(&ba, &bb) ? 1 : 0);
     tdb_value_clear(&v1);
+  } else if (!strcasecmp(fn, "nextval") && argc == 1) {
+    const char *nm = tdb_value_as_text(&a0);
+    tdb_sequence *s = nm ? tdb_db_seq_find(db, nm, 1) : NULL;
+    if (!s) { tdb_db_seterr(db, "nextval: invalid sequence name"); tdb_value_clear(&a0); return TDB_ERROR; }
+    if (!s->has_cur) { s->cur = 1; s->has_cur = 1; } else s->cur += s->inc;
+    tdb_value_set_int(out, s->cur);
+  } else if (!strcasecmp(fn, "currval") && argc == 1) {
+    const char *nm = tdb_value_as_text(&a0);
+    tdb_sequence *s = nm ? tdb_db_seq_find(db, nm, 0) : NULL;
+    if (!s || !s->has_cur) { tdb_db_seterr(db, "currval: nextval has not been called for this sequence"); tdb_value_clear(&a0); return TDB_ERROR; }
+    tdb_value_set_int(out, s->cur);
+  } else if (!strcasecmp(fn, "setval") && argc == 2) {
+    const char *nm = tdb_value_as_text(&a0);
+    tdb_value v1; tdb_value_init(&v1); eval(db, c, e->args->items[1], &v1);
+    int64_t n = tdb_value_as_int(&v1); tdb_value_clear(&v1);
+    tdb_sequence *s = nm ? tdb_db_seq_find(db, nm, 1) : NULL;
+    if (!s) { tdb_db_seterr(db, "setval: invalid sequence name"); tdb_value_clear(&a0); return TDB_ERROR; }
+    s->cur = n; s->has_cur = 1;
+    tdb_value_set_int(out, n);
+  } else if (tdb_db_find_plsql(db, fn)) {
+    /* stored LANGUAGE PLSQL function */
+    const tdb_plsql_routine *r = tdb_db_find_plsql(db, fn);
+    tdb_value *args = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(argc ? argc : 1));
+    for (int i = 0; i < argc; i++) { tdb_value_init(&args[i]); eval(db, c, e->args->items[i], &args[i]); }
+    tdb_value res; tdb_value_init(&res);
+    char perr[160] = {0};
+    int rc = tdb_plsql_exec(r->proc, args, argc, &res, perr, sizeof(perr));
+    for (int i = 0; i < argc; i++) tdb_value_clear(&args[i]);
+    tdb_mfree(args);
+    tdb_value_clear(&a0);
+    if (rc != TDB_OK) { tdb_db_seterr(db, "%s", perr); tdb_value_clear(&res); return TDB_ERROR; }
+    tdb_value_copy(out, &res); tdb_value_clear(&res);
+    return TDB_OK;
+  } else if (tdb_db_find_function(db, fn, argc)) {
+    /* user-defined / plugin scalar function (incl. built-in crypto) */
+    const tdb_func_entry *fe = tdb_db_find_function(db, fn, argc);
+    tdb_value *args = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(argc ? argc : 1));
+    tdb_value **argv = (tdb_value **)tdb_calloc(sizeof(tdb_value *) * (size_t)(argc ? argc : 1));
+    for (int i = 0; i < argc; i++) { tdb_value_init(&args[i]); eval(db, c, e->args->items[i], &args[i]); argv[i] = &args[i]; }
+    tdb_context fctx; memset(&fctx, 0, sizeof(fctx));
+    fctx.db = db; fctx.pApp = fe->pApp; fctx.out = out;
+    fe->fn(&fctx, argc, argv);
+    for (int i = 0; i < argc; i++) tdb_value_clear(&args[i]);
+    tdb_mfree(args); tdb_mfree(argv);
+    tdb_value_clear(&a0);
+    if (fctx.is_error) { tdb_db_seterr(db, "%s", fctx.errmsg); return TDB_ERROR; }
+    return TDB_OK;
   } else {
 #ifdef TDB_HAVE_LUA
     if (db->lua && tdb_catalog_find_routine(db->cat, fn)) {

@@ -10,9 +10,10 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()
 
-option(TDB_BUILD_TESTS "Build the test suite" ON)
-option(TDB_BUILD_CLI   "Build the CLI shell" ON)
-option(TDB_BUILD_LUA   "Build with embedded Lua" ON)
+option(TDB_BUILD_TESTS     "Build the test suite" ON)
+option(TDB_BUILD_CLI       "Build the CLI shell" ON)
+option(TDB_BUILD_LUA       "Build with embedded Lua" ON)
+option(TDB_BUILD_OPENSSL   "Build crypto functions against OpenSSL (AES, CSPRNG)" OFF)
 # Package as an Apple .framework bundle (no-op off Apple); see cmake/AppleFramework.cmake.
 option(TDB_BUILD_FRAMEWORK "Build as an Apple .framework bundle" OFF)
 
@@ -49,6 +50,8 @@ target_include_directories(transactiondb
           "${CMAKE_SOURCE_DIR}/src/txn"
           "${CMAKE_SOURCE_DIR}/src/catalog"
           "${CMAKE_SOURCE_DIR}/src/sql"
+          "${CMAKE_SOURCE_DIR}/src/plsql"
+          "${CMAKE_SOURCE_DIR}/src/ext"
           "${CMAKE_SOURCE_DIR}/src/lua"
           "${CMAKE_SOURCE_DIR}/src/api")
 target_link_libraries(transactiondb PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
@@ -64,6 +67,12 @@ if(TDB_BUILD_LUA)
   include(FetchLua)
   target_link_libraries(transactiondb PRIVATE lua_static)
   target_compile_definitions(transactiondb PRIVATE TDB_HAVE_LUA=1)
+endif()
+
+if(TDB_BUILD_OPENSSL)
+  find_package(OpenSSL REQUIRED)
+  target_link_libraries(transactiondb PUBLIC OpenSSL::Crypto)
+  target_compile_definitions(transactiondb PRIVATE TDB_HAVE_OPENSSL=1)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -91,7 +100,8 @@ endif()
 if(TDB_BUILD_TESTS)
   enable_testing()
   set(TDB_TESTS util value_record wal pager sqltype schema btree
-                mvcc lock engine catalog lexer parser exec concurrency geom rtree)
+                mvcc lock engine catalog lexer parser exec concurrency geom rtree
+                plsql composite crypto routines keywords)
   foreach(t ${TDB_TESTS})
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_${t}.c")
       add_executable(test_${t} "tests/test_${t}.c")
@@ -105,7 +115,8 @@ if(TDB_BUILD_TESTS)
         "${CMAKE_SOURCE_DIR}/src/storage"
         "${CMAKE_SOURCE_DIR}/src/txn"
         "${CMAKE_SOURCE_DIR}/src/catalog"
-        "${CMAKE_SOURCE_DIR}/src/sql")
+        "${CMAKE_SOURCE_DIR}/src/sql"
+        "${CMAKE_SOURCE_DIR}/src/plsql")
       add_test(NAME ${t} COMMAND test_${t})
     endif()
   endforeach()
@@ -116,6 +127,19 @@ if(TDB_BUILD_TESTS)
   target_include_directories(test_cpp PRIVATE
     "${CMAKE_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/tests")
   add_test(NAME cpp COMMAND test_cpp)
+
+  # Example C++ plugin (shared module) + dynamic load test. The plugin's tdb_*
+  # symbols are resolved from the host test executable at dlopen time, so
+  # test_crypto is built with exported symbols (-rdynamic).
+  if(TARGET test_crypto AND NOT WIN32)
+    add_library(tdb_plugin_example MODULE examples/tdb_plugin_example.cpp)
+    target_include_directories(tdb_plugin_example PRIVATE "${CMAKE_SOURCE_DIR}/include")
+    set_target_properties(tdb_plugin_example PROPERTIES PREFIX "")
+    set_target_properties(test_crypto PROPERTIES ENABLE_EXPORTS ON)
+    add_dependencies(test_crypto tdb_plugin_example)
+    target_compile_definitions(test_crypto PRIVATE
+      TDB_PLUGIN_PATH="$<TARGET_FILE:tdb_plugin_example>")
+  endif()
 
   # Lua integration test (only when Lua is built in)
   if(TDB_BUILD_LUA)

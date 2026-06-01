@@ -149,9 +149,35 @@ int         tdb_value_bytes(tdb_value *v);
 void tdb_result_int64(tdb_context *ctx, int64_t v);
 void tdb_result_double(tdb_context *ctx, double v);
 void tdb_result_text(tdb_context *ctx, const char *v, int n);
+void tdb_result_blob(tdb_context *ctx, const void *v, int n);
 void tdb_result_null(tdb_context *ctx);
 void tdb_result_error(tdb_context *ctx, const char *msg);
 void *tdb_user_data(tdb_context *ctx);
+
+/* ------------------------------------------------------------------ */
+/* SQL keyword introspection (mirrors SQLite's keyword API)            */
+/* ------------------------------------------------------------------ */
+/* The number of SQL keywords TransactionDB recognizes. */
+int tdb_keyword_count(void);
+/* The i-th keyword (0-based): *pzName points at a static, NUL-terminated,
+** uppercase name and *pnName its length. Returns TDB_OK or TDB_RANGE. */
+int tdb_keyword_name(int i, const char **pzName, int *pnName);
+/* Non-zero if the n-byte (n<0 => strlen) string is a keyword (case-insensitive). */
+int tdb_keyword_check(const char *z, int n);
+
+/* ------------------------------------------------------------------ */
+/* C/C++ plugin engine                                                 */
+/* ------------------------------------------------------------------ */
+/* A loadable extension exposes an entry point of this type. It registers
+** functions via tdb_create_function() and returns TDB_OK on success (on
+** failure it may set *errmsg to a tdb_malloc'd string the caller frees). */
+typedef int (*tdb_ext_init_fn)(tdb_db *db, char **errmsg);
+
+/* Load a shared object and invoke its entry point (default name
+** "tdb_extension_init"). The library handle is held until the connection
+** closes. Returns TDB_OK or an error; *errmsg (if non-NULL) receives detail. */
+int tdb_load_extension(tdb_db *db, const char *path, const char *entry,
+                       char **errmsg);
 
 #ifdef __cplusplus
 } /* extern "C" */

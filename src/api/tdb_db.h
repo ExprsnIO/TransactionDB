@@ -22,6 +22,50 @@
 
 struct tdb_env;            /* shared environment (tdb_env.h) */
 
+/* A registered user-defined scalar function (C/C++ plugin entry). */
+typedef struct tdb_func_entry {
+  char                  *name;
+  int                    nArg;   /* required arity, or -1 for variadic */
+  tdb_func               fn;
+  void                  *pApp;
+  struct tdb_func_entry *next;
+} tdb_func_entry;
+
+/* A dynamically loaded extension shared object, kept so it can be closed. */
+typedef struct tdb_ext_handle {
+  void                  *dl;     /* dlopen handle */
+  struct tdb_ext_handle *next;
+} tdb_ext_handle;
+
+struct tdb_plsql_proc;           /* opaque compiled PL/SQL routine (tdb_plsql.h) */
+
+/* A stored PL/SQL routine (LANGUAGE PLSQL) compiled on this connection. */
+typedef struct tdb_plsql_routine {
+  char                     *name;
+  struct tdb_plsql_proc    *proc;
+  int                       is_function;
+  int                       nparams;
+  struct tdb_plsql_routine *next;
+} tdb_plsql_routine;
+
+/* A named sequence generator (nextval/currval/setval). */
+typedef struct tdb_sequence {
+  char                *name;
+  int64_t              cur;
+  int64_t              inc;
+  int                  has_cur;     /* 0 until the first nextval/setval */
+  struct tdb_sequence *next;
+} tdb_sequence;
+
+/* Context passed to a user function: it reads pApp and writes the result. */
+struct tdb_context {
+  tdb_db    *db;
+  void      *pApp;
+  tdb_value *out;      /* result destination (borrowed) */
+  int        is_error;
+  char       errmsg[256];
+};
+
 struct tdb_db {
   struct tdb_env *env;     /* shared resources (pager/catalog/locks/txn/engine) */
 
@@ -32,6 +76,11 @@ struct tdb_db {
   tdb_lockmgr *lm;
   tdb_txnmgr  *tm;
   tdb_storage *engine;
+
+  tdb_func_entry *funcs;   /* registered user-defined functions (C/C++ plugins) */
+  tdb_ext_handle *exts;    /* loaded extension shared objects */
+  tdb_plsql_routine *plroutines; /* stored LANGUAGE PLSQL routines */
+  tdb_sequence   *seqs;    /* named sequence generators */
 
   tdb_lua     *lua;        /* embedded Lua state (NULL if built without Lua); per-connection */
   tdb_txn     *txn;        /* the current transaction (auto or explicit); per-connection */
@@ -79,6 +128,17 @@ struct tdb_stmt {
 
 /* Set the connection error message. */
 void tdb_db_seterr(tdb_db *db, const char *fmt, ...);
+
+/* Look up a registered user function by name and arity (NULL if none). */
+const tdb_func_entry *tdb_db_find_function(tdb_db *db, const char *name, int argc);
+
+/* Register / find a stored PL/SQL routine (proc ownership transfers to db). */
+int  tdb_db_add_plsql(tdb_db *db, const char *name, struct tdb_plsql_proc *proc,
+                      int is_function, int nparams);
+const tdb_plsql_routine *tdb_db_find_plsql(tdb_db *db, const char *name);
+
+/* Find (optionally creating with start=1,inc=1) a named sequence. */
+tdb_sequence *tdb_db_seq_find(tdb_db *db, const char *name, int create);
 
 /* Execute a prepared statement: run DDL/DML to completion, or prepare a SELECT
 ** result — either materialized into stmt->rows or, for a streamable scan, armed

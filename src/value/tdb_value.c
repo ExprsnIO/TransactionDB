@@ -1,6 +1,8 @@
 /* tdb_value.c — runtime SQL value operations. */
 #include "tdb_value.h"
+#include "tdb_record.h"              /* composite (un)packing reuses the codec */
 #include "../common/tdb_mem.h"
+#include "../common/tdb_buf.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -60,8 +62,47 @@ int tdb_value_set_blob(tdb_value *v, const void *p, int n, int copy) {
   return value_set_bytes(v, TDB_VAL_BLOB, p, n, copy);
 }
 
+int tdb_value_set_composite(tdb_value *v, const void *p, int n, int copy) {
+  return value_set_bytes(v, TDB_VAL_COMPOSITE, p, n, copy);
+}
+
+int tdb_value_composite_pack(tdb_value *out, const tdb_value *fields, int n) {
+  tdb_buf b; tdb_buf_init(&b);
+  int rc = tdb_record_encode(fields, n, &b);
+  if (rc == TDB_OK) rc = tdb_value_set_composite(out, b.data, (int)b.len, 1);
+  tdb_buf_free(&b);
+  return rc;
+}
+
+int tdb_value_composite_count(const tdb_value *v) {
+  if (v->type != TDB_VAL_COMPOSITE || !v->u.s.p) return 0;
+  tdb_value dummy; int nc = 0;
+  if (tdb_record_decode((const uint8_t *)v->u.s.p, (size_t)v->u.s.n,
+                        &dummy, 0, &nc) != TDB_OK)
+    return 0;
+  return nc;
+}
+
+int tdb_value_composite_field(const tdb_value *v, int i, tdb_value *out) {
+  tdb_value_clear(out);
+  if (v->type != TDB_VAL_COMPOSITE || !v->u.s.p || i < 0) return TDB_RANGE;
+  int want = i + 1;
+  tdb_value *fs = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)want);
+  if (!fs) return TDB_NOMEM;
+  int nc = 0;
+  int rc = tdb_record_decode((const uint8_t *)v->u.s.p, (size_t)v->u.s.n, fs, want, &nc);
+  if (rc == TDB_OK) {
+    if (i < nc) rc = tdb_value_copy(out, &fs[i]);
+    else rc = TDB_RANGE;
+  }
+  for (int k = 0; k < want && k < nc; k++) tdb_value_clear(&fs[k]);
+  tdb_mfree(fs);
+  return rc;
+}
+
 void tdb_value_clear(tdb_value *v) {
-  if ((v->type == TDB_VAL_TEXT || v->type == TDB_VAL_BLOB) && v->u.s.owned) {
+  if ((v->type == TDB_VAL_TEXT || v->type == TDB_VAL_BLOB ||
+       v->type == TDB_VAL_COMPOSITE) && v->u.s.owned) {
     tdb_mfree(v->u.s.p);
   }
   v->type = TDB_VAL_NULL;
@@ -77,6 +118,7 @@ int tdb_value_copy(tdb_value *dst, const tdb_value *src) {
     case TDB_VAL_REAL: tdb_value_set_real(dst, src->u.r); break;
     case TDB_VAL_TEXT: return tdb_value_set_text(dst, src->u.s.p, src->u.s.n, 1);
     case TDB_VAL_BLOB: return tdb_value_set_blob(dst, src->u.s.p, src->u.s.n, 1);
+    case TDB_VAL_COMPOSITE: return tdb_value_set_composite(dst, src->u.s.p, src->u.s.n, 1);
   }
   return TDB_OK;
 }
@@ -119,6 +161,28 @@ const char *tdb_value_as_text(const tdb_value *v) {
       char tmp[40];
       snprintf(tmp, sizeof(tmp), "%.17g", v->u.r);
       tdb_value_set_text(m, tmp, -1, 1);
+      return m->u.s.p;
+    }
+    case TDB_VAL_COMPOSITE: {
+      /* render as "(field, field, ...)" — materializes into `m`'s storage */
+      tdb_buf b; tdb_buf_init(&b);
+      tdb_buf_putc(&b, '(');
+      int n = tdb_value_composite_count(v);
+      for (int i = 0; i < n; i++) {
+        tdb_value f; tdb_value_init(&f);
+        if (i) tdb_buf_append(&b, ", ", 2);
+        if (tdb_value_composite_field(v, i, &f) == TDB_OK) {
+          if (f.type == TDB_VAL_NULL) tdb_buf_append(&b, "NULL", 4);
+          else {
+            const char *t = tdb_value_as_text(&f);
+            if (t) tdb_buf_append(&b, t, strlen(t));
+          }
+        }
+        tdb_value_clear(&f);
+      }
+      tdb_buf_putc(&b, ')');
+      tdb_value_set_text(m, (const char *)b.data, (int)b.len, 1);
+      tdb_buf_free(&b);
       return m->u.s.p;
     }
   }

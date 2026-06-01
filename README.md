@@ -31,6 +31,17 @@ readers proceed concurrently without blocking.
 - **Streaming execution** — simple single-table scans run through a pull-based
   (volcano) operator tree; more complex queries fall back to materialization.
 - **Optional embedded Lua** — Lua 5.4 scripting support, gated behind a build option.
+- **PL/SQL engine** — a procedural routine language (DECLARE/BEGIN/END, assignment,
+  IF/ELSIF/ELSE, WHILE, FOR..LOOP, RETURN) with a tree-walking interpreter *and* an
+  LLVM IR backend (constant-folding pass + textual LLVM module emission).
+- **Stored functions & sequences** — `CREATE FUNCTION ... LANGUAGE PLSQL`, plus
+  `nextval` / `currval` / `setval` sequence generators.
+- **Composite (ROW/STRUCT) types** — first-class tuple values with field access,
+  nesting, and a `ROW(...)` constructor.
+- **C/C++ plugin engine** — register scalar functions with `tdb_create_function`, or
+  load a shared object at runtime with `tdb_load_extension`.
+- **Cryptography functions** — `sha256`, `md5`, `hmac_sha256`, `crc32`, `hex`/`unhex`,
+  `randomblob` built in; AES + a CSPRNG when built with `-DTDB_BUILD_OPENSSL=ON`.
 - **Interactive shell** — a small REPL (`tdb_shell`) for ad-hoc SQL.
 
 ### SQL support
@@ -44,7 +55,12 @@ include:
   and the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` aggregates
 - Correlated subqueries
 - `BEGIN` / `COMMIT` / `ROLLBACK`
-- Types: `INTEGER`, `REAL`, `TEXT`, `BLOB`, with `PRIMARY KEY`
+- `CREATE FUNCTION`/`PROCEDURE ... LANGUAGE PLSQL`/`LUA`, and `CALL`
+- Scalar functions including `row(...)`/`composite_extract(...)`, the crypto suite,
+  and the sequence functions `nextval`/`currval`/`setval`
+- Types: `INTEGER`, `REAL`, `TEXT`, `BLOB`, `COMPOSITE`/`ROW`, with `PRIMARY KEY`
+- The full SQL keyword set is introspectable via `tdb_keyword_count` /
+  `tdb_keyword_name` / `tdb_keyword_check` (à la SQLite)
 
 For a feature-by-feature comparison against SQLite — including what's supported,
 what's parsed-but-not-yet-enforced, and tdb-only extensions — see
@@ -62,13 +78,12 @@ cmake --build build -j           # build the library, CLI, and tests
 
 ### Configure options
 
-All default to `ON`:
-
 | Option             | Description                                              |
 | ------------------ | -------------------------------------------------------- |
-| `TDB_BUILD_TESTS`  | Build the test suite.                                    |
-| `TDB_BUILD_CLI`    | Build the `tdb_shell` REPL.                              |
-| `TDB_BUILD_LUA`    | Build with embedded Lua scripting support.               |
+| `TDB_BUILD_TESTS`   | Build the test suite. (default `ON`)                    |
+| `TDB_BUILD_CLI`     | Build the `tdb_shell` REPL. (default `ON`)              |
+| `TDB_BUILD_LUA`     | Build with embedded Lua scripting support. (default `ON`)|
+| `TDB_BUILD_OPENSSL` | Add OpenSSL-backed crypto (AES, CSPRNG). (default `OFF`) |
 
 > ⚠️ **`TDB_BUILD_LUA=ON` fetches Lua 5.4.7 over the network** via CMake `FetchContent`.
 > For offline builds, drop a copy under `third_party/lua/` or configure with

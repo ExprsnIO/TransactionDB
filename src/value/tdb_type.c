@@ -88,8 +88,9 @@ static int type_class(tdb_valtype t) {
     case TDB_VAL_REAL: return 1;
     case TDB_VAL_TEXT: return 2;
     case TDB_VAL_BLOB: return 3;
+    case TDB_VAL_COMPOSITE: return 4;
   }
-  return 4;
+  return 5;
 }
 
 static int cmp_text(const char *a, int na, const char *b, int nb,
@@ -127,7 +128,8 @@ int tdb_value_compare(const tdb_value *a, const tdb_value *b,
     }
     case TDB_VAL_TEXT:
       return cmp_text(a->u.s.p, a->u.s.n, b->u.s.p, b->u.s.n, coll);
-    case TDB_VAL_BLOB: {
+    case TDB_VAL_BLOB:
+    case TDB_VAL_COMPOSITE: {
       int n = a->u.s.n < b->u.s.n ? a->u.s.n : b->u.s.n;
       int c = memcmp(a->u.s.p, b->u.s.p, (size_t)n);
       if (c) return c < 0 ? -1 : 1;

@@ -8,6 +8,8 @@
 #include "tdb_db.h"
 #include "tdb_env.h"
 #include "../sql/tdb_parser.h"
+#include "../ext/tdb_crypto.h"
+#include "../plsql/tdb_plsql.h"
 #include "../common/tdb_mem.h"
 #ifdef TDB_HAVE_LUA
 #include "../lua/tdb_lua.h"
@@ -16,6 +18,14 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
+static void tdb_db_free_functions(tdb_db *db);
+static void tdb_db_free_extensions(tdb_db *db);
+static void tdb_db_free_plsql(tdb_db *db);
+static void tdb_db_free_sequences(tdb_db *db);
 
 void tdb_db_seterr(tdb_db *db, const char *fmt, ...) {
   if (!db) return;
@@ -56,6 +66,9 @@ int tdb_open_v2(const char *filename, tdb_db **ppDb, int flags) {
   db->tm     = db->env->tm;
   db->engine = db->env->engine;
 
+  /* register built-in extension functions (cryptography, etc.) */
+  tdb_register_crypto(db);
+
 #ifdef TDB_HAVE_LUA
   rc = tdb_lua_open(db, &db->lua);
   if (rc) goto fail;
@@ -76,6 +89,10 @@ fail:
 int tdb_close(tdb_db *db) {
   if (!db) return TDB_OK;
   if (db->txn) tdb_txn_rollback(db->txn);
+  tdb_db_free_functions(db);
+  tdb_db_free_plsql(db);
+  tdb_db_free_sequences(db);
+  tdb_db_free_extensions(db);
 #ifdef TDB_HAVE_LUA
   if (db->lua) tdb_lua_close(db->lua);
 #endif
@@ -259,7 +276,8 @@ int tdb_column_type(tdb_stmt *st, int i) {
     case TDB_VAL_INT: return TDB_INTEGER;
     case TDB_VAL_REAL: return TDB_FLOAT;
     case TDB_VAL_TEXT: return TDB_TEXT;
-    case TDB_VAL_BLOB: return TDB_BLOB;
+    case TDB_VAL_BLOB:
+    case TDB_VAL_COMPOSITE: return TDB_BLOB;
     default: return TDB_NULL;
   }
 }
@@ -330,9 +348,167 @@ int tdb_exec(tdb_db *db, const char *sql, tdb_exec_cb cb, void *user,
 /* ----------------- user-defined functions (Phase 9) ------------------- */
 
 int tdb_create_function(tdb_db *db, const char *name, int nArg, tdb_func fn, void *p) {
-  TDB_UNUSED(name); TDB_UNUSED(nArg); TDB_UNUSED(fn); TDB_UNUSED(p);
-  tdb_db_seterr(db, "user-defined functions arrive with Lua (Phase 9)");
+  if (!db || !name || !fn) return TDB_MISUSE;
+  tdb_func_entry *e = (tdb_func_entry *)tdb_calloc(sizeof(*e));
+  if (!e) return TDB_NOMEM;
+  e->name = tdb_strdup(name);
+  if (!e->name) { tdb_mfree(e); return TDB_NOMEM; }
+  e->nArg = nArg;
+  e->fn = fn;
+  e->pApp = p;
+  db_lock(db);
+  e->next = db->funcs;
+  db->funcs = e;
+  db_unlock(db);
+  return TDB_OK;
+}
+
+/* Find a registered function matching `name`/`argc` (case-insensitive name). */
+const tdb_func_entry *tdb_db_find_function(tdb_db *db, const char *name, int argc) {
+  for (tdb_func_entry *e = db->funcs; e; e = e->next)
+    if (!strcasecmp(e->name, name) && (e->nArg < 0 || e->nArg == argc))
+      return e;
+  return NULL;
+}
+
+static void tdb_db_free_functions(tdb_db *db) {
+  tdb_func_entry *e = db->funcs;
+  while (e) { tdb_func_entry *n = e->next; tdb_mfree(e->name); tdb_mfree(e); e = n; }
+  db->funcs = NULL;
+}
+
+/* ----------------------- PL/SQL routine registry ---------------------- */
+
+int tdb_db_add_plsql(tdb_db *db, const char *name, struct tdb_plsql_proc *proc,
+                     int is_function, int nparams) {
+  if (!db || !name || !proc) return TDB_MISUSE;
+  /* replace any existing routine of the same name */
+  tdb_plsql_routine **pp = &db->plroutines;
+  while (*pp) {
+    if (!strcasecmp((*pp)->name, name)) {
+      tdb_plsql_routine *old = *pp;
+      *pp = old->next;
+      tdb_plsql_free(old->proc);
+      tdb_mfree(old->name);
+      tdb_mfree(old);
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  tdb_plsql_routine *r = (tdb_plsql_routine *)tdb_calloc(sizeof(*r));
+  if (!r) return TDB_NOMEM;
+  r->name = tdb_strdup(name);
+  r->proc = proc;
+  r->is_function = is_function;
+  r->nparams = nparams;
+  r->next = db->plroutines;
+  db->plroutines = r;
+  return TDB_OK;
+}
+
+const tdb_plsql_routine *tdb_db_find_plsql(tdb_db *db, const char *name) {
+  for (tdb_plsql_routine *r = db->plroutines; r; r = r->next)
+    if (!strcasecmp(r->name, name)) return r;
+  return NULL;
+}
+
+static void tdb_db_free_plsql(tdb_db *db) {
+  tdb_plsql_routine *r = db->plroutines;
+  while (r) {
+    tdb_plsql_routine *n = r->next;
+    tdb_plsql_free(r->proc);
+    tdb_mfree(r->name);
+    tdb_mfree(r);
+    r = n;
+  }
+  db->plroutines = NULL;
+}
+
+/* --------------------------- sequence registry ------------------------ */
+
+tdb_sequence *tdb_db_seq_find(tdb_db *db, const char *name, int create) {
+  for (tdb_sequence *s = db->seqs; s; s = s->next)
+    if (!strcasecmp(s->name, name)) return s;
+  if (!create) return NULL;
+  tdb_sequence *s = (tdb_sequence *)tdb_calloc(sizeof(*s));
+  if (!s) return NULL;
+  s->name = tdb_strdup(name);
+  s->cur = 0; s->inc = 1; s->has_cur = 0;
+  s->next = db->seqs;
+  db->seqs = s;
+  return s;
+}
+
+static void tdb_db_free_sequences(tdb_db *db) {
+  tdb_sequence *s = db->seqs;
+  while (s) { tdb_sequence *n = s->next; tdb_mfree(s->name); tdb_mfree(s); s = n; }
+  db->seqs = NULL;
+}
+
+/*
+** Load a C/C++ plugin from a shared object and run its entry point. The entry
+** function (default name "tdb_extension_init") has the signature
+**   int tdb_extension_init(tdb_db *db, char **errmsg);
+** and typically calls tdb_create_function() to register functions. The handle
+** is retained until the connection closes.
+*/
+int tdb_load_extension(tdb_db *db, const char *path, const char *entry,
+                       char **errmsg) {
+  if (errmsg) *errmsg = NULL;
+  if (!db || !path) return TDB_MISUSE;
+#ifdef _WIN32
+  (void)entry;
+  tdb_db_seterr(db, "extension loading is not supported on this platform");
+  if (errmsg) *errmsg = tdb_strdup(db->errmsg);
   return TDB_UNSUPPORTED;
+#else
+  void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  if (!h) {
+    const char *e = dlerror();
+    tdb_db_seterr(db, "dlopen failed: %s", e ? e : "unknown error");
+    if (errmsg) *errmsg = tdb_strdup(db->errmsg);
+    return TDB_ERROR;
+  }
+  const char *sym = entry && *entry ? entry : "tdb_extension_init";
+  /* object-pointer to function-pointer cast via a union to stay strictly
+  ** conforming under -Wpedantic */
+  union { void *p; tdb_ext_init_fn f; } cast;
+  cast.p = dlsym(h, sym);
+  if (!cast.p) {
+    tdb_db_seterr(db, "extension entry point '%s' not found", sym);
+    if (errmsg) *errmsg = tdb_strdup(db->errmsg);
+    dlclose(h);
+    return TDB_ERROR;
+  }
+  char *emsg = NULL;
+  int rc = cast.f(db, &emsg);
+  if (rc != TDB_OK) {
+    tdb_db_seterr(db, "extension init failed: %s", emsg ? emsg : "error");
+    if (errmsg) *errmsg = emsg; else tdb_free(emsg);
+    dlclose(h);
+    return rc;
+  }
+  tdb_free(emsg);
+  tdb_ext_handle *eh = (tdb_ext_handle *)tdb_calloc(sizeof(*eh));
+  if (!eh) { dlclose(h); return TDB_NOMEM; }
+  eh->dl = h;
+  eh->next = db->exts;
+  db->exts = eh;
+  return TDB_OK;
+#endif
+}
+
+static void tdb_db_free_extensions(tdb_db *db) {
+  tdb_ext_handle *e = db->exts;
+  while (e) {
+    tdb_ext_handle *n = e->next;
+#ifndef _WIN32
+    if (e->dl) dlclose(e->dl);
+#endif
+    tdb_mfree(e);
+    e = n;
+  }
+  db->exts = NULL;
 }
 
 /* ---------------------- value / result accessors ---------------------- */
@@ -343,7 +519,8 @@ int tdb_value_type(tdb_value *v) {
     case TDB_VAL_INT: return TDB_INTEGER;
     case TDB_VAL_REAL: return TDB_FLOAT;
     case TDB_VAL_TEXT: return TDB_TEXT;
-    case TDB_VAL_BLOB: return TDB_BLOB;
+    case TDB_VAL_BLOB:
+    case TDB_VAL_COMPOSITE: return TDB_BLOB;
     default: return TDB_NULL;
   }
 }
@@ -357,9 +534,14 @@ int tdb_value_bytes(tdb_value *v) {
   return (v && (v->type == TDB_VAL_BLOB || v->type == TDB_VAL_TEXT)) ? v->u.s.n : 0;
 }
 
-void tdb_result_int64(tdb_context *c, int64_t v) { TDB_UNUSED(c); TDB_UNUSED(v); }
-void tdb_result_double(tdb_context *c, double v) { TDB_UNUSED(c); TDB_UNUSED(v); }
-void tdb_result_text(tdb_context *c, const char *v, int n) { TDB_UNUSED(c); TDB_UNUSED(v); TDB_UNUSED(n); }
-void tdb_result_null(tdb_context *c) { TDB_UNUSED(c); }
-void tdb_result_error(tdb_context *c, const char *m) { TDB_UNUSED(c); TDB_UNUSED(m); }
-void *tdb_user_data(tdb_context *c) { TDB_UNUSED(c); return NULL; }
+void tdb_result_int64(tdb_context *c, int64_t v) { if (c && c->out) tdb_value_set_int(c->out, v); }
+void tdb_result_double(tdb_context *c, double v) { if (c && c->out) tdb_value_set_real(c->out, v); }
+void tdb_result_text(tdb_context *c, const char *v, int n) { if (c && c->out) tdb_value_set_text(c->out, v, n, 1); }
+void tdb_result_blob(tdb_context *c, const void *v, int n) { if (c && c->out) tdb_value_set_blob(c->out, v, n, 1); }
+void tdb_result_null(tdb_context *c) { if (c && c->out) tdb_value_set_null(c->out); }
+void tdb_result_error(tdb_context *c, const char *m) {
+  if (!c) return;
+  c->is_error = 1;
+  snprintf(c->errmsg, sizeof(c->errmsg), "%s", m ? m : "error");
+}
+void *tdb_user_data(tdb_context *c) { return c ? c->pApp : NULL; }

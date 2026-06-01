@@ -71,7 +71,8 @@ int tdb_record_encode(const tdb_value *vals, int n, tdb_buf *out) {
       case TDB_VAL_INT:  st[i] = int_serial_type(v->u.i, &bl[i]); break;
       case TDB_VAL_REAL: st[i] = 7; bl[i] = 8; break;
       case TDB_VAL_TEXT: bl[i] = v->u.s.n; st[i] = (uint64_t)13 + (uint64_t)2 * (uint64_t)(unsigned)v->u.s.n; break;
-      case TDB_VAL_BLOB: bl[i] = v->u.s.n; st[i] = (uint64_t)12 + (uint64_t)2 * (uint64_t)(unsigned)v->u.s.n; break;
+      case TDB_VAL_BLOB:
+      case TDB_VAL_COMPOSITE: bl[i] = v->u.s.n; st[i] = (uint64_t)12 + (uint64_t)2 * (uint64_t)(unsigned)v->u.s.n; break;
       default: st[i] = 0; bl[i] = 0; break;
     }
   }
@@ -82,7 +83,8 @@ int tdb_record_encode(const tdb_value *vals, int n, tdb_buf *out) {
 
   for (int i = 0; i < n; i++) {
     const tdb_value *v = &vals[i];
-    if (bl[i] == 0 && v->type != TDB_VAL_TEXT && v->type != TDB_VAL_BLOB) continue;
+    if (bl[i] == 0 && v->type != TDB_VAL_TEXT && v->type != TDB_VAL_BLOB &&
+        v->type != TDB_VAL_COMPOSITE) continue;
     if ((rc = tdb_buf_reserve(out, (size_t)bl[i] + 8))) goto done;
     uint8_t *dst = out->data + out->len;
     switch (v->type) {
@@ -94,6 +96,7 @@ int tdb_record_encode(const tdb_value *vals, int n, tdb_buf *out) {
       }
       case TDB_VAL_TEXT:
       case TDB_VAL_BLOB:
+      case TDB_VAL_COMPOSITE:
         if (bl[i]) memcpy(dst, v->u.s.p, (size_t)bl[i]);
         break;
       default: break;

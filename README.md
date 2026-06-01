@@ -46,6 +46,10 @@ include:
 - `BEGIN` / `COMMIT` / `ROLLBACK`
 - Types: `INTEGER`, `REAL`, `TEXT`, `BLOB`, with `PRIMARY KEY`
 
+For a feature-by-feature comparison against SQLite — including what's supported,
+what's parsed-but-not-yet-enforced, and tdb-only extensions — see
+[`docs/SQL_COMPATIBILITY.md`](docs/SQL_COMPATIBILITY.md).
+
 ## Building
 
 TransactionDB uses **CMake (≥ 3.16)** with an out-of-source build. The default build

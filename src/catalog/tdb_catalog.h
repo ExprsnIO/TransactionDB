@@ -71,4 +71,15 @@ int        tdb_catalog_set_comment(tdb_catalog *c, int kind,
 /* Returns a malloc'd copy of the body (caller frees) or NULL if none. */
 char      *tdb_catalog_get_comment(tdb_catalog *c, int kind, const char *target);
 
+/* Tablespace registry — metadata only (placement is not implemented; the
+** entries only constrain CREATE TABLE TABLESPACE <name> validation). Both
+** create and drop are idempotent under the matching IF clause. */
+int          tdb_catalog_tablespace_create(tdb_catalog *c, const char *name,
+                                           const char *location, int if_not_exists);
+int          tdb_catalog_tablespace_drop(tdb_catalog *c, const char *name, int if_exists);
+int          tdb_catalog_tablespace_exists(tdb_catalog *c, const char *name);
+int          tdb_catalog_tablespace_count(tdb_catalog *c);
+const char  *tdb_catalog_tablespace_name_at(tdb_catalog *c, int i);
+const char  *tdb_catalog_tablespace_location_at(tdb_catalog *c, int i);
+
 #endif /* TDB_CATALOG_H */

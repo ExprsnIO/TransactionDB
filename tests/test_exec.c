@@ -1875,8 +1875,15 @@ static void test_phase11_utility(void) {
   TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE log IS 'second'"), TDB_OK);
   TDB_CHECK_EQ(exec(db, "COMMENT ON COLUMN log.msg IS NULL"), TDB_OK);
 
-  /* CREATE TABLESPACE / DROP TABLESPACE are parsed and accepted. */
+  /* CREATE / DROP TABLESPACE persist a registry entry. The log table was
+  ** created with TABLESPACE warm, so DROP refuses while it's in use. */
   TDB_CHECK_EQ(exec(db, "CREATE TABLESPACE warm LOCATION '/tmp/warm'"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLESPACE warm LOCATION '/tmp/warm'"), TDB_ERROR);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLESPACE IF NOT EXISTS warm"), TDB_OK);
+  TDB_CHECK(exec(db, "DROP TABLESPACE warm") != TDB_OK);     /* in use by log */
+  TDB_CHECK(exec(db, "DROP TABLESPACE nope") != TDB_OK);
+  TDB_CHECK_EQ(exec(db, "DROP TABLESPACE IF EXISTS nope"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "DROP TABLE log"), TDB_OK);
   TDB_CHECK_EQ(exec(db, "DROP TABLESPACE warm"), TDB_OK);
 
   /* Unknown target rejected */

@@ -1030,12 +1030,33 @@ static int exec_comment(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 }
 
 static int exec_tablespace_create(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
-  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
-  return TDB_OK;
+  TDB_UNUSED(st);
+  const char *name = a->u.create_tablespace.name;
+  const char *loc  = a->u.create_tablespace.location;
+  int if_not_exists = a->u.create_tablespace.if_not_exists;
+  if (!if_not_exists && tdb_catalog_tablespace_exists(db->cat, name)) {
+    tdb_db_seterr(db, "tablespace %s already exists", name);
+    return TDB_ERROR;
+  }
+  return tdb_catalog_tablespace_create(db->cat, name, loc, if_not_exists);
 }
 static int exec_tablespace_drop(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
-  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
-  return TDB_OK;
+  TDB_UNUSED(st);
+  const char *name = a->u.drop_tablespace.name;
+  int if_exists = a->u.drop_tablespace.if_exists;
+  if (!if_exists && !tdb_catalog_tablespace_exists(db->cat, name)) {
+    tdb_db_seterr(db, "no such tablespace: %s", name);
+    return TDB_ERROR;
+  }
+  /* Refuse to drop a tablespace that's still in use by a table. */
+  for (int i = 0; i < tdb_catalog_table_count(db->cat); i++) {
+    tdb_table *t = tdb_catalog_table_at(db->cat, i);
+    if (t->tablespace && strcasecmp(t->tablespace, name) == 0) {
+      tdb_db_seterr(db, "tablespace %s still in use by table %s", name, t->name);
+      return TDB_ERROR;
+    }
+  }
+  return tdb_catalog_tablespace_drop(db->cat, name, if_exists);
 }
 
 /* Split a comma/space-delimited privilege list into uppercase tokens. */

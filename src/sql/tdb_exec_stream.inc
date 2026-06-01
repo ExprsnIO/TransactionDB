@@ -593,6 +593,8 @@ static void op_close(tdb_op *op) {
         tdb_value_clear(&gp->acc[j].mn); tdb_value_clear(&gp->acc[j].mx);
         for (int k = 0; k < gp->acc[j].nseen; k++) tdb_value_clear(&gp->acc[j].seen[k]);
         tdb_mfree(gp->acc[j].seen);
+        if (gp->acc[j].gc_init) tdb_buf_free(&gp->acc[j].gc);
+        tdb_mfree(gp->acc[j].gc_sep);
       }
       tdb_mfree(gp->acc);
     }
@@ -682,6 +684,12 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
     qs->join = s->join; qs->on = s->on;
     Q.totalcols += t->ncol;
     Q.nsrc++;
+    /* NATURAL JOIN: derive an ON from the columns shared with the prior source.
+    ** (USING is already desugared in the parser.) */
+    if (s->natural && Q.nsrc >= 2 && !qs->on) {
+      synth_join_on(st, s, &Q, Q.nsrc - 1);
+      s->on = qs->on;   /* mirror back so join->on (below) picks it up */
+    }
   }
   tdb_table *t = Q.src[0].tbl;   /* the (left-most) driving table */
 

@@ -114,10 +114,30 @@ static tdb_expr *parse_primary(P *p) {
       { char *s = decode_string(p, &p->cur);
         tdb_value_set_text(&e->lit, s, -1, 0); }
       advance(p); return e;
-    case TK_BLOB:
+    case TK_BLOB: {
+      /* x'AABB' — decode the hex payload into a real BLOB value (SQLite-compat). */
       e = tdb_expr_new(p->a, EX_LITERAL);
-      tdb_value_set_text(&e->lit, dup_tok(p, &p->cur), -1, 0); /* hex text; analyzer decodes */
+      int hn = p->cur.n;
+      const char *hz = p->cur.z;
+      if (hn & 1) { set_err(p, "odd-length blob literal"); advance(p); return e; }
+      int bn = hn / 2;
+      uint8_t *b = (uint8_t *)tdb_arena_alloc(p->a, (size_t)(bn ? bn : 1));
+      int ok = 1;
+      for (int i = 0; i < bn && ok; i++) {
+        int hi = hz[2*i], lo = hz[2*i+1];
+        int hv = (hi >= '0' && hi <= '9') ? hi - '0'
+               : (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10
+               : (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : -1;
+        int lv = (lo >= '0' && lo <= '9') ? lo - '0'
+               : (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10
+               : (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : -1;
+        if (hv < 0 || lv < 0) { ok = 0; break; }
+        b[i] = (uint8_t)((hv << 4) | lv);
+      }
+      if (!ok) { set_err(p, "invalid hex digit in blob literal"); advance(p); return e; }
+      tdb_value_set_blob(&e->lit, b, bn, 1);
       advance(p); return e;
+    }
     case TK_NULL: e = tdb_expr_new(p->a, EX_NULL); advance(p); return e;
     case TK_TRUE: e = tdb_expr_new(p->a, EX_LITERAL); tdb_value_set_int(&e->lit, 1); advance(p); return e;
     case TK_FALSE: e = tdb_expr_new(p->a, EX_LITERAL); tdb_value_set_int(&e->lit, 0); advance(p); return e;
@@ -323,10 +343,14 @@ static tdb_expr *parse_expr(P *p, int minprec) {
 
 /* ------------------------------- SELECT ------------------------------- */
 
-/* optional alias: "AS name" or a bare identifier */
+/* optional alias: "AS name" or a bare identifier. Contextual join keywords
+** (NATURAL) are explicitly excluded so `FROM a NATURAL JOIN b` doesn't treat
+** "NATURAL" as a's alias. */
 static char *opt_alias(P *p) {
   if (accept(p, TK_AS)) { char *a = dup_tok(p, &p->cur); expect(p, TK_ID, "expected alias"); return a; }
-  if (p->cur.kind == TK_ID) { char *a = dup_tok(p, &p->cur); advance(p); return a; }
+  if (p->cur.kind == TK_ID && !id_is(&p->cur, "NATURAL")) {
+    char *a = dup_tok(p, &p->cur); advance(p); return a;
+  }
   return NULL;
 }
 
@@ -355,11 +379,34 @@ static tdb_src *parse_src_item(P *p) {
   return s;
 }
 
+/* Build "<lq>.col = <rq>.col". Caller-owned arena strings. */
+static tdb_expr *parser_eq(P *p, const char *lq, const char *rq, const char *col) {
+  tdb_expr *l = tdb_expr_new(p->a, EX_COLUMN);
+  l->table = tdb_arena_strndup(p->a, lq ? lq : "", lq ? strlen(lq) : 0);
+  l->name = tdb_arena_strndup(p->a, col, strlen(col));
+  tdb_expr *r = tdb_expr_new(p->a, EX_COLUMN);
+  r->table = tdb_arena_strndup(p->a, rq ? rq : "", rq ? strlen(rq) : 0);
+  r->name = tdb_arena_strndup(p->a, col, strlen(col));
+  tdb_expr *eq = tdb_expr_new(p->a, EX_BINARY);
+  eq->op = TK_EQ; eq->left = l; eq->right = r;
+  return eq;
+}
+static tdb_expr *parser_and(P *p, tdb_expr *a, tdb_expr *b) {
+  if (!a) return b;
+  if (!b) return a;
+  tdb_expr *e = tdb_expr_new(p->a, EX_BINARY);
+  e->op = TK_AND; e->left = a; e->right = b;
+  return e;
+}
+
 static tdb_src *parse_from(P *p) {
   tdb_src *head = parse_src_item(p);
   tdb_src *tailp = head;
   for (;;) {
     tdb_join_kind jk = JOIN_NONE;
+    int natural = 0;
+    /* NATURAL [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN */
+    if (id_is(&p->cur, "NATURAL")) { advance(p); natural = 1; }
     if (accept(p, TK_COMMA)) jk = JOIN_CROSS;
     else if (p->cur.kind == TK_JOIN) { advance(p); jk = JOIN_INNER; }
     else if (p->cur.kind == TK_INNER) { advance(p); accept(p, TK_JOIN); jk = JOIN_INNER; }
@@ -367,11 +414,26 @@ static tdb_src *parse_from(P *p) {
     else if (p->cur.kind == TK_LEFT)  { advance(p); accept(p, TK_OUTER); accept(p, TK_JOIN); jk = JOIN_LEFT; }
     else if (p->cur.kind == TK_RIGHT) { advance(p); accept(p, TK_OUTER); accept(p, TK_JOIN); jk = JOIN_RIGHT; }
     else if (p->cur.kind == TK_FULL)  { advance(p); accept(p, TK_OUTER); accept(p, TK_JOIN); jk = JOIN_FULL; }
-    else break;
+    else { if (natural) set_err(p, "NATURAL must be followed by JOIN"); break; }
 
     tdb_src *next = parse_src_item(p);
     next->join = jk;
+    next->natural = natural;
     if (accept(p, TK_ON)) next->on = parse_expr(p, 0);
+    else if (accept(p, TK_USING)) {
+      expect(p, TK_LP, "expected ( after USING");
+      next->using_cols = parse_name_list(p, &next->nusing);
+      expect(p, TK_RP, "expected ) after USING column list");
+      /* Eagerly desugar USING into an ON condition referencing both sides by
+      ** their alias (or table name). NATURAL is left to the executor — its
+      ** column-name set needs the catalog. */
+      const char *lq = tailp->alias ? tailp->alias : tailp->table;
+      const char *rq = next->alias  ? next->alias  : next->table;
+      tdb_expr *cond = NULL;
+      for (int i = 0; i < next->nusing; i++)
+        cond = parser_and(p, cond, parser_eq(p, lq, rq, next->using_cols[i]));
+      next->on = cond;
+    }
     tailp->next = next; tailp = next;
     if (p->err) break;
   }
@@ -684,6 +746,11 @@ static tdb_ast_stmt *parse_create_table(P *p) {
   if (p->cur.kind == TK_IF) { advance(p); expect(p, TK_NOT, "expected NOT"); expect(p, TK_EXISTS, "expected EXISTS"); ct->if_not_exists = 1; }
   ct->name = dup_tok(p, &p->cur);
   expect(p, TK_ID, "expected table name");
+  /* CREATE TABLE name AS SELECT ... — schema derived from the SELECT */
+  if (accept(p, TK_AS)) {
+    ct->as_select = parse_select(p);
+    return s;
+  }
   expect(p, TK_LP, "expected (");
 
   int cap = 0;
@@ -1129,6 +1196,11 @@ static tdb_ast_stmt *parse_stmt(P *p) {
     case TK_LOCK:    return parse_lock(p);
     case TK_EXPLAIN: {
       advance(p);
+      /* Optional "QUERY PLAN" — treated the same as bare EXPLAIN. */
+      if (id_is(&p->cur, "QUERY")) {
+        advance(p);
+        if (id_is(&p->cur, "PLAN")) advance(p);
+      }
       tdb_ast_stmt *inner = parse_stmt(p);
       tdb_ast_stmt *s = new_stmt(p, ST_EXPLAIN);
       s->u.explain.inner = inner;

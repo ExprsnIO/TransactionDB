@@ -68,7 +68,8 @@ static int pk_int_col(tdb_table *t) {
   return -1;
 }
 
-/* finalize a full column row: generated cols, type coercion, NOT NULL, period */
+/* finalize a full column row: generated cols, type coercion, NOT NULL, CHECK,
+** period. */
 static int finalize_row(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_value *full) {
   for (int i = 0; i < t->ncol; i++) {
     tdb_column *col = &t->cols[i];
@@ -90,6 +91,33 @@ static int finalize_row(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_value *full)
       tdb_db_seterr(db, "NOT NULL constraint failed: %s", col->name);
       return TDB_CONSTRAINT;
     }
+  }
+  /* Column-level CHECK constraints. NULL (UNKNOWN) is treated as passing,
+  ** matching SQLite's behaviour. */
+  for (int i = 0; i < t->ncol; i++) {
+    if (!t->cols[i].check_sql) continue;
+    tdb_expr *ce = prepare_col_expr(db, st, t, t->cols[i].check_sql);
+    if (!ce) return TDB_ERROR;
+    ectx ec = { full, t->ncol, NULL, 0, st, NULL, NULL };
+    tdb_value v; tdb_value_init(&v);
+    eval(db, &ec, ce, &v);
+    int ok = (v.type == TDB_VAL_NULL) ? 1 : val_true(&v);
+    tdb_value_clear(&v);
+    if (!ok) {
+      tdb_db_seterr(db, "CHECK constraint failed: %s", t->cols[i].name);
+      return TDB_CONSTRAINT;
+    }
+  }
+  /* Table-level CHECK (if any). */
+  if (t->check_sql) {
+    tdb_expr *ce = prepare_col_expr(db, st, t, t->check_sql);
+    if (!ce) return TDB_ERROR;
+    ectx ec = { full, t->ncol, NULL, 0, st, NULL, NULL };
+    tdb_value v; tdb_value_init(&v);
+    eval(db, &ec, ce, &v);
+    int ok = (v.type == TDB_VAL_NULL) ? 1 : val_true(&v);
+    tdb_value_clear(&v);
+    if (!ok) { tdb_db_seterr(db, "CHECK constraint failed"); return TDB_CONSTRAINT; }
   }
   return TDB_OK;
 }
@@ -248,7 +276,11 @@ static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *ta
   }
 
   int rc = store_full(db, st, t, full, rowid, rec, 0);
-  if (!rc) { *applied = 1; returning_emit(db, st, rp, full, t->ncol); }
+  if (!rc) {
+    *applied = 1;
+    db->last_insert_rowid = (int64_t)rowid;   /* sqlite3_last_insert_rowid mirror */
+    returning_emit(db, st, rp, full, t->ncol);
+  }
   free_row(full, t->ncol);
   return rc;
 }
@@ -485,14 +517,69 @@ static int exec_delete(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   return rc;
 }
 
+/* Pick a declared SQL type that fits the source value (best-effort, used by
+** CREATE TABLE AS SELECT to derive a schema from the first projected row). */
+static const char *infer_decl_type(const tdb_value *v) {
+  switch (v->type) {
+    case TDB_VAL_INT:  return "INTEGER";
+    case TDB_VAL_REAL: return "REAL";
+    case TDB_VAL_BLOB: return "BLOB";
+    case TDB_VAL_COMPOSITE: return "COMPOSITE";
+    default: return "TEXT";
+  }
+}
+
 static int exec_create_table(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
-  TDB_UNUSED(st);
   tdb_create_table *ct = a->u.create_table;
   if (tdb_catalog_find_table(db->cat, ct->name)) {
     if (ct->if_not_exists) return TDB_OK;
     tdb_db_seterr(db, "table %s already exists", ct->name);
     return TDB_ERROR;
   }
+
+  /* CREATE TABLE name AS SELECT ... — derive columns from the SELECT result. */
+  if (ct->as_select) {
+    tdb_stmt tmp;
+    int rc = run_subselect(db, st, ct->as_select, &tmp, NULL);
+    if (rc) { tdb_stmt_clear_results(&tmp); return rc; }
+    /* synthesize columns named after the projection */
+    tdb_create_table syn = *ct;
+    syn.cols = (tdb_coldef *)tdb_calloc(sizeof(tdb_coldef) * (size_t)(tmp.ncol ? tmp.ncol : 1));
+    syn.ncol = tmp.ncol;
+    for (int i = 0; i < tmp.ncol; i++) {
+      const char *nm = (tmp.colnames && tmp.colnames[i]) ? tmp.colnames[i] : "col";
+      syn.cols[i].name = tdb_strdup(nm);
+      syn.cols[i].coll = TDB_COLL_BINARY;
+      const char *tn = "TEXT";
+      if (tmp.nrows > 0) tn = infer_decl_type(&tmp.rows[0][i]);
+      syn.cols[i].type = tdb_typespec_parse(tn);
+    }
+    char *err = NULL;
+    tdb_table *t = tdb_ast_to_table(&syn, &err);
+    for (int i = 0; i < syn.ncol; i++) tdb_mfree(syn.cols[i].name);
+    tdb_mfree(syn.cols);
+    if (!t) { tdb_db_seterr(db, "%s", err ? err : "invalid table"); tdb_mfree(err); tdb_stmt_clear_results(&tmp); return TDB_ERROR; }
+    rc = db->engine->vtab->create_table(db->engine, db->txn, t);
+    if (rc) { tdb_table_free(t); tdb_stmt_clear_results(&tmp); return rc; }
+    rc = tdb_catalog_add_table(db->cat, t);
+    if (rc) { tdb_table_free(t); tdb_stmt_clear_results(&tmp); return rc; }
+    tdb_pager_set_schema_cookie(db->pager, tdb_pager_schema_cookie(db->pager) + 1);
+
+    /* now bulk-insert the materialized rows */
+    tdb_buf rec; tdb_buf_init(&rec);
+    for (int r = 0; r < tmp.nrows && !rc; r++) {
+      tdb_rowid rowid;
+      db->engine->vtab->next_rowid(db->engine, t, &rowid);
+      tdb_buf_reset(&rec);
+      tdb_record_encode(tmp.rows[r], tmp.ncol, &rec);
+      rc = db->engine->vtab->insert(db->engine, db->txn, t, rowid, rec.data, (int)rec.len);
+      if (!rc) { st->changes++; db->last_insert_rowid = (int64_t)rowid; }
+    }
+    tdb_buf_free(&rec);
+    tdb_stmt_clear_results(&tmp);
+    return rc;
+  }
+
   char *err = NULL;
   tdb_table *t = tdb_ast_to_table(ct, &err);
   if (!t) { tdb_db_seterr(db, "%s", err ? err : "invalid table"); tdb_mfree(err); return TDB_ERROR; }

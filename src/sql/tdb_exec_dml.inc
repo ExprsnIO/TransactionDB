@@ -932,10 +932,9 @@ static int exec_truncate(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   return truncate_one(db, st, t);
 }
 
-/* ANALYZE / REINDEX validate their target and otherwise no-op: there is no
-** stats catalog yet, and index pages are kept healthy by the b-tree on
-** every write so an explicit rebuild has nothing to do. ATTACH / DETACH
-** are accepted by the parser but not executable (no attach manager). */
+/* ANALYZE validates its target and otherwise no-ops: there is no stats
+** catalog yet. ATTACH / DETACH are accepted by the parser but not
+** executable (no attach manager). */
 static int exec_analyze(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
   if (a->u.analyze.name && !tdb_catalog_find_table(db->cat, a->u.analyze.name)) {
@@ -945,12 +944,50 @@ static int exec_analyze(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   return TDB_OK;
 }
 
+/* Drop and recreate one index's b-tree from the table's current rows. */
+static int reindex_one(tdb_db *db, tdb_table *t, tdb_index *ix) {
+  int rc = db->engine->vtab->drop_index(db->engine, db->txn, t, ix);
+  if (rc) return rc;
+  ix->root = 0;
+  rc = db->engine->vtab->create_index(db->engine, db->txn, t, ix);
+  if (rc) return rc;
+  return tdb_catalog_update_table(db->cat, t);
+}
+
+/* REINDEX rebuilds index b-trees from the current visible rows. With no
+** target it rebuilds every index on every table. REINDEX TABLE rebuilds
+** every index on one table. REINDEX INDEX rebuilds one named index. */
 static int exec_reindex(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
-  if (a->u.reindex.name && !a->u.reindex.is_index) {
-    if (!tdb_catalog_find_table(db->cat, a->u.reindex.name)) {
-      tdb_db_seterr(db, "no such table: %s", a->u.reindex.name);
-      return TDB_ERROR;
+  const char *name = a->u.reindex.name;
+
+  if (name && a->u.reindex.is_index) {
+    for (int i = 0; i < tdb_catalog_table_count(db->cat); i++) {
+      tdb_table *t = tdb_catalog_table_at(db->cat, i);
+      for (int k = 0; k < t->nindex; k++) {
+        if (strcasecmp(t->indexes[k].name, name) == 0)
+          return reindex_one(db, t, &t->indexes[k]);
+      }
+    }
+    tdb_db_seterr(db, "no such index: %s", name);
+    return TDB_ERROR;
+  }
+
+  if (name) {
+    tdb_table *t = tdb_catalog_find_table(db->cat, name);
+    if (!t) { tdb_db_seterr(db, "no such table: %s", name); return TDB_ERROR; }
+    for (int k = 0; k < t->nindex; k++) {
+      int rc = reindex_one(db, t, &t->indexes[k]);
+      if (rc) return rc;
+    }
+    return TDB_OK;
+  }
+
+  for (int i = 0; i < tdb_catalog_table_count(db->cat); i++) {
+    tdb_table *t = tdb_catalog_table_at(db->cat, i);
+    for (int k = 0; k < t->nindex; k++) {
+      int rc = reindex_one(db, t, &t->indexes[k]);
+      if (rc) return rc;
     }
   }
   return TDB_OK;

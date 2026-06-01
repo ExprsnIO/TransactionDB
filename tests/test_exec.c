@@ -1844,11 +1844,26 @@ static void test_phase11_utility(void) {
   TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 0);
   TDB_CHECK(exec(db, "TRUNCATE TABLE log RESTART IDENTITY") != TDB_OK);
 
-  /* ANALYZE / REINDEX are accepted; they do not error on a valid table even
-  ** though their internal effects are stubbed. */
+  /* ANALYZE is accepted; it does not error on a valid table even though
+  ** its internal effects are stubbed. */
   TDB_CHECK_EQ(exec(db, "ANALYZE log"), TDB_OK);
   TDB_CHECK_EQ(exec(db, "REINDEX TABLE log"), TDB_OK);
   TDB_CHECK_EQ(exec(db, "LOCK TABLE log IN EXCLUSIVE MODE"), TDB_OK);
+
+  /* REINDEX actually rebuilds: drop the index pages and recreate from rows.
+  ** Use a non-partitioned table so we can also exercise REINDEX INDEX. */
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE bag (id INTEGER PRIMARY KEY, k INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE INDEX bag_k ON bag(k)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO bag VALUES (1,10),(2,20),(3,30),(4,40)"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM bag WHERE k = 30"), 1);
+  TDB_CHECK_EQ(exec(db, "REINDEX INDEX bag_k"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM bag WHERE k = 30"), 1);
+  TDB_CHECK_EQ(exec(db, "REINDEX TABLE bag"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM bag WHERE k = 20"), 1);
+  TDB_CHECK(exec(db, "REINDEX INDEX nope") != TDB_OK);
+  /* REINDEX with no target rebuilds every index in the database. */
+  TDB_CHECK_EQ(exec(db, "REINDEX"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM bag WHERE k = 40"), 1);
 
   /* COMMENT validates the target object exists and persists the body. */
   TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE log IS 'truncated'"), TDB_OK);

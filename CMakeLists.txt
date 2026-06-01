@@ -40,6 +40,7 @@ target_include_directories(transactiondb
           "${CMAKE_SOURCE_DIR}/src/txn"
           "${CMAKE_SOURCE_DIR}/src/catalog"
           "${CMAKE_SOURCE_DIR}/src/sql"
+          "${CMAKE_SOURCE_DIR}/src/plsql"
           "${CMAKE_SOURCE_DIR}/src/lua"
           "${CMAKE_SOURCE_DIR}/src/api")
 target_link_libraries(transactiondb PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
@@ -79,7 +80,8 @@ endif()
 if(TDB_BUILD_TESTS)
   enable_testing()
   set(TDB_TESTS util value_record wal pager sqltype schema btree
-                mvcc lock engine catalog lexer parser exec concurrency geom rtree)
+                mvcc lock engine catalog lexer parser exec concurrency geom rtree
+                plsql)
   foreach(t ${TDB_TESTS})
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_${t}.c")
       add_executable(test_${t} "tests/test_${t}.c")
@@ -93,7 +95,8 @@ if(TDB_BUILD_TESTS)
         "${CMAKE_SOURCE_DIR}/src/storage"
         "${CMAKE_SOURCE_DIR}/src/txn"
         "${CMAKE_SOURCE_DIR}/src/catalog"
-        "${CMAKE_SOURCE_DIR}/src/sql")
+        "${CMAKE_SOURCE_DIR}/src/sql"
+        "${CMAKE_SOURCE_DIR}/src/plsql")
       add_test(NAME ${t} COMMAND test_${t})
     endif()
   endforeach()

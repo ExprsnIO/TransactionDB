@@ -259,7 +259,8 @@ int tdb_column_type(tdb_stmt *st, int i) {
     case TDB_VAL_INT: return TDB_INTEGER;
     case TDB_VAL_REAL: return TDB_FLOAT;
     case TDB_VAL_TEXT: return TDB_TEXT;
-    case TDB_VAL_BLOB: return TDB_BLOB;
+    case TDB_VAL_BLOB:
+    case TDB_VAL_COMPOSITE: return TDB_BLOB;
     default: return TDB_NULL;
   }
 }
@@ -343,7 +344,8 @@ int tdb_value_type(tdb_value *v) {
     case TDB_VAL_INT: return TDB_INTEGER;
     case TDB_VAL_REAL: return TDB_FLOAT;
     case TDB_VAL_TEXT: return TDB_TEXT;
-    case TDB_VAL_BLOB: return TDB_BLOB;
+    case TDB_VAL_BLOB:
+    case TDB_VAL_COMPOSITE: return TDB_BLOB;
     default: return TDB_NULL;
   }
 }

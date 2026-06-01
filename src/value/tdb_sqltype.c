@@ -37,6 +37,7 @@ static const type_alias k_aliases[] = {
   {"GEOMETRY", TDB_T_GEOMETRY}, {"GEOM", TDB_T_GEOMETRY},
   {"POINT", TDB_T_POINT},
   {"GEOGRAPHY", TDB_T_GEOGRAPHY}, {"GEOG", TDB_T_GEOGRAPHY},
+  {"COMPOSITE", TDB_T_COMPOSITE}, {"STRUCT", TDB_T_COMPOSITE}, {"ROW", TDB_T_COMPOSITE},
 };
 
 const char *tdb_typeid_name(tdb_typeid id) {
@@ -63,6 +64,7 @@ const char *tdb_typeid_name(tdb_typeid id) {
     case TDB_T_GEOMETRY:  return "GEOMETRY";
     case TDB_T_POINT:     return "POINT";
     case TDB_T_GEOGRAPHY: return "GEOGRAPHY";
+    case TDB_T_COMPOSITE: return "COMPOSITE";
     default:              return "UNKNOWN";
   }
 }
@@ -120,6 +122,7 @@ tdb_valtype tdb_typespec_storage(const tdb_typespec *ts) {
     case TDB_T_GEOMETRY:
     case TDB_T_POINT:
     case TDB_T_GEOGRAPHY:
+    case TDB_T_COMPOSITE:
       return TDB_VAL_BLOB;
     default:
       /* DECIMAL, CHAR/VARCHAR/TEXT, DATE/TIME/TIMESTAMP, JSON, UUID
@@ -262,6 +265,14 @@ int tdb_typespec_coerce(tdb_value *v, const tdb_typespec *ts, const char **why) 
         return TDB_OK;
       }
       if (why) *why = "not a UUID";
+      return TDB_MISMATCH;
+    }
+    case TDB_T_COMPOSITE: {
+      /* Already a composite: accept. A blob (e.g. just decoded from storage)
+      ** carries the composite's record bytes, so re-tag it in place. */
+      if (v->type == TDB_VAL_COMPOSITE) return TDB_OK;
+      if (v->type == TDB_VAL_BLOB) { v->type = TDB_VAL_COMPOSITE; return TDB_OK; }
+      if (why) *why = "not a composite value";
       return TDB_MISMATCH;
     }
     case TDB_T_BINARY:

@@ -28,7 +28,8 @@ static void push_value(lua_State *L, const tdb_value *v) {
     case TDB_VAL_INT:  lua_pushinteger(L, (lua_Integer)v->u.i); break;
     case TDB_VAL_REAL: lua_pushnumber(L, v->u.r); break;
     case TDB_VAL_TEXT:
-    case TDB_VAL_BLOB: lua_pushlstring(L, v->u.s.p ? v->u.s.p : "", (size_t)v->u.s.n); break;
+    case TDB_VAL_BLOB:
+    case TDB_VAL_COMPOSITE: lua_pushlstring(L, v->u.s.p ? v->u.s.p : "", (size_t)v->u.s.n); break;
   }
 }
 

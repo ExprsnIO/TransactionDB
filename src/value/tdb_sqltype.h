@@ -44,7 +44,9 @@ typedef enum tdb_typeid {
   /* geospatial: stored as a binary geometry blob (see tdb_geom.h) */
   TDB_T_GEOMETRY,
   TDB_T_POINT,
-  TDB_T_GEOGRAPHY
+  TDB_T_GEOGRAPHY,
+  /* composite (ROW/STRUCT): an ordered tuple, stored as a record encoding */
+  TDB_T_COMPOSITE
 } tdb_typeid;
 
 typedef struct tdb_typespec {

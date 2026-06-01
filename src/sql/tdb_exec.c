@@ -471,8 +471,29 @@ static int eval_func(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     tdb_value_clear(&v);
   } else if (!strcasecmp(fn, "typeof") && argc == 1) {
     const char *t = a0.type == TDB_VAL_NULL ? "null" : a0.type == TDB_VAL_INT ? "integer"
-                  : a0.type == TDB_VAL_REAL ? "real" : a0.type == TDB_VAL_BLOB ? "blob" : "text";
+                  : a0.type == TDB_VAL_REAL ? "real" : a0.type == TDB_VAL_BLOB ? "blob"
+                  : a0.type == TDB_VAL_COMPOSITE ? "composite" : "text";
     tdb_value_set_text(out, t, -1, 1);
+  } else if (!strcasecmp(fn, "row") || !strcasecmp(fn, "composite")) {
+    /* ROW(a, b, ...) — build a composite value from the arguments */
+    tdb_value *fs = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(argc ? argc : 1));
+    for (int i = 0; i < argc; i++) { tdb_value_init(&fs[i]); eval(db, c, e->args->items[i], &fs[i]); }
+    tdb_value_composite_pack(out, fs, argc);
+    for (int i = 0; i < argc; i++) tdb_value_clear(&fs[i]);
+    tdb_mfree(fs);
+  } else if (!strcasecmp(fn, "composite_extract") && argc == 2) {
+    /* composite_extract(c, i) — 1-based field access */
+    tdb_value idxv; tdb_value_init(&idxv); eval(db, c, e->args->items[1], &idxv);
+    int idx = (int)tdb_value_as_int(&idxv); tdb_value_clear(&idxv);
+    tdb_value comp; tdb_value_init(&comp); tdb_value_copy(&comp, &a0);
+    if (comp.type == TDB_VAL_BLOB) comp.type = TDB_VAL_COMPOSITE; /* re-tag stored bytes */
+    if (tdb_value_composite_field(&comp, idx - 1, out) != TDB_OK) tdb_value_set_null(out);
+    tdb_value_clear(&comp);
+  } else if (!strcasecmp(fn, "composite_count") && argc == 1) {
+    tdb_value comp; tdb_value_init(&comp); tdb_value_copy(&comp, &a0);
+    if (comp.type == TDB_VAL_BLOB) comp.type = TDB_VAL_COMPOSITE;
+    tdb_value_set_int(out, tdb_value_composite_count(&comp));
+    tdb_value_clear(&comp);
   } else if (!strcasecmp(fn, "round") && (argc == 1 || argc == 2)) {
     double x = tdb_value_as_real(&a0); int nd = 0;
     if (argc == 2) { tdb_value v; tdb_value_init(&v); eval(db, c, e->args->items[1], &v); nd = (int)tdb_value_as_int(&v); tdb_value_clear(&v); }

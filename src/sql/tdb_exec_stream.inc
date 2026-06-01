@@ -3,12 +3,13 @@
 ** Included by tdb_exec.c after the materializing executor, this introduces a
 ** small family of demand-driven operators — Scan, Join, Filter, Agg, Sort,
 ** Distinct, Project, Limit — wired child-to-parent so each next() pulls one row
-** from below. A SELECT over one or more base tables (INNER/CROSS joins,
+** from below. A SELECT over one or more base tables (INNER/LEFT/CROSS joins,
 ** left-deep) with an optional WHERE / GROUP BY+aggregates / HAVING / ORDER BY /
 ** projection / DISTINCT / LIMIT is compiled into such a tree; the row at a time pull means a LIMIT
 ** stops the scan early instead of materializing the whole result first. Join is
-** a nested loop: it re-scans the inner table for each outer row, or seeks it via
-** an index when the ON predicate is an equijoin on an indexed inner column. Agg
+** a nested loop: it re-scans the inner table for each outer row (or seeks it via
+** an index when the ON predicate is an equijoin on an indexed inner column), and
+** for a LEFT JOIN emits a NULL-extended row when an outer row matches nothing. Agg
 ** and Sort are the blocking operators: Agg drains its child to group + reduce,
 ** Sort to order — but when ORDER BY is paired with LIMIT, Sort keeps only the
 ** top (OFFSET+LIMIT) rows in a bounded heap rather than buffering all input.
@@ -50,17 +51,19 @@ typedef struct tdb_op {
   /* OP_FILTER */
   tdb_expr      *pred;
 
-  /* OP_JOIN (left-deep nested loop over INNER/CROSS base-table joins). `child`
-  ** is the outer (left) subtree; `inner` is the right Scan, re-scanned per
-  ** outer row. The join emits a combined row of `joinncol` values: the outer
+  /* OP_JOIN (left-deep nested loop over INNER/LEFT/CROSS base-table joins).
+  ** `child` is the outer (left) subtree; `inner` is the right Scan, re-scanned
+  ** per outer row. The join emits a combined row of `joinncol` values: the outer
   ** row's columns followed by the inner table's, at offset `inner_base`. */
   struct tdb_op *inner;
-  tdb_expr      *on;          /* INNER join ON predicate (NULL for CROSS) */
+  tdb_expr      *on;          /* INNER/LEFT join ON predicate (NULL for CROSS) */
   tdb_value     *joinrow;     /* reused combined row (joinncol values) */
   int            joinncol;
   int            inner_base;  /* column offset of the inner table in joinrow */
   int            join_started;/* outer row pulled at least once */
   int            join_eof;
+  int            left_join;   /* LEFT JOIN: emit a NULL-extended row if no match */
+  int            outer_matched;/* current outer row matched some inner row */
   /* index-driven inner lookup: when the ON predicate has an equijoin on an
   ** indexed inner column, seek the inner table to the outer value each pass
   ** instead of full-scanning. `idx_join_key` is the outer expression supplying
@@ -148,17 +151,17 @@ static int expr_has_agg(const tdb_expr *e) {
   return 0;
 }
 
-/* A streamable FROM is one or more base tables joined left-deep by INNER or
-** CROSS joins (no derived tables, views, outer joins, AS OF, or CTE shadowing).
-** Returns the source count (>=1) or 0 if not streamable. */
+/* A streamable FROM is one or more base tables joined left-deep by INNER, LEFT,
+** or CROSS joins (no derived tables, views, RIGHT/FULL joins, AS OF, or CTE
+** shadowing). Returns the source count (>=1) or 0 if not streamable. */
 static int from_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   int n = 0;
   for (tdb_src *s = q->from; s; s = s->next) {
     if (s->subquery || !s->table || s->as_of) return 0;
     if (find_cte(st, s->table)) return 0;                /* CTE name shadows a table */
     if (!tdb_catalog_find_table(db->cat, s->table)) return 0;   /* view / missing */
-    if (n > 0 && s->join != JOIN_INNER && s->join != JOIN_CROSS) return 0;
-    if (s->join == JOIN_INNER && expr_blocks_stream(s->on)) return 0;
+    if (n > 0 && s->join != JOIN_INNER && s->join != JOIN_CROSS && s->join != JOIN_LEFT) return 0;
+    if ((s->join == JOIN_INNER || s->join == JOIN_LEFT) && expr_blocks_stream(s->on)) return 0;
     if (++n > MAXSRC) return 0;
   }
   return n;
@@ -230,9 +233,20 @@ static int scan_rewind_seek(tdb_op *op, tdb_index *idx, const tdb_value *key) {
   return rc;
 }
 
+/* Set the inner table's columns in the combined row to NULL (the unmatched side
+** of a LEFT JOIN). */
+static void join_null_inner(tdb_op *op) {
+  for (int i = 0; i < op->inner->tbl->ncol; i++) {
+    tdb_value_clear(&op->joinrow[op->inner_base + i]);
+    tdb_value_set_null(&op->joinrow[op->inner_base + i]);
+  }
+}
+
 /* Nested-loop join: for each outer (left) row, scan the inner (right) table and
-** emit the combined rows that satisfy the ON predicate (all rows for CROSS).
-** The combined row is the outer row's columns followed by the inner table's. */
+** emit the combined rows that satisfy the ON predicate (all rows for CROSS). The
+** combined row is the outer row's columns followed by the inner table's. For a
+** LEFT JOIN, an outer row that matches no inner row still emits once, with the
+** inner columns NULL. */
 static int join_next(tdb_op *op, tdb_value **row, int *ncol) {
   for (;;) {
     if (!op->join_started || op->join_eof) {
@@ -244,27 +258,39 @@ static int join_next(tdb_op *op, tdb_value **row, int *ncol) {
         tdb_value_clear(&op->joinrow[i]);
         if (i < onc) tdb_value_copy(&op->joinrow[i], &orow[i]);
       }
+      op->join_started = 1; op->join_eof = 0; op->outer_matched = 0;
       if (op->inner_idx) {
         /* index-driven probe: seek the inner table to the outer key value */
         ectx ec = { op->joinrow, op->inner_base, NULL, 0, op->st, NULL, NULL };
         tdb_value probe; tdb_value_init(&probe);
         eval(op->db, &ec, op->idx_join_key, &probe);
-        if (probe.type == TDB_VAL_NULL) {       /* NULL never equals: skip outer row */
-          tdb_value_clear(&probe);
-          op->join_eof = 1; op->join_started = 1; continue;
-        }
-        rc = scan_rewind_seek(op->inner, op->inner_idx, &probe);
+        int is_null = (probe.type == TDB_VAL_NULL);
+        if (!is_null) rc = scan_rewind_seek(op->inner, op->inner_idx, &probe);
         tdb_value_clear(&probe);
+        if (is_null) {                          /* NULL never equals: no inner match */
+          op->join_eof = 1;
+          if (op->left_join) { join_null_inner(op); op->outer_matched = 1;
+            *row = op->joinrow; *ncol = op->joinncol; return TDB_ROW; }
+          continue;
+        }
       } else {
         rc = scan_rewind(op->inner);
       }
       if (rc) return rc;
-      op->join_started = 1; op->join_eof = 0;
     }
     /* pull the next inner row */
     tdb_value *irow; int inc;
     int rc = scan_next(op->inner, &irow, &inc);
-    if (rc == TDB_DONE) { op->join_eof = 1; continue; }   /* outer advances */
+    if (rc == TDB_DONE) {
+      op->join_eof = 1;
+      if (op->left_join && !op->outer_matched) {   /* unmatched outer row -> NULL row */
+        join_null_inner(op);
+        op->outer_matched = 1;
+        *row = op->joinrow; *ncol = op->joinncol;
+        return TDB_ROW;
+      }
+      continue;                                    /* outer advances */
+    }
     if (rc != TDB_ROW) return rc;
     for (int i = 0; i < op->inner->tbl->ncol; i++) {
       tdb_value_clear(&op->joinrow[op->inner_base + i]);
@@ -278,6 +304,7 @@ static int join_next(tdb_op *op, tdb_value **row, int *ncol) {
       tdb_value_clear(&v);
       if (!ok) continue;
     }
+    op->outer_matched = 1;
     *row = op->joinrow; *ncol = op->joinncol;
     return TDB_ROW;
   }
@@ -734,7 +761,8 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
     tdb_op *join = op_new(OP_JOIN, db, st);
     join->child = src;
     join->inner = inner;
-    join->on = (s->join == JOIN_INNER) ? s->on : NULL;   /* CROSS has no ON */
+    join->on = (s->join == JOIN_CROSS) ? NULL : s->on;   /* CROSS has no ON */
+    join->left_join = (s->join == JOIN_LEFT);
     join->inner_base = qs->base;
     join->joinncol = qs->base + qs->tbl->ncol;
     join->joinrow = row_alloc(join->joinncol);

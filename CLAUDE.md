@@ -69,14 +69,15 @@ Bottom to top:
   execution bodies live in `tdb_exec_dml.inc` / `tdb_exec_select.inc`, `#include`d into
   `tdb_exec.c` (they are not separately compiled). Most SELECTs **materialize** their result set
   (full cross-product join → filter → group → project → sort → limit). A scan over one or more base
-  tables (INNER/CROSS joins, left-deep) with an optional WHERE / GROUP BY+aggregates / HAVING /
+  tables (INNER/LEFT/CROSS joins, left-deep) with an optional WHERE / GROUP BY+aggregates / HAVING /
   ORDER BY / projection / DISTINCT / LIMIT instead runs through a pull-based **volcano operator
   tree** (`tdb_exec_stream.inc`: Scan → Join → Filter → Agg → Sort → Project → Distinct → Limit)
   that `tdb_step()` pulls one row at a time, holding a statement-owned read snapshot open across
   steps; Join is a nested loop (inner table re-scanned per outer row, or index-seeked when the ON
-  predicate is an equijoin on an indexed inner column), Agg is a blocking hash/linear
-  group-and-reduce, the Sort operator becomes a bounded top-N heap when ORDER BY is paired with
-  LIMIT, and Distinct is a streaming dedup (used when there is no ORDER BY).
+  predicate is an equijoin on an indexed inner column; a LEFT JOIN emits a NULL-extended row when an
+  outer row matches nothing), Agg is a blocking hash/linear group-and-reduce, the Sort operator
+  becomes a bounded top-N heap when ORDER BY is paired with LIMIT, and Distinct is a streaming dedup
+  (used when there is no ORDER BY).
   Anything more complex
   falls back to materialization. Correlated subqueries are supported (unbound columns resolve outward
   through enclosing query contexts, re-run per outer row).

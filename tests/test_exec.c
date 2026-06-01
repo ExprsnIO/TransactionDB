@@ -1444,6 +1444,54 @@ static void test_stream_join_index(void) {
   tdb_close(db);
 }
 
+static void test_stream_left_join(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept INTEGER)");
+  exec(db, "INSERT INTO emp VALUES (1,10),(2,20),(3,99),(4,NULL)");
+  exec(db, "CREATE TABLE dept (did INTEGER, dname TEXT)");
+  exec(db, "INSERT INTO dept VALUES (10,'eng'),(20,'sales')");
+  int ids[16], n;
+
+  /* every outer row is preserved: 4 emp rows, two unmatched -> still 4 */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp e LEFT JOIN dept d ON e.dept = d.did"), 4);
+
+  /* unmatched outer rows carry NULL inner columns: COUNT(d.did) skips them */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(d.did) FROM emp e LEFT JOIN dept d ON e.dept = d.did"), 2);
+
+  /* anti-join idiom: outer rows with no match (dept 99 and NULL) -> ids 3,4 */
+  n = collect_ints(db,
+    "SELECT e.id FROM emp e LEFT JOIN dept d ON e.dept = d.did WHERE d.did IS NULL ORDER BY e.id", ids, 16);
+  TDB_CHECK_EQ(n, 2);
+  TDB_CHECK_EQ(ids[0], 3); TDB_CHECK_EQ(ids[1], 4);
+
+  /* matched rows still project the inner value */
+  check_text(db,
+    "SELECT d.dname FROM emp e LEFT JOIN dept d ON e.dept = d.did WHERE e.id = 1", "eng");
+
+  /* index-driven LEFT JOIN with duplicate inner keys: emp 1 (dept 10) matches
+  ** two dept rows, the unmatched/NULL-dept emps each emit one NULL row */
+  exec(db, "CREATE TABLE d2 (did INTEGER, dname TEXT)");
+  exec(db, "CREATE INDEX d2i ON d2(did)");
+  exec(db, "INSERT INTO d2 VALUES (10,'eng'),(10,'eng2'),(20,'sales')");
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM emp e LEFT JOIN d2 d ON e.dept = d.did"), 5);  /* 2+1+1+1 */
+
+  /* LEFT JOIN feeding GROUP BY: the unmatched group counts 0 inner rows */
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT c FROM (SELECT e.dept dp, COUNT(d.did) c FROM emp e LEFT JOIN dept d ON e.dept=d.did "
+    "GROUP BY e.dept) WHERE dp = 99"), 0);
+
+  /* chained LEFT JOIN: a missing middle row NULLs the rest of the chain */
+  exec(db, "CREATE TABLE c3 (cid INTEGER, v TEXT)");
+  exec(db, "INSERT INTO c3 VALUES (10,'hit')");
+  n = collect_ints(db,
+    "SELECT e.id FROM emp e LEFT JOIN dept d ON e.dept=d.did "
+    "LEFT JOIN c3 c ON d.did=c.cid ORDER BY e.id", ids, 16);
+  TDB_CHECK_EQ(n, 4);   /* all four emp rows survive both left joins */
+
+  tdb_close(db);
+}
+
 static void test_stream_agg(void) {
   tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
   exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)");
@@ -1567,6 +1615,7 @@ static tdb_test_case cases[] = {
   {"stream_sort", test_stream_sort},
   {"stream_join", test_stream_join},
   {"stream_join_index", test_stream_join_index},
+  {"stream_left_join", test_stream_left_join},
   {"stream_agg", test_stream_agg},
   {"stream_distinct", test_stream_distinct},
   {"upsert", test_upsert},

@@ -11,6 +11,7 @@
 #define CAT_VIEW    'V'
 #define CAT_ROUTINE 'R'
 #define CAT_GRANT   'G'
+#define CAT_COMMENT 'C'
 
 struct tdb_catalog {
   tdb_pager   *pager;
@@ -495,6 +496,105 @@ int tdb_catalog_update_table_as(tdb_catalog *c, const char *find_name, tdb_table
 
 int tdb_catalog_update_table(tdb_catalog *c, tdb_table *t) {
   return tdb_catalog_update_table_as(c, t->name, t);
+}
+
+/* ------------------------------ comments ----------------------------- */
+
+/* CAT_COMMENT layout: 'C' | kind:u8 | varint+bytes target | varint+bytes body */
+static void ser_comment(int kind, const char *target, const char *body, tdb_buf *b) {
+  w_u8(b, CAT_COMMENT);
+  w_u8(b, (uint8_t)kind);
+  w_str(b, target);
+  w_str(b, body);
+}
+
+/* Find every CAT_COMMENT row matching (kind, target) and return rowids. */
+static int find_comment_rows(tdb_catalog *c, int kind, const char *target,
+                             tdb_rowid **out, int *out_n) {
+  *out = NULL; *out_n = 0;
+  tdb_btree *bt;
+  int rc = tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt);
+  if (rc) return rc;
+  tdb_cursor *cur;
+  rc = tdb_cursor_open(bt, &cur);
+  if (rc) { tdb_btree_close(bt); return rc; }
+
+  tdb_rowid *ids = NULL; int nid = 0, cap = 0;
+  for (tdb_cursor_first(cur); !tdb_cursor_eof(cur); tdb_cursor_next(cur)) {
+    const uint8_t *v; int n;
+    if (tdb_cursor_data(cur, &v, &n)) break;
+    if (n < 2 || v[0] != CAT_COMMENT) continue;
+    rd r = { v, n, 0, 0 };
+    (void)r_u8(&r);
+    int ek = r_u8(&r);
+    char *etgt = r_str(&r);
+    int hit = (!r.err && ek == kind && etgt && target && strcasecmp(etgt, target) == 0);
+    tdb_mfree(etgt);
+    if (!hit) continue;
+    if (nid == cap) {
+      cap = cap ? cap * 2 : 4;
+      ids = (tdb_rowid *)tdb_realloc(ids, sizeof(tdb_rowid) * (size_t)cap);
+    }
+    tdb_cursor_rowid(cur, &ids[nid++]);
+  }
+  tdb_cursor_close(cur);
+  tdb_btree_close(bt);
+  *out = ids; *out_n = nid;
+  return TDB_OK;
+}
+
+int tdb_catalog_set_comment(tdb_catalog *c, int kind, const char *target,
+                            const char *body) {
+  if (!target) return TDB_MISUSE;
+  /* delete any prior comment for this object so we don't accumulate rows */
+  tdb_rowid *ids = NULL; int nid = 0;
+  int rc = find_comment_rows(c, kind, target, &ids, &nid);
+  if (rc) { tdb_mfree(ids); return rc; }
+  if (nid > 0) {
+    tdb_btree *bt;
+    rc = tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt);
+    if (!rc) {
+      for (int i = 0; i < nid && !rc; i++) {
+        int f = 0; rc = tdb_btree_del(bt, ids[i], &f);
+      }
+      tdb_btree_close(bt);
+    }
+  }
+  tdb_mfree(ids);
+  if (rc) return rc;
+  if (!body) return TDB_OK;            /* NULL body = drop the comment */
+  tdb_buf b; tdb_buf_init(&b);
+  ser_comment(kind, target, body, &b);
+  rc = catalog_put(c, &b);
+  tdb_buf_free(&b);
+  return rc;
+}
+
+char *tdb_catalog_get_comment(tdb_catalog *c, int kind, const char *target) {
+  if (!target) return NULL;
+  tdb_btree *bt;
+  if (tdb_btree_open(c->pager, c->root, TDB_BT_TABLE, NULL, &bt) != TDB_OK) return NULL;
+  tdb_cursor *cur;
+  if (tdb_cursor_open(bt, &cur) != TDB_OK) { tdb_btree_close(bt); return NULL; }
+  char *found = NULL;
+  for (tdb_cursor_first(cur); !tdb_cursor_eof(cur); tdb_cursor_next(cur)) {
+    const uint8_t *v; int n;
+    if (tdb_cursor_data(cur, &v, &n)) break;
+    if (n < 2 || v[0] != CAT_COMMENT) continue;
+    rd r = { v, n, 0, 0 };
+    (void)r_u8(&r);
+    int ek = r_u8(&r);
+    char *etgt = r_str(&r);
+    if (!r.err && ek == kind && etgt && strcasecmp(etgt, target) == 0) {
+      tdb_mfree(etgt);
+      found = r_str(&r);
+      break;
+    }
+    tdb_mfree(etgt);
+  }
+  tdb_cursor_close(cur);
+  tdb_btree_close(bt);
+  return found;
 }
 
 /* Delete the persisted catalog row for `name` (any object type: the name is

@@ -62,4 +62,13 @@ int        tdb_catalog_acl_unpersist(tdb_catalog *c, const char *grantee,
                                      const char *priv, int kind,
                                      const char *object, int *removed);
 
+/* Schema-object comments (COMMENT ON ...). `kind` mirrors the parser's
+** on_kind (1=TABLE, 2=COLUMN, 3=INDEX, 4=VIEW, 5=DATABASE). Persisted as
+** CAT_COMMENT catalog rows; replacing an existing comment overwrites it,
+** and a NULL `body` deletes the comment. Returns TDB_OK on success. */
+int        tdb_catalog_set_comment(tdb_catalog *c, int kind,
+                                   const char *target, const char *body);
+/* Returns a malloc'd copy of the body (caller frees) or NULL if none. */
+char      *tdb_catalog_get_comment(tdb_catalog *c, int kind, const char *target);
+
 #endif /* TDB_CATALOG_H */

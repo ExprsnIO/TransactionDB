@@ -941,8 +941,39 @@ static int exec_reindex(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 }
 
 static int exec_comment(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
-  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
-  return TDB_OK;
+  TDB_UNUSED(st);
+  const char *target = a->u.comment_on.target;
+  int kind = a->u.comment_on.on_kind;
+  if (!target || !*target) {
+    tdb_db_seterr(db, "COMMENT ON requires a target name");
+    return TDB_ERROR;
+  }
+  /* For the kinds we can introspect, refuse comments on unknown objects so
+  ** typos surface immediately. INDEX/DATABASE pass through unchecked. */
+  if (kind == 1) {                                            /* TABLE */
+    if (!tdb_catalog_find_table(db->cat, target)) {
+      tdb_db_seterr(db, "no such table: %s", target); return TDB_ERROR;
+    }
+  } else if (kind == 4) {                                     /* VIEW */
+    if (!tdb_catalog_find_view(db->cat, target)) {
+      tdb_db_seterr(db, "no such view: %s", target); return TDB_ERROR;
+    }
+  } else if (kind == 2) {                                     /* COLUMN tbl.col */
+    const char *dot = strchr(target, '.');
+    if (!dot || dot == target || !dot[1]) {
+      tdb_db_seterr(db, "COMMENT ON COLUMN requires table.column"); return TDB_ERROR;
+    }
+    char *tbl = tdb_strndup(target, (size_t)(dot - target));
+    tdb_table *t = tdb_catalog_find_table(db->cat, tbl);
+    int rc = TDB_OK;
+    if (!t) { tdb_db_seterr(db, "no such table: %s", tbl); rc = TDB_ERROR; }
+    else if (tdb_table_find_column(t, dot + 1) < 0) {
+      tdb_db_seterr(db, "no such column: %s.%s", tbl, dot + 1); rc = TDB_ERROR;
+    }
+    tdb_mfree(tbl);
+    if (rc) return rc;
+  }
+  return tdb_catalog_set_comment(db->cat, kind, target, a->u.comment_on.body);
 }
 
 static int exec_tablespace_create(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {

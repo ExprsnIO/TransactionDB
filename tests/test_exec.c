@@ -1838,12 +1838,21 @@ static void test_phase11_utility(void) {
   TDB_CHECK_EQ(exec(db, "TRUNCATE TABLE log"), TDB_OK);
   TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 0);
 
-  /* ANALYZE / REINDEX / COMMENT are accepted; they do not error on a valid
-  ** table even though their internal effects are stubbed. */
+  /* ANALYZE / REINDEX are accepted; they do not error on a valid table even
+  ** though their internal effects are stubbed. */
   TDB_CHECK_EQ(exec(db, "ANALYZE log"), TDB_OK);
   TDB_CHECK_EQ(exec(db, "REINDEX TABLE log"), TDB_OK);
-  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE log IS 'truncated'"), TDB_OK);
   TDB_CHECK_EQ(exec(db, "LOCK TABLE log IN EXCLUSIVE MODE"), TDB_OK);
+
+  /* COMMENT validates the target object exists and persists the body. */
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE log IS 'truncated'"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "COMMENT ON COLUMN log.msg IS 'message text'"), TDB_OK);
+  TDB_CHECK(exec(db, "COMMENT ON TABLE nope IS 'x'")   != TDB_OK);
+  TDB_CHECK(exec(db, "COMMENT ON COLUMN log.nope IS 'x'") != TDB_OK);
+  TDB_CHECK(exec(db, "COMMENT ON COLUMN bareword IS 'x'") != TDB_OK);
+  /* Replacing an existing comment, and clearing with NULL, both succeed. */
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE log IS 'second'"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "COMMENT ON COLUMN log.msg IS NULL"), TDB_OK);
 
   /* CREATE TABLESPACE / DROP TABLESPACE are parsed and accepted. */
   TDB_CHECK_EQ(exec(db, "CREATE TABLESPACE warm LOCATION '/tmp/warm'"), TDB_OK);
@@ -1852,6 +1861,21 @@ static void test_phase11_utility(void) {
   /* Unknown target rejected */
   TDB_CHECK(exec(db, "TRUNCATE TABLE nope") != TDB_OK);
   tdb_close(db);
+
+  /* COMMENT persistence survives a close/reopen. */
+  const char *path = "test_phase11_comment.db";
+  remove(path); remove("test_phase11_comment.db-wal");
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE notes (id INTEGER PRIMARY KEY, t TEXT)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE notes IS 'persistent'"), TDB_OK);
+  tdb_close(db);
+
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  /* clearing the body removes the row; setting it again writes a fresh one */
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE notes IS NULL"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE notes IS 'restored'"), TDB_OK);
+  tdb_close(db);
+  remove(path); remove("test_phase11_comment.db-wal");
 }
 
 static tdb_test_case cases[] = {

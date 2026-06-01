@@ -1606,6 +1606,73 @@ static void test_stream_distinct(void) {
   tdb_close(db);
 }
 
+static void test_acl_grant_revoke(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (1,10),(2,20)"), TDB_OK);
+
+  /* open mode: no user set, all ops allowed */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 2);
+
+  /* set a user with no grants — every op is denied */
+  tdb_set_user(db, "alice");
+  TDB_CHECK_STR(tdb_get_user(db), "alice");
+  TDB_CHECK(exec(db, "SELECT * FROM t") != TDB_OK);
+  TDB_CHECK(exec(db, "INSERT INTO t VALUES (3,30)") != TDB_OK);
+
+  /* grant SELECT only — reads ok, writes still denied */
+  tdb_set_user(db, NULL);
+  TDB_CHECK_EQ(exec(db, "GRANT SELECT ON TABLE t TO alice"), TDB_OK);
+  tdb_set_user(db, "alice");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 2);
+  TDB_CHECK(exec(db, "INSERT INTO t VALUES (3,30)") != TDB_OK);
+
+  /* grant the rest (comma-list parsing) */
+  tdb_set_user(db, NULL);
+  TDB_CHECK_EQ(exec(db, "GRANT INSERT, UPDATE, DELETE ON TABLE t TO alice"), TDB_OK);
+  tdb_set_user(db, "alice");
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (3,30)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "UPDATE t SET v = v + 1"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "DELETE FROM t WHERE id = 1"), TDB_OK);
+
+  /* revoke INSERT and verify */
+  tdb_set_user(db, NULL);
+  TDB_CHECK_EQ(exec(db, "REVOKE INSERT ON TABLE t FROM alice"), TDB_OK);
+  tdb_set_user(db, "alice");
+  TDB_CHECK(exec(db, "INSERT INTO t VALUES (9,90)") != TDB_OK);
+
+  /* GRANT ALL — broad wildcard */
+  tdb_set_user(db, NULL);
+  TDB_CHECK_EQ(exec(db, "GRANT ALL ON TABLE t TO alice"), TDB_OK);
+  tdb_set_user(db, "alice");
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (9,90)"), TDB_OK);
+
+  /* PUBLIC grant is honored for any user */
+  tdb_set_user(db, NULL);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE u (id INTEGER PRIMARY KEY)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "GRANT SELECT ON TABLE u TO PUBLIC"), TDB_OK);
+  tdb_set_user(db, "bob");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM u"), 0);
+  tdb_close(db);
+
+  /* persistence: a GRANT survives reopening the database file */
+  const char *path = "test_acl_persist.db";
+  remove(path); remove("test_acl_persist.db-wal");
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE x (v INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO x VALUES (7)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "GRANT SELECT ON TABLE x TO carol"), TDB_OK);
+  tdb_close(db);
+
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  tdb_set_user(db, "carol");
+  TDB_CHECK_EQ(scalar(db, "SELECT v FROM x"), 7);
+  tdb_set_user(db, "dave");                 /* unrelated user — still denied */
+  TDB_CHECK(exec(db, "SELECT v FROM x") != TDB_OK);
+  tdb_close(db);
+  remove(path); remove("test_acl_persist.db-wal");
+}
+
 static void test_window_functions(void) {
   tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
   TDB_CHECK_EQ(exec(db, "CREATE TABLE s (region TEXT, q INTEGER, amt INTEGER)"), TDB_OK);
@@ -1745,6 +1812,7 @@ static tdb_test_case cases[] = {
   {"returning", test_returning},
   {"cte", test_cte},
   {"ddl_dml_select", test_ddl_dml_select},
+  {"acl_grant_revoke", test_acl_grant_revoke},
   {"window_functions", test_window_functions},
   {"recursive_cte", test_recursive_cte},
   {"phase11_utility", test_phase11_utility},

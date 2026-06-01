@@ -297,6 +297,13 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
   if (!sub && s->table) {
     tdb_table *t = tdb_catalog_find_table(db->cat, s->table);
     if (t) {
+      if (db->current_user &&
+          !tdb_acl_check(tdb_catalog_acl(db->cat), db->current_user,
+                         "SELECT", TDB_ACL_TABLE, s->table)) {
+        tdb_db_seterr(db, "permission denied: SELECT on table '%s' for user '%s'",
+                      s->table, db->current_user);
+        return TDB_ERROR;
+      }
       qs->tbl = t; qs->ncol = t->ncol;
       tdb_txnid as_of = 0;
       if (s->as_of) {

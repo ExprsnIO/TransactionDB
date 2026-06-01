@@ -10,6 +10,7 @@
 #define CAT_TABLE   'T'
 #define CAT_VIEW    'V'
 #define CAT_ROUTINE 'R'
+#define CAT_GRANT   'G'
 
 struct tdb_catalog {
   tdb_pager   *pager;
@@ -17,6 +18,7 @@ struct tdb_catalog {
   tdb_table  **tables;  int ntable, captable;
   tdb_view   **views;   int nview, capview;
   tdb_routine**routines;int nroutine, caproutine;
+  tdb_acl      acl;
 };
 
 /* ----------------------------- writer/reader -------------------------- */
@@ -317,6 +319,12 @@ static int catalog_load(tdb_catalog *c) {
       rt->is_function = r_u8(&r);
       rt->nargs = (int)r_var(&r) - 1;
       if (!r.err) cache_add_routine(c, rt); else tdb_routine_free(rt);
+    } else if (type == CAT_GRANT) {
+      tdb_acl_entry ent;
+      if (tdb_acl_entry_deserialize(v, n, &ent) == TDB_OK) {
+        tdb_acl_grant(&c->acl, ent.grantee, ent.priv, ent.kind, ent.object);
+        tdb_mfree(ent.grantee); tdb_mfree(ent.priv); tdb_mfree(ent.object);
+      }
     }
   }
   tdb_cursor_close(cur);
@@ -329,6 +337,7 @@ int tdb_catalog_open(tdb_pager *p, tdb_catalog **out) {
   if (!c) return TDB_NOMEM;
   c->pager = p;
   c->root = tdb_pager_catalog_root(p);
+  tdb_acl_init(&c->acl);
 
   if (c->root == 0) {
     /* bootstrap: create the catalog b-tree and record its root */
@@ -355,7 +364,18 @@ void tdb_catalog_close(tdb_catalog *c) {
   tdb_mfree(c->tables);
   tdb_mfree(c->views);
   tdb_mfree(c->routines);
+  tdb_acl_free(&c->acl);
   tdb_mfree(c);
+}
+
+tdb_acl *tdb_catalog_acl(tdb_catalog *c) { return &c->acl; }
+
+int tdb_catalog_acl_persist(tdb_catalog *c, const tdb_acl_entry *e) {
+  tdb_buf b; tdb_buf_init(&b);
+  tdb_acl_entry_serialize(e, &b);
+  int rc = catalog_put(c, &b);
+  tdb_buf_free(&b);
+  return rc;
 }
 
 tdb_table *tdb_catalog_find_table(tdb_catalog *c, const char *name) {

@@ -667,6 +667,13 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
   qctx Q; memset(&Q, 0, sizeof(Q));
   for (tdb_src *s = q->from; s; s = s->next) {
     tdb_table *t = tdb_catalog_find_table(db->cat, s->table);
+    if (db->current_user &&
+        !tdb_acl_check(tdb_catalog_acl(db->cat), db->current_user,
+                       "SELECT", TDB_ACL_TABLE, s->table)) {
+      tdb_db_seterr(db, "permission denied: SELECT on table '%s' for user '%s'",
+                    s->table, db->current_user);
+      return NULL;
+    }
     qsrc *qs = &Q.src[Q.nsrc];
     qs->tbl = t; qs->alias = s->alias; qs->base = Q.totalcols; qs->ncol = t->ncol;
     qs->join = s->join; qs->on = s->on;

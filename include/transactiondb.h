@@ -179,6 +179,16 @@ typedef int (*tdb_ext_init_fn)(tdb_db *db, char **errmsg);
 int tdb_load_extension(tdb_db *db, const char *path, const char *entry,
                        char **errmsg);
 
+/* ------------------------------------------------------------------ */
+/* Access control                                                     */
+/* ------------------------------------------------------------------ */
+/* Set the current user for ACL checks. Pass NULL to drop back into the
+** default "superuser" mode where GRANT/REVOKE are recorded but all
+** privilege checks pass. Subsequent statements check ACL grants for the
+** named user against the catalog's grant list. Returns TDB_OK. */
+int tdb_set_user(tdb_db *db, const char *name);
+const char *tdb_get_user(tdb_db *db);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

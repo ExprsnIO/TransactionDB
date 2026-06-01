@@ -155,6 +155,17 @@ void tdb_result_error(tdb_context *ctx, const char *msg);
 void *tdb_user_data(tdb_context *ctx);
 
 /* ------------------------------------------------------------------ */
+/* SQL keyword introspection (mirrors SQLite's keyword API)            */
+/* ------------------------------------------------------------------ */
+/* The number of SQL keywords TransactionDB recognizes. */
+int tdb_keyword_count(void);
+/* The i-th keyword (0-based): *pzName points at a static, NUL-terminated,
+** uppercase name and *pnName its length. Returns TDB_OK or TDB_RANGE. */
+int tdb_keyword_name(int i, const char **pzName, int *pnName);
+/* Non-zero if the n-byte (n<0 => strlen) string is a keyword (case-insensitive). */
+int tdb_keyword_check(const char *z, int n);
+
+/* ------------------------------------------------------------------ */
 /* C/C++ plugin engine                                                 */
 /* ------------------------------------------------------------------ */
 /* A loadable extension exposes an entry point of this type. It registers

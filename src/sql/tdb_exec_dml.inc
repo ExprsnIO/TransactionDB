@@ -1146,13 +1146,22 @@ static int exec_detach(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 
 static int exec_lock(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
-  if (a->u.lock_tbl.table && !tdb_catalog_find_table(db->cat, a->u.lock_tbl.table)) {
+  tdb_table *t = tdb_catalog_find_table(db->cat, a->u.lock_tbl.table);
+  if (!t) {
     tdb_db_seterr(db, "no such table: %s", a->u.lock_tbl.table);
     return TDB_ERROR;
   }
-  /* pager is single-writer: the surrounding auto-txn already holds the write
-  ** slot, so LOCK TABLE is a no-op at this level. */
-  return TDB_OK;
+  /* Acquire a real lock through the lock manager so concurrent connections
+  ** see the contention. The pager already serializes writes, but readers in
+  ** SNAPSHOT/SERIALIZABLE isolation that touch this table need to wait or
+  ** abort under WAIT-DIE. The lock auto-releases when the txn ends. */
+  if (!db->txn) return TDB_OK;            /* no active txn → nothing to scope */
+  tdb_lockmode mode = a->u.lock_tbl.exclusive ? TDB_LOCK_EXCL : TDB_LOCK_SHARED;
+  int rc = tdb_lock_acquire(db->lm, db->txn->id, TDB_RES_TABLE,
+                            (uint64_t)t->root, 0, mode);
+  if (rc == TDB_BUSY) tdb_db_seterr(db, "LOCK TABLE: resource busy");
+  else if (rc == TDB_ABORT) tdb_db_seterr(db, "LOCK TABLE: deadlock prevention aborted");
+  return rc;
 }
 
 static int exec_txn(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {

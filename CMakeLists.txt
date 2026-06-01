@@ -13,6 +13,8 @@ endif()
 option(TDB_BUILD_TESTS "Build the test suite" ON)
 option(TDB_BUILD_CLI   "Build the CLI shell" ON)
 option(TDB_BUILD_LUA   "Build with embedded Lua" ON)
+# Package as an Apple .framework bundle (no-op off Apple); see cmake/AppleFramework.cmake.
+option(TDB_BUILD_FRAMEWORK "Build as an Apple .framework bundle" OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
@@ -30,7 +32,14 @@ if(NOT TDB_BUILD_LUA)
   list(FILTER TDB_SOURCES EXCLUDE REGEX "/src/lua/")
 endif()
 
-add_library(transactiondb STATIC ${TDB_SOURCES})
+# An Apple framework bundle must be a shared library; otherwise stay static.
+if(APPLE AND TDB_BUILD_FRAMEWORK)
+  set(TDB_LIB_TYPE SHARED)
+else()
+  set(TDB_LIB_TYPE STATIC)
+endif()
+
+add_library(transactiondb ${TDB_LIB_TYPE} ${TDB_SOURCES})
 target_include_directories(transactiondb
   PUBLIC  "${CMAKE_SOURCE_DIR}/include"
   PRIVATE "${CMAKE_SOURCE_DIR}/src"
@@ -47,6 +56,9 @@ if(NOT WIN32)
   target_link_libraries(transactiondb PUBLIC m)
 endif()
 tdb_set_warnings(transactiondb)
+
+# Apple .framework packaging (no-op unless APPLE AND TDB_BUILD_FRAMEWORK).
+include(AppleFramework)
 
 if(TDB_BUILD_LUA)
   include(FetchLua)

@@ -1,5 +1,48 @@
 /* tdb_exec_dml.inc — DML/DDL execution (included by tdb_exec.c). */
 
+#include "../catalog/tdb_acl.h"
+static int acl_check_or_err(tdb_db *db, const char *priv, int kind, const char *name);
+
+/* -------------------- HASH partitioning helpers ----------------------- */
+
+/* Hash a single tdb_value into 64 bits — used by partition routing. */
+static uint64_t pv_hash(const tdb_value *v) {
+  switch (v->type) {
+    case TDB_VAL_NULL: return 0x9e3779b97f4a7c15ULL;
+    case TDB_VAL_INT:  return (uint64_t)v->u.i * 0x100000001b3ULL ^ 0xcbf29ce484222325ULL;
+    case TDB_VAL_REAL: { uint64_t u; memcpy(&u, &v->u.r, 8); return u * 0x100000001b3ULL; }
+    default:
+      if (!v->u.s.p) return 0;
+      return tdb_fnv1a(v->u.s.p, (size_t)v->u.s.n);
+  }
+}
+
+/* Pick the child partition table for `t` given the row's partition-key
+** column values. Returns the catalog-resolved tdb_table or NULL on error. */
+static tdb_table *partition_pick_child(tdb_db *db, tdb_table *t, const tdb_value *row) {
+  if (t->partition_kind != TDB_PART_HASH || t->partition_count <= 0) return t;
+  uint64_t h = 1469598103934665603ULL;
+  for (int i = 0; i < t->npart_col; i++) {
+    int ci = tdb_table_find_column(t, t->partition_cols[i]);
+    if (ci < 0) {
+      tdb_db_seterr(db, "partition column %s missing on %s", t->partition_cols[i], t->name);
+      return NULL;
+    }
+    h = (h ^ pv_hash(&row[ci])) * 1099511628211ULL;
+  }
+  int k = (int)(h % (uint64_t)t->partition_count);
+  char child[256];
+  snprintf(child, sizeof(child), "%s__p%d", t->name, k);
+  tdb_table *ct = tdb_catalog_find_table(db->cat, child);
+  if (!ct) tdb_db_seterr(db, "missing partition %s", child);
+  return ct;
+}
+
+/* Return non-zero if `t` is the parent of HASH-partitioned children. */
+static int is_hash_partitioned(const tdb_table *t) {
+  return t && t->partition_kind == TDB_PART_HASH && t->partition_count > 0;
+}
+
 /* parse + resolve a column expression (generated/DEFAULT) against `t` */
 static tdb_expr *prepare_col_expr(tdb_db *db, tdb_stmt *st, tdb_table *t,
                                   const char *sql) {
@@ -55,10 +98,16 @@ static int store_full(tdb_db *db, tdb_stmt *st, tdb_table *t, tdb_value *row,
                       tdb_rowid rowid, tdb_buf *rec, int is_update) {
   int rc = finalize_row(db, st, t, row);
   if (rc) return rc;
+  /* Route to the correct child for HASH-partitioned parents. */
+  tdb_table *target = t;
+  if (is_hash_partitioned(t)) {
+    target = partition_pick_child(db, t, row);
+    if (!target) return TDB_ERROR;
+  }
   tdb_buf_reset(rec);
-  tdb_record_encode(row, t->ncol, rec);
-  return is_update ? db->engine->vtab->update(db->engine, db->txn, t, rowid, rec->data, (int)rec->len)
-                   : db->engine->vtab->insert(db->engine, db->txn, t, rowid, rec->data, (int)rec->len);
+  tdb_record_encode(row, target->ncol, rec);
+  return is_update ? db->engine->vtab->update(db->engine, db->txn, target, rowid, rec->data, (int)rec->len)
+                   : db->engine->vtab->insert(db->engine, db->txn, target, rowid, rec->data, (int)rec->len);
 }
 
 /* ---- RETURNING projection support -------------------------------------- */
@@ -207,6 +256,7 @@ static int insert_row_vals(tdb_db *db, tdb_stmt *st, tdb_table *t, const int *ta
 static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   tdb_table *t = tdb_catalog_find_table(db->cat, a->u.insert.table);
   if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.insert.table); return TDB_ERROR; }
+  if (acl_check_or_err(db, "INSERT", TDB_ACL_TABLE, a->u.insert.table) != TDB_OK) return TDB_ERROR;
 
   /* target column indices */
   int target[64]; int ntarget;
@@ -285,10 +335,17 @@ static int exec_insert(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   return rc;
 }
 
-/* materialize (rowid, values) pairs for UPDATE/DELETE */
-typedef struct { tdb_rowid *rids; tdb_value **rows; int n, cap, ncol; } rrowset;
-static int mat_rid(tdb_db *db, tdb_table *t, rrowset *rr) {
-  memset(rr, 0, sizeof(*rr)); rr->ncol = t->ncol;
+/* materialize (rowid, values) pairs for UPDATE/DELETE. For a HASH-partitioned
+** parent we sweep every child, tagging each row with its source table so the
+** caller can hand the update/delete back to the right b-tree. */
+typedef struct {
+  tdb_rowid *rids;
+  tdb_value **rows;
+  tdb_table **srcs;       /* per-row source table (== caller's `t` for unpartitioned) */
+  int n, cap, ncol;
+} rrowset;
+
+static int mat_rid_one(tdb_db *db, tdb_table *t, tdb_table *parent, rrowset *rr) {
   tdb_scan *sc;
   int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, 0, NULL, &sc);
   if (rc) return rc;
@@ -296,27 +353,46 @@ static int mat_rid(tdb_db *db, tdb_table *t, rrowset *rr) {
   while ((rc = db->engine->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {
     tdb_value tmp[64]; int nc = 0;
     if (tdb_record_decode(rec, (size_t)reclen, tmp, 64, &nc)) { rc = TDB_CORRUPT; break; }
-    tdb_value *row = row_alloc(t->ncol);
-    for (int i = 0; i < t->ncol && i < nc; i++) tdb_value_copy(&row[i], &tmp[i]);
+    tdb_value *row = row_alloc(parent->ncol);
+    for (int i = 0; i < parent->ncol && i < nc; i++) tdb_value_copy(&row[i], &tmp[i]);
     for (int i = 0; i < nc; i++) tdb_value_clear(&tmp[i]);
     if (rr->n == rr->cap) {
       rr->cap = rr->cap ? rr->cap * 2 : 16;
       rr->rids = (tdb_rowid *)tdb_realloc(rr->rids, sizeof(tdb_rowid) * (size_t)rr->cap);
       rr->rows = (tdb_value **)tdb_realloc(rr->rows, sizeof(void *) * (size_t)rr->cap);
+      rr->srcs = (tdb_table **)tdb_realloc(rr->srcs, sizeof(void *) * (size_t)rr->cap);
     }
-    rr->rids[rr->n] = rid; rr->rows[rr->n] = row; rr->n++;
+    rr->rids[rr->n] = rid; rr->rows[rr->n] = row; rr->srcs[rr->n] = t; rr->n++;
   }
   db->engine->vtab->scan_close(sc);
   return (rc == TDB_DONE) ? TDB_OK : rc;
 }
+
+static int mat_rid(tdb_db *db, tdb_table *t, rrowset *rr) {
+  memset(rr, 0, sizeof(*rr)); rr->ncol = t->ncol;
+  if (is_hash_partitioned(t)) {
+    for (int k = 0; k < t->partition_count; k++) {
+      char child[256];
+      snprintf(child, sizeof(child), "%s__p%d", t->name, k);
+      tdb_table *ct = tdb_catalog_find_table(db->cat, child);
+      if (!ct) continue;
+      int rc = mat_rid_one(db, ct, t, rr);
+      if (rc) return rc;
+    }
+    return TDB_OK;
+  }
+  return mat_rid_one(db, t, t, rr);
+}
+
 static void rrowset_free(rrowset *rr) {
   for (int i = 0; i < rr->n; i++) free_row(rr->rows[i], rr->ncol);
-  tdb_mfree(rr->rows); tdb_mfree(rr->rids);
+  tdb_mfree(rr->rows); tdb_mfree(rr->rids); tdb_mfree(rr->srcs);
 }
 
 static int exec_update(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   tdb_table *t = tdb_catalog_find_table(db->cat, a->u.update.table);
   if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.update.table); return TDB_ERROR; }
+  if (acl_check_or_err(db, "UPDATE", TDB_ACL_TABLE, a->u.update.table) != TDB_OK) return TDB_ERROR;
 
   qctx q; memset(&q, 0, sizeof(q));
   q.src[0].tbl = t; q.src[0].base = 0; q.nsrc = 1; q.totalcols = t->ncol;
@@ -352,7 +428,23 @@ static int exec_update(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     if (rc) { free_row(full, t->ncol); break; }
     tdb_buf_reset(&rec);
     tdb_record_encode(full, t->ncol, &rec);
-    rc = db->engine->vtab->update(db->engine, db->txn, t, rr.rids[r], rec.data, (int)rec.len);
+    /* For HASH-partitioned parents the row may need to migrate between
+    ** children if the update changed a partition key. We always remove
+    ** from the row's current source and let store_full route the new
+    ** value to the (possibly different) target child. */
+    tdb_table *src = rr.srcs[r];
+    if (is_hash_partitioned(t)) {
+      tdb_table *target = partition_pick_child(db, t, full);
+      if (!target) { free_row(full, t->ncol); rc = TDB_ERROR; break; }
+      if (target == src) {
+        rc = db->engine->vtab->update(db->engine, db->txn, src, rr.rids[r], rec.data, (int)rec.len);
+      } else {
+        rc = db->engine->vtab->remove(db->engine, db->txn, src, rr.rids[r]);
+        if (!rc) rc = db->engine->vtab->insert(db->engine, db->txn, target, rr.rids[r], rec.data, (int)rec.len);
+      }
+    } else {
+      rc = db->engine->vtab->update(db->engine, db->txn, src, rr.rids[r], rec.data, (int)rec.len);
+    }
     if (!rc) { st->changes++; returning_emit(db, st, &rp, full, t->ncol); }
     free_row(full, t->ncol);
     if (rc) break;
@@ -366,6 +458,7 @@ static int exec_update(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 static int exec_delete(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   tdb_table *t = tdb_catalog_find_table(db->cat, a->u.del.table);
   if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.del.table); return TDB_ERROR; }
+  if (acl_check_or_err(db, "DELETE", TDB_ACL_TABLE, a->u.del.table) != TDB_OK) return TDB_ERROR;
   qctx q; memset(&q, 0, sizeof(q));
   q.src[0].tbl = t; q.src[0].base = 0; q.nsrc = 1; q.totalcols = t->ncol;
   if (a->u.del.where && resolve_expr(db, &q, a->u.del.where)) return TDB_ERROR;
@@ -382,7 +475,7 @@ static int exec_delete(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       int ok = val_true(&w); tdb_value_clear(&w);
       if (!ok) continue;
     }
-    rc = db->engine->vtab->remove(db->engine, db->txn, t, rr.rids[r]);
+    rc = db->engine->vtab->remove(db->engine, db->txn, rr.srcs[r], rr.rids[r]);
     if (rc) break;
     st->changes++;
     returning_emit(db, st, &rp, rr.rows[r], t->ncol);  /* RETURNING old row */
@@ -408,6 +501,34 @@ static int exec_create_table(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   rc = tdb_catalog_add_table(db->cat, t);
   if (rc) { tdb_table_free(t); return rc; }
   tdb_pager_set_schema_cookie(db->pager, tdb_pager_schema_cookie(db->pager) + 1);
+
+  /* HASH-partitioned parents own their data through N child tables named
+  ** "<parent>__pK". Each child has the parent's column schema but no
+  ** partitioning metadata of its own (data lives only in children). */
+  if (t->partition_kind == TDB_PART_HASH && t->partition_count > 0) {
+    for (int k = 0; k < t->partition_count; k++) {
+      char child[256];
+      snprintf(child, sizeof(child), "%s__p%d", t->name, k);
+      if (tdb_catalog_find_table(db->cat, child)) continue;
+      tdb_table *ck = tdb_table_new(child);
+      if (!ck) return TDB_NOMEM;
+      for (int i = 0; i < t->ncol; i++) {
+        tdb_column col;
+        tdb_column_init(&col, t->cols[i].name, t->cols[i].type);
+        col.coll = t->cols[i].coll;
+        col.notnull = t->cols[i].notnull;
+        col.pk = t->cols[i].pk;
+        col.unique = t->cols[i].unique;
+        col.hidden = t->cols[i].hidden;
+        if (t->cols[i].default_sql) col.default_sql = tdb_strdup(t->cols[i].default_sql);
+        if (t->cols[i].check_sql) col.check_sql = tdb_strdup(t->cols[i].check_sql);
+        if (tdb_table_add_column(ck, &col) != TDB_OK) { tdb_table_free(ck); return TDB_NOMEM; }
+      }
+      int rc2 = db->engine->vtab->create_table(db->engine, db->txn, ck);
+      if (!rc2) rc2 = tdb_catalog_add_table(db->cat, ck);
+      if (rc2) { tdb_table_free(ck); return rc2; }
+    }
+  }
   return TDB_OK;
 }
 
@@ -573,6 +694,7 @@ static int exec_call(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
     tdb_db_seterr(db, "no such routine: %s", a->u.call.name);
     return TDB_ERROR;
   }
+  if (acl_check_or_err(db, "EXECUTE", TDB_ACL_PROCEDURE, a->u.call.name) != TDB_OK) return TDB_ERROR;
   qctx q; memset(&q, 0, sizeof(q));
   int argc = a->u.call.args ? a->u.call.args->n : 0;
   for (int i = 0; i < argc; i++)
@@ -661,6 +783,209 @@ static int exec_alter(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
       tdb_db_seterr(db, "unsupported ALTER TABLE action");
       return TDB_UNSUPPORTED;
   }
+}
+
+/* ------------------------ Phase 11: utility DDL ------------------------ */
+
+/* TRUNCATE TABLE — delete every visible row. (Identity reset / CASCADE
+** are parsed and remembered on the AST but not yet executed.) */
+static int truncate_one(tdb_db *db, tdb_stmt *st, tdb_table *t) {
+  tdb_scan *sc;
+  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, 0, NULL, &sc);
+  if (rc) return rc;
+  tdb_rowid *ids = NULL; int nid = 0, capid = 0;
+  tdb_rowid rid; const uint8_t *rec; int reclen;
+  while ((rc = db->engine->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {
+    if (nid == capid) {
+      capid = capid ? capid * 2 : 64;
+      ids = (tdb_rowid *)tdb_realloc(ids, sizeof(tdb_rowid) * (size_t)capid);
+    }
+    ids[nid++] = rid;
+  }
+  db->engine->vtab->scan_close(sc);
+  if (rc != TDB_DONE) { tdb_mfree(ids); return rc; }
+  for (int i = 0; i < nid; i++) {
+    int dr = db->engine->vtab->remove(db->engine, db->txn, t, ids[i]);
+    if (dr) { tdb_mfree(ids); return dr; }
+    st->changes++;
+  }
+  tdb_mfree(ids);
+  return TDB_OK;
+}
+
+static int exec_truncate(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  tdb_table *t = tdb_catalog_find_table(db->cat, a->u.truncate.name);
+  if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.truncate.name); return TDB_ERROR; }
+  if (is_hash_partitioned(t)) {
+    for (int k = 0; k < t->partition_count; k++) {
+      char child[256];
+      snprintf(child, sizeof(child), "%s__p%d", t->name, k);
+      tdb_table *ct = tdb_catalog_find_table(db->cat, child);
+      if (!ct) continue;
+      int rc = truncate_one(db, st, ct);
+      if (rc) return rc;
+    }
+    return TDB_OK;
+  }
+  return truncate_one(db, st, t);
+}
+
+/* ANALYZE / REINDEX / COMMENT / LOCK / GRANT / REVOKE / ATTACH / DETACH —
+** parsing is the main deliverable; semantic effects are stubs at this
+** point (no stats catalog, ACL system, or attach manager exists yet). */
+static int exec_analyze(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st);
+  if (a->u.analyze.name && !tdb_catalog_find_table(db->cat, a->u.analyze.name)) {
+    tdb_db_seterr(db, "no such table: %s", a->u.analyze.name);
+    return TDB_ERROR;
+  }
+  return TDB_OK;
+}
+
+static int exec_reindex(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st);
+  if (a->u.reindex.name && !a->u.reindex.is_index) {
+    if (!tdb_catalog_find_table(db->cat, a->u.reindex.name)) {
+      tdb_db_seterr(db, "no such table: %s", a->u.reindex.name);
+      return TDB_ERROR;
+    }
+  }
+  return TDB_OK;
+}
+
+static int exec_comment(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
+  return TDB_OK;
+}
+
+static int exec_tablespace_create(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
+  return TDB_OK;
+}
+static int exec_tablespace_drop(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
+  return TDB_OK;
+}
+
+/* Split a comma/space-delimited privilege list into uppercase tokens. */
+static char **split_privs(const char *src, int *out_n) {
+  *out_n = 0;
+  if (!src) return NULL;
+  char **arr = NULL; int cap = 0, n = 0;
+  const char *p = src;
+  while (*p) {
+    while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+    if (!*p) break;
+    const char *start = p;
+    while (*p && !isspace((unsigned char)*p) && *p != ',') p++;
+    int len = (int)(p - start);
+    if (len > 0) {
+      if (n == cap) { cap = cap ? cap * 2 : 4; arr = (char **)tdb_realloc(arr, sizeof(char *) * (size_t)cap); }
+      char *tok = tdb_strndup(start, (size_t)len);
+      for (char *q = tok; *q; q++) *q = (char)toupper((unsigned char)*q);
+      arr[n++] = tok;
+    }
+  }
+  *out_n = n;
+  return arr;
+}
+
+/* Parse "TABLE name" / "INDEX name" / "FUNCTION name" / etc from grant.object;
+** returns the TDB_ACL_* kind and a malloc'd object name (caller frees). */
+static int parse_grant_object(const char *src, int *out_kind, char **out_name) {
+  *out_kind = TDB_ACL_TABLE; *out_name = NULL;
+  if (!src) return TDB_MISUSE;
+  while (*src && isspace((unsigned char)*src)) src++;
+  int kind = tdb_acl_kind_of(src);
+  if (kind == 0) {
+    /* bare name — default to TABLE */
+    while (*src && isspace((unsigned char)*src)) src++;
+    *out_name = tdb_strdup(src);
+    return TDB_OK;
+  }
+  *out_kind = kind;
+  const char *p = src + strlen(tdb_acl_kind_name(kind));
+  while (*p && isspace((unsigned char)*p)) p++;
+  *out_name = tdb_strdup(p);
+  return TDB_OK;
+}
+
+static int exec_grant(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st);
+  int npriv = 0;
+  char **privs = split_privs(a->u.grant.privs, &npriv);
+  int kind = 0; char *obj = NULL;
+  if (parse_grant_object(a->u.grant.object, &kind, &obj) != TDB_OK) {
+    for (int i = 0; i < npriv; i++) tdb_mfree(privs[i]);
+    tdb_mfree(privs);
+    tdb_db_seterr(db, "bad object spec in %s", a->kind == ST_GRANT ? "GRANT" : "REVOKE");
+    return TDB_ERROR;
+  }
+  if (!obj || !*obj) {
+    for (int i = 0; i < npriv; i++) tdb_mfree(privs[i]);
+    tdb_mfree(privs); tdb_mfree(obj);
+    tdb_db_seterr(db, "missing object name in %s", a->kind == ST_GRANT ? "GRANT" : "REVOKE");
+    return TDB_ERROR;
+  }
+  tdb_acl *acl = tdb_catalog_acl(db->cat);
+  const char *grantee = a->u.grant.grantee ? a->u.grant.grantee : "PUBLIC";
+  int rc = TDB_OK;
+  if (a->kind == ST_GRANT) {
+    for (int i = 0; i < npriv && !rc; i++) {
+      rc = tdb_acl_grant(acl, grantee, privs[i], kind, obj);
+      if (!rc) {
+        tdb_acl_entry e = { (char *)grantee, privs[i], kind, obj, NULL };
+        rc = tdb_catalog_acl_persist(db->cat, &e);
+      }
+    }
+  } else {
+    for (int i = 0; i < npriv; i++) {
+      tdb_acl_revoke(acl, grantee, privs[i], kind, obj);
+      /* persistent revoke: append a tombstone? For simplicity, we leave the
+      ** old GRANT records on disk but skip them on next open via a scan-time
+      ** filter — kept simple: the catalog reload will re-add them, then this
+      ** REVOKE in-memory removes them. So a process restart loses REVOKEs.
+      ** TODO: catalog row deletion for true persistence. */
+    }
+  }
+  for (int i = 0; i < npriv; i++) tdb_mfree(privs[i]);
+  tdb_mfree(privs); tdb_mfree(obj);
+  return rc;
+}
+
+/* Privilege gate for SELECT/INSERT/UPDATE/DELETE/CALL/etc.
+** Returns TDB_OK if the current connection user has the privilege, else
+** TDB_ERROR with an error message set. */
+static int acl_check_or_err(tdb_db *db, const char *priv, int kind, const char *name) {
+  if (!db->current_user) return TDB_OK;       /* open / superuser mode */
+  if (tdb_acl_check(tdb_catalog_acl(db->cat), db->current_user, priv, kind, name))
+    return TDB_OK;
+  tdb_db_seterr(db, "permission denied: %s on %s '%s' for user '%s'",
+                priv ? priv : "?", tdb_acl_kind_name(kind),
+                name ? name : "?", db->current_user);
+  return TDB_ERROR;
+}
+
+static int exec_attach(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(a);
+  tdb_db_seterr(db, "ATTACH DATABASE is parsed but not yet executable");
+  return TDB_UNSUPPORTED;
+}
+static int exec_detach(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(a);
+  tdb_db_seterr(db, "DETACH DATABASE is parsed but not yet executable");
+  return TDB_UNSUPPORTED;
+}
+
+static int exec_lock(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st);
+  if (a->u.lock_tbl.table && !tdb_catalog_find_table(db->cat, a->u.lock_tbl.table)) {
+    tdb_db_seterr(db, "no such table: %s", a->u.lock_tbl.table);
+    return TDB_ERROR;
+  }
+  /* pager is single-writer: the surrounding auto-txn already holds the write
+  ** slot, so LOCK TABLE is a no-op at this level. */
+  return TDB_OK;
 }
 
 static int exec_txn(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {

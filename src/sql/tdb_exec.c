@@ -47,6 +47,11 @@ typedef struct qctx {
   int       totalcols;
   tdb_expr *aggs[64];
   int       nagg;
+  /* Window function calls (EX_WINDOW) in this query, in collection order.
+  ** Indexed by EX_WINDOW.win_index; values pre-computed per row before
+  ** projection (see eval_windows). */
+  tdb_expr *wins[32];
+  int       nwin;
   int       paramcount;
   int       err;
   struct qctx *outer;   /* enclosing query's context (correlated subqueries) */
@@ -79,12 +84,10 @@ static tdb_value *row_alloc(int ncol) {
 
 /* ---------------------------- materialize ----------------------------- */
 
-/* Materialize the rows of `t` visible to txn into `rs` (deep copies). If
-** `idx` is non-NULL the scan is index-driven over `range`. */
-static int mat_table(tdb_db *db, tdb_table *t, tdb_index *idx,
-                     const tdb_keyrange *range, tdb_txnid as_of,
-                     const uint8_t *colmask, rowset *rs) {
-  rowset_init(rs, t->ncol);
+/* Scan a single physical table into `rs` (caller initializes rs). */
+static int mat_scan_one(tdb_db *db, tdb_table *t, tdb_index *idx,
+                        const tdb_keyrange *range, tdb_txnid as_of,
+                        const uint8_t *colmask, rowset *rs) {
   tdb_scan *sc;
   int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, idx, range, as_of, colmask, &sc);
   if (rc) return rc;
@@ -100,6 +103,28 @@ static int mat_table(tdb_db *db, tdb_table *t, tdb_index *idx,
   }
   db->engine->vtab->scan_close(sc);
   return (rc == TDB_DONE) ? TDB_OK : rc;
+}
+
+/* Materialize the rows of `t` visible to txn into `rs` (deep copies). For a
+** HASH-partitioned parent this unions all child partitions; for an ordinary
+** table it scans `t` itself. Index hints are ignored on a partitioned scan
+** (each child has its own indexes). */
+static int mat_table(tdb_db *db, tdb_table *t, tdb_index *idx,
+                     const tdb_keyrange *range, tdb_txnid as_of,
+                     const uint8_t *colmask, rowset *rs) {
+  rowset_init(rs, t->ncol);
+  if (t->partition_kind != TDB_PART_HASH || t->partition_count <= 0)
+    return mat_scan_one(db, t, idx, range, as_of, colmask, rs);
+
+  for (int k = 0; k < t->partition_count; k++) {
+    char child[256];
+    snprintf(child, sizeof(child), "%s__p%d", t->name, k);
+    tdb_table *ct = tdb_catalog_find_table(db->cat, child);
+    if (!ct) continue;        /* partition missing (e.g. older db); skip */
+    int rc = mat_scan_one(db, ct, NULL, NULL, as_of, colmask, rs);
+    if (rc) return rc;
+  }
+  return TDB_OK;
 }
 
 /* ----------------------------- resolution ----------------------------- */
@@ -149,6 +174,21 @@ static int resolve_expr(tdb_db *db, qctx *q, tdb_expr *e) {
     case EX_AGG:
       if (q->nagg < 64) { e->agg_index = q->nagg; q->aggs[q->nagg++] = e; }
       return resolve_list(db, q, e->args);
+    case EX_WINDOW: {
+      if (q->nwin < 32) { e->win_index = q->nwin; q->wins[q->nwin++] = e; }
+      if (resolve_list(db, q, e->args)) return TDB_ERROR;
+      if (e->win) {
+        if (e->win->partition) {
+          for (int i = 0; i < e->win->partition->n; i++)
+            if (resolve_expr(db, q, e->win->partition->items[i])) return TDB_ERROR;
+        }
+        if (e->win->order) {
+          for (int i = 0; i < e->win->order->n; i++)
+            if (resolve_expr(db, q, e->win->order->exprs[i])) return TDB_ERROR;
+        }
+      }
+      return TDB_OK;
+    }
     case EX_BINARY:
     case EX_UNARY:
       if (resolve_expr(db, q, e->left)) return TDB_ERROR;
@@ -176,6 +216,12 @@ typedef struct ectx {
   tdb_stmt  *stmt;
   qctx        *qc;      /* this query's resolution context (for subqueries) */
   struct ectx *outer;   /* enclosing query's per-row context (correlation) */
+  /* Pre-computed window-function values for `row` (size nwinvals). NULL
+  ** outside a windowed projection pass. Kept at end of the struct so that
+  ** the existing positional initializers across the codebase still work
+  ** (the trailing fields zero-initialize). */
+  tdb_value *winvals;
+  int        nwinvals;
 } ectx;
 
 static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out);
@@ -188,14 +234,46 @@ typedef struct cte_scope {
   struct cte_scope *parent;
 } cte_scope;
 
+/* Pre-materialized rows for a recursive CTE's working set / final result.
+** Owned for the duration of the outer SELECT; rows are heap-allocated and
+** freed in cte_rows_free at scope-pop time. */
+typedef struct cte_rows {
+  tdb_value **rows;
+  int          nrows, capr;
+  int          ncol;
+  char       **colnames;     /* arena-allocated */
+} cte_rows;
+
+static void cte_rows_free(cte_rows *cr) {
+  if (!cr) return;
+  for (int i = 0; i < cr->nrows; i++) {
+    for (int k = 0; k < cr->ncol; k++) tdb_value_clear(&cr->rows[i][k]);
+    tdb_mfree(cr->rows[i]);
+  }
+  tdb_mfree(cr->rows);
+  tdb_mfree(cr);
+}
+
+/* deep-copy row k of stmt `s` into a freshly allocated array */
+static tdb_value *row_dup(tdb_stmt *s, int k) {
+  tdb_value *r = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(s->ncol ? s->ncol : 1));
+  if (!r) return NULL;
+  for (int i = 0; i < s->ncol; i++) { tdb_value_init(&r[i]); tdb_value_copy(&r[i], &s->rows[k][i]); }
+  return r;
+}
+
 /* Find an in-scope, non-active CTE by name (case-insensitive). Active CTEs are
-** those currently being materialized — skipping them blocks self-reference. */
+** those currently being materialized — skipping them blocks self-reference.
+** A CTE with `rows` already attached (recursive-CTE working set) is treated
+** as visible regardless of `active`: the recursive arm wants to read it. */
 static tdb_cte *find_cte(tdb_stmt *st, const char *name) {
   for (cte_scope *sc = st->cte_scope; sc; sc = sc->parent) {
     tdb_ctelist *l = sc->list;
-    for (int i = 0; l && i < l->n; i++)
-      if (!l->items[i].active && strcasecmp(l->items[i].name, name) == 0)
-        return &l->items[i];
+    for (int i = 0; l && i < l->n; i++) {
+      if (strcasecmp(l->items[i].name, name) != 0) continue;
+      if (l->items[i].active && !l->items[i].rows) continue;
+      return &l->items[i];
+    }
   }
   return NULL;
 }
@@ -713,6 +791,10 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
       if (c->aggvals && e->agg_index >= 0 && e->agg_index < c->naggvals)
         return tdb_value_copy(out, &c->aggvals[e->agg_index]);
       tdb_value_set_null(out); return TDB_OK;
+    case EX_WINDOW:
+      if (c->winvals && e->win_index >= 0 && e->win_index < c->nwinvals)
+        return tdb_value_copy(out, &c->winvals[e->win_index]);
+      tdb_value_set_null(out); return TDB_OK;
     case EX_UNARY: {
       tdb_value v; tdb_value_init(&v);
       eval(db, c, e->left, &v);
@@ -1071,6 +1153,16 @@ static int stmt_execute_locked(tdb_stmt *st) {
     case ST_CREATE_ROUTINE: rc = exec_create_routine(db, st, a); break;
     case ST_CALL: rc = exec_call(db, st, a); break;
     case ST_ALTER_TABLE: rc = exec_alter(db, st, a); break;
+    case ST_TRUNCATE:    rc = exec_truncate(db, st, a); break;
+    case ST_ANALYZE:     rc = exec_analyze(db, st, a); break;
+    case ST_REINDEX:     rc = exec_reindex(db, st, a); break;
+    case ST_COMMENT:     rc = exec_comment(db, st, a); break;
+    case ST_CREATE_TABLESPACE: rc = exec_tablespace_create(db, st, a); break;
+    case ST_DROP_TABLESPACE:   rc = exec_tablespace_drop(db, st, a); break;
+    case ST_GRANT: case ST_REVOKE: rc = exec_grant(db, st, a); break;
+    case ST_ATTACH:      rc = exec_attach(db, st, a); break;
+    case ST_DETACH:      rc = exec_detach(db, st, a); break;
+    case ST_LOCK_TABLE:  rc = exec_lock(db, st, a); break;
     default:
       tdb_db_seterr(db, "statement type not yet executable");
       rc = TDB_UNSUPPORTED;

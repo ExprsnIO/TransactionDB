@@ -273,11 +273,37 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
   tdb_cte    *cte = NULL;
   if (!sub && s->table) {
     cte = find_cte(st, s->table);              /* a WITH name shadows a table */
-    if (cte) { sub = cte->select; if (!qs->alias) qs->alias = cte->name; }
+    if (cte) {
+      if (!qs->alias) qs->alias = cte->name;
+      /* recursive CTE: read directly from the pre-materialized rowset
+      ** instead of re-running the body. */
+      if (cte->rows) {
+        cte_rows *cr = (cte_rows *)cte->rows;
+        qs->ncol = cr->ncol;
+        qs->colnames = (char **)tdb_arena_alloc(st->arena,
+            sizeof(char *) * (size_t)(cr->ncol ? cr->ncol : 1));
+        for (int k = 0; k < cr->ncol; k++) qs->colnames[k] = cr->colnames[k];
+        rowset_init(set, cr->ncol ? cr->ncol : 1);
+        for (int r = 0; r < cr->nrows; r++) {
+          tdb_value *row = row_alloc(cr->ncol ? cr->ncol : 1);
+          for (int k = 0; k < cr->ncol; k++) tdb_value_copy(&row[k], &cr->rows[r][k]);
+          rowset_add(set, row);
+        }
+        return TDB_OK;
+      }
+      sub = cte->select;
+    }
   }
   if (!sub && s->table) {
     tdb_table *t = tdb_catalog_find_table(db->cat, s->table);
     if (t) {
+      if (db->current_user &&
+          !tdb_acl_check(tdb_catalog_acl(db->cat), db->current_user,
+                         "SELECT", TDB_ACL_TABLE, s->table)) {
+        tdb_db_seterr(db, "permission denied: SELECT on table '%s' for user '%s'",
+                      s->table, db->current_user);
+        return TDB_ERROR;
+      }
       qs->tbl = t; qs->ncol = t->ncol;
       tdb_txnid as_of = 0;
       if (s->as_of) {
@@ -327,15 +353,443 @@ static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
 static int exec_setop_chain(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer);
 static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer);
 
+/* Run a recursive CTE to fixed point. The body is expected to be a UNION
+** (with or without ALL) of a seed (non-recursive) arm and a recursive arm
+** that reads the CTE name. Strategy:
+**
+**   1. Run the seed alone — this fixes the CTE's schema and seeds the
+**      working set.
+**   2. Loop: run the recursive arm with the CTE's current rows visible.
+**      Append (or, for UNION, dedup-append) the iteration output to the
+**      working set. Stop when no new rows appear.
+**
+** This is the textbook seed/recursive split and handles both UNION ALL
+** (no dedup) and UNION DISTINCT (row-equality dedup) recursion. A safety
+** cap prevents non-terminating queries from blocking forever. */
+#define TDB_CTE_MAX_ITERS 8192
+
+static int row_value_equal(const tdb_value *a, const tdb_value *b) {
+  return tdb_value_compare(a, b, TDB_COLL_BINARY) == 0;
+}
+static int row_already_in(cte_rows *cr, tdb_value *row) {
+  for (int i = 0; i < cr->nrows; i++) {
+    int eq = 1;
+    for (int k = 0; k < cr->ncol; k++)
+      if (!row_value_equal(&cr->rows[i][k], &row[k])) { eq = 0; break; }
+    if (eq) return 1;
+  }
+  return 0;
+}
+
+static int cte_rows_grow(cte_rows *acc) {
+  if (acc->nrows < acc->capr) return TDB_OK;
+  int cap = acc->capr ? acc->capr * 2 : 16;
+  tdb_value **g = (tdb_value **)tdb_realloc(acc->rows, sizeof(void *) * (size_t)cap);
+  if (!g) return TDB_NOMEM;
+  acc->rows = g; acc->capr = cap;
+  return TDB_OK;
+}
+
+/* Move all rows from `src` into `dst` and reset `src` to empty (transfers
+** ownership of the row arrays — no copying). */
+static void cte_rows_take(cte_rows *dst, cte_rows *src) {
+  for (int i = 0; i < src->nrows; i++) {
+    if (dst->nrows == dst->capr) {
+      dst->capr = dst->capr ? dst->capr * 2 : 16;
+      dst->rows = (tdb_value **)tdb_realloc(dst->rows, sizeof(void *) * (size_t)dst->capr);
+    }
+    dst->rows[dst->nrows++] = src->rows[i];
+  }
+  tdb_mfree(src->rows);
+  src->rows = NULL; src->nrows = 0; src->capr = 0;
+}
+
+static int materialize_recursive_cte(tdb_db *db, tdb_stmt *st, tdb_cte *c) {
+  if (c->rows) return TDB_OK;
+  cte_rows *acc = (cte_rows *)tdb_calloc(sizeof(*acc));        /* full result */
+  cte_rows *wset = (cte_rows *)tdb_calloc(sizeof(*wset));      /* current frontier */
+  if (!acc || !wset) { cte_rows_free(acc); cte_rows_free(wset); return TDB_NOMEM; }
+
+  /* Detach the recursive arm so the seed can be run in isolation. */
+  tdb_select *body = c->select;
+  int  saved_setop     = body->setop;
+  int  saved_setop_all = body->setop_all;
+  tdb_select *saved_next = body->setop_next;
+  body->setop = 0; body->setop_all = 0; body->setop_next = NULL;
+  int dedup = (saved_setop == TK_UNION && !saved_setop_all);
+
+  tdb_stmt seed;
+  int rc = run_subselect(db, st, body, &seed, NULL);
+  body->setop = saved_setop; body->setop_all = saved_setop_all; body->setop_next = saved_next;
+  if (rc) { tdb_stmt_clear_results(&seed); cte_rows_free(acc); cte_rows_free(wset); return rc; }
+
+  /* Schema comes from the seed. */
+  acc->ncol = wset->ncol = seed.ncol;
+  acc->colnames = (char **)tdb_arena_alloc(st->arena,
+      sizeof(char *) * (size_t)(seed.ncol ? seed.ncol : 1));
+  for (int k = 0; k < seed.ncol; k++) {
+    const char *nm = (k < c->ncolname) ? c->colnames[k]
+                   : (seed.colnames && seed.colnames[k]) ? seed.colnames[k] : "col";
+    acc->colnames[k] = tdb_arena_strndup(st->arena, nm, strlen(nm));
+  }
+  wset->colnames = acc->colnames;
+
+  /* Seed populates both `acc` (final result) and `wset` (initial frontier). */
+  for (int r = 0; r < seed.nrows; r++) {
+    if (cte_rows_grow(acc) || cte_rows_grow(wset)) {
+      tdb_stmt_clear_results(&seed); cte_rows_free(acc); cte_rows_free(wset);
+      return TDB_NOMEM;
+    }
+    tdb_value *a = row_dup(&seed, r), *b = row_dup(&seed, r);
+    if (!a || !b) { tdb_stmt_clear_results(&seed); cte_rows_free(acc); cte_rows_free(wset); return TDB_NOMEM; }
+    acc->rows[acc->nrows++] = a;
+    wset->rows[wset->nrows++] = b;
+  }
+  tdb_stmt_clear_results(&seed);
+
+  if (!saved_next) {
+    cte_rows_free(wset);
+    c->rows = acc;
+    return TDB_OK;
+  }
+
+  /* Iterate: each step's reference to the CTE sees `wset` only (the frontier),
+  ** not the full accumulated result — this is what gives recursive CTEs
+  ** correct termination semantics for UNION ALL recursion. */
+  for (int it = 0; it < TDB_CTE_MAX_ITERS; it++) {
+    c->rows = wset;
+    tdb_stmt step;
+    rc = run_subselect(db, st, saved_next, &step, NULL);
+    c->rows = NULL;
+    if (rc) { tdb_stmt_clear_results(&step); cte_rows_free(acc); cte_rows_free(wset); return rc; }
+
+    cte_rows *next = (cte_rows *)tdb_calloc(sizeof(*next));
+    if (!next) { tdb_stmt_clear_results(&step); cte_rows_free(acc); cte_rows_free(wset); return TDB_NOMEM; }
+    next->ncol = acc->ncol; next->colnames = acc->colnames;
+
+    for (int r = 0; r < step.nrows; r++) {
+      tdb_value *row = row_dup(&step, r);
+      if (!row) { tdb_stmt_clear_results(&step); cte_rows_free(acc); cte_rows_free(wset); cte_rows_free(next); return TDB_NOMEM; }
+      if (dedup && row_already_in(acc, row)) {
+        for (int k = 0; k < acc->ncol; k++) tdb_value_clear(&row[k]);
+        tdb_mfree(row);
+        continue;
+      }
+      if (cte_rows_grow(next)) { tdb_mfree(row); tdb_stmt_clear_results(&step); cte_rows_free(acc); cte_rows_free(wset); cte_rows_free(next); return TDB_NOMEM; }
+      next->rows[next->nrows++] = row;
+    }
+    tdb_stmt_clear_results(&step);
+
+    if (next->nrows == 0) {
+      cte_rows_free(next); cte_rows_free(wset);
+      c->rows = acc;
+      return TDB_OK;
+    }
+    /* Append `next` to `acc` (transfer ownership), and make it the new frontier. */
+    cte_rows *frontier = (cte_rows *)tdb_calloc(sizeof(*frontier));
+    frontier->ncol = acc->ncol; frontier->colnames = acc->colnames;
+    /* For frontier we need a copy distinct from acc's rows (acc takes ownership of `next`'s rows). */
+    for (int r = 0; r < next->nrows; r++) {
+      if (cte_rows_grow(frontier)) { cte_rows_free(acc); cte_rows_free(wset); cte_rows_free(next); cte_rows_free(frontier); return TDB_NOMEM; }
+      tdb_value *dup = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(acc->ncol ? acc->ncol : 1));
+      for (int k = 0; k < acc->ncol; k++) { tdb_value_init(&dup[k]); tdb_value_copy(&dup[k], &next->rows[r][k]); }
+      frontier->rows[frontier->nrows++] = dup;
+    }
+    cte_rows_take(acc, next);            /* move into acc */
+    cte_rows_free(next);
+    cte_rows_free(wset);
+    wset = frontier;
+  }
+  cte_rows_free(wset);
+  c->rows = acc;
+  tdb_db_seterr(db, "WITH RECURSIVE did not converge within %d iterations", TDB_CTE_MAX_ITERS);
+  return TDB_ERROR;
+}
+
 /* Push this SELECT's WITH frame (if any) so its CTEs are visible to the body
 ** and any nested subqueries, run the body, then pop the frame. `outer` is the
 ** enclosing query's per-row context for correlated subqueries (NULL at top). */
 static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer) {
   cte_scope scope; cte_scope *saved = st->cte_scope;
   if (q->with) { scope.list = q->with; scope.parent = saved; st->cte_scope = &scope; }
-  int rc = exec_select_body(db, st, q, outer);
+  int rc = TDB_OK;
+  if (q->with && q->with->recursive) {
+    for (int i = 0; rc == TDB_OK && i < q->with->n; i++)
+      rc = materialize_recursive_cte(db, st, &q->with->items[i]);
+  }
+  if (rc == TDB_OK) rc = exec_select_body(db, st, q, outer);
+  /* tear down any rows attached for recursive CTEs in this frame */
+  if (q->with) {
+    for (int i = 0; i < q->with->n; i++) {
+      cte_rows_free((cte_rows *)q->with->items[i].rows);
+      q->with->items[i].rows = NULL;
+    }
+  }
   st->cte_scope = saved;
   return rc;
+}
+
+/* ---------------------------- window functions ---------------------------
+**
+** Compute one value per (row, window-call) pair, returned as winvals[r][f].
+** The implementation supports four ranking functions (ROW_NUMBER, RANK,
+** DENSE_RANK, NTILE) and the standard scalar aggregates as window
+** aggregates (COUNT, SUM, AVG, MIN, MAX).
+**
+** Semantics: rows are first partitioned by `OVER (PARTITION BY ...)` (one
+** partition if absent), then ordered within each partition by ORDER BY (an
+** indeterminate but stable order if absent). Without an ORDER BY clause an
+** aggregate window function returns the same value (the full-partition
+** aggregate) for every row; with ORDER BY it returns the running aggregate
+** up to and including the current row's peer group (the default frame in
+** SQL is "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"). */
+
+typedef struct { tdb_expr *w; int kind; } winkind;
+enum { WK_ROW_NUMBER = 1, WK_RANK, WK_DENSE_RANK, WK_NTILE,
+       WK_COUNT, WK_SUM, WK_AVG, WK_MIN, WK_MAX };
+
+static int classify_win(tdb_expr *w) {
+  if (!w->name) return 0;
+  if (!strcasecmp(w->name, "row_number"))  return WK_ROW_NUMBER;
+  if (!strcasecmp(w->name, "rank"))        return WK_RANK;
+  if (!strcasecmp(w->name, "dense_rank"))  return WK_DENSE_RANK;
+  if (!strcasecmp(w->name, "ntile"))       return WK_NTILE;
+  if (!strcasecmp(w->name, "count"))       return WK_COUNT;
+  if (!strcasecmp(w->name, "sum") ||
+      !strcasecmp(w->name, "total"))       return WK_SUM;
+  if (!strcasecmp(w->name, "avg"))         return WK_AVG;
+  if (!strcasecmp(w->name, "min"))         return WK_MIN;
+  if (!strcasecmp(w->name, "max"))         return WK_MAX;
+  return 0;
+}
+
+/* Within-partition comparator over an order-by row of values. */
+static int orderkey_cmp(tdb_value *a, tdb_value *b, int n, const uint8_t *desc) {
+  for (int i = 0; i < n; i++) {
+    int c = tdb_value_compare(&a[i], &b[i], TDB_COLL_BINARY);
+    if (desc && desc[i]) c = -c;
+    if (c) return c;
+  }
+  return 0;
+}
+
+/* Compute winvals[r][f] for every row r and every window-call f in Q.
+** Caller owns winvals: free with tdb_value_clear per cell then tdb_mfree. */
+static int eval_windows(tdb_db *db, tdb_stmt *st, qctx *Q, rowset *in,
+                        tdb_value ***winvals_out, ectx *outer) {
+  int nr = in->n, nw = Q->nwin;
+  if (nw == 0) { *winvals_out = NULL; return TDB_OK; }
+  tdb_value **wv = (tdb_value **)tdb_calloc(sizeof(tdb_value *) * (size_t)nr);
+  if (!wv) return TDB_NOMEM;
+  for (int r = 0; r < nr; r++) {
+    wv[r] = row_alloc(nw);
+    for (int f = 0; f < nw; f++) tdb_value_set_null(&wv[r][f]);
+  }
+
+  /* Per-row idx; reused for partitioning. */
+  int *order = (int *)tdb_malloc(sizeof(int) * (size_t)(nr ? nr : 1));
+  for (int r = 0; r < nr; r++) order[r] = r;
+
+  for (int f = 0; f < nw; f++) {
+    tdb_expr *we = Q->wins[f];
+    int kind = classify_win(we);
+    if (!kind) { tdb_db_seterr(db, "unsupported window function: %s", we->name ? we->name : "?"); tdb_mfree(order); return TDB_ERROR; }
+    int np = we->win && we->win->partition ? we->win->partition->n : 0;
+    int no = we->win && we->win->order ? we->win->order->n : 0;
+
+    /* compute partition key + order key per row */
+    tdb_value **pkey = (tdb_value **)tdb_calloc(sizeof(void *) * (size_t)nr);
+    tdb_value **okey = (tdb_value **)tdb_calloc(sizeof(void *) * (size_t)nr);
+    /* argument value for aggregate funcs (the first arg; COUNT(*) treated as constant 1) */
+    tdb_value *argv = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(nr ? nr : 1));
+    int has_arg = we->args && we->args->n > 0;
+    int star_arg = has_arg && we->args->items[0]->kind == EX_STAR;
+
+    for (int r = 0; r < nr; r++) {
+      ectx ec = { in->rows[r], in->ncol, NULL, 0, st, Q, outer };
+      if (np) {
+        pkey[r] = row_alloc(np);
+        for (int i = 0; i < np; i++) eval(db, &ec, we->win->partition->items[i], &pkey[r][i]);
+      }
+      if (no) {
+        okey[r] = row_alloc(no);
+        for (int i = 0; i < no; i++) eval(db, &ec, we->win->order->exprs[i], &okey[r][i]);
+      }
+      tdb_value_init(&argv[r]);
+      if (has_arg && !star_arg) eval(db, &ec, we->args->items[0], &argv[r]);
+      else if (star_arg) tdb_value_set_int(&argv[r], 1);
+    }
+
+    /* sort row indices: partition-key first, then order-key */
+    for (int r = 0; r < nr; r++) order[r] = r;
+    for (int i = 1; i < nr; i++) {        /* simple insertion sort */
+      int v = order[i]; int j = i - 1;
+      while (j >= 0) {
+        int a = order[j];
+        int c = np ? orderkey_cmp(pkey[a], pkey[v], np, NULL) : 0;
+        if (c == 0 && no) c = orderkey_cmp(okey[a], okey[v], no, we->win->order->desc);
+        if (c <= 0) break;
+        order[j + 1] = order[j]; j--;
+      }
+      order[j + 1] = v;
+    }
+
+    /* Walk the sorted rows, computing the window value for each. */
+    int p_start = 0;
+    while (p_start < nr) {
+      /* find end of partition */
+      int p_end = p_start + 1;
+      while (p_end < nr) {
+        if (np && orderkey_cmp(pkey[order[p_start]], pkey[order[p_end]], np, NULL) != 0) break;
+        p_end++;
+      }
+
+      /* If kind is a full-partition aggregate (no ORDER BY), pre-compute it. */
+      double sum_d = 0; int64_t sum_i = 0; int sum_is_int = 1;
+      int64_t cnt = 0;
+      tdb_value mn, mx; tdb_value_init(&mn); tdb_value_init(&mx);
+      int have_mm = 0;
+      for (int k = p_start; k < p_end; k++) {
+        int r = order[k];
+        if (kind == WK_COUNT) {
+          if (star_arg || argv[r].type != TDB_VAL_NULL) cnt++;
+        } else if (kind == WK_SUM || kind == WK_AVG) {
+          if (argv[r].type == TDB_VAL_NULL) continue;
+          if (argv[r].type == TDB_VAL_REAL) { sum_d += argv[r].u.r; sum_is_int = 0; }
+          else { sum_d += (double)tdb_value_as_int(&argv[r]); if (argv[r].type != TDB_VAL_INT) sum_is_int = 0; else sum_i += argv[r].u.i; }
+          cnt++;
+        } else if (kind == WK_MIN || kind == WK_MAX) {
+          if (argv[r].type == TDB_VAL_NULL) continue;
+          if (!have_mm) { tdb_value_copy(&mn, &argv[r]); tdb_value_copy(&mx, &argv[r]); have_mm = 1; }
+          else {
+            if (tdb_value_compare(&argv[r], &mn, TDB_COLL_BINARY) < 0) { tdb_value_clear(&mn); tdb_value_copy(&mn, &argv[r]); }
+            if (tdb_value_compare(&argv[r], &mx, TDB_COLL_BINARY) > 0) { tdb_value_clear(&mx); tdb_value_copy(&mx, &argv[r]); }
+          }
+        }
+      }
+
+      /* Per-row outputs. For ranking + running aggregates we walk the partition
+      ** in sorted order and emit values as we go. */
+      int row_num = 0, rank = 0, dense = 0;
+      tdb_value *prev_okey = NULL;
+      int64_t run_cnt = 0; double run_sum_d = 0; int64_t run_sum_i = 0; int run_is_int = 1;
+      tdb_value run_min, run_max; tdb_value_init(&run_min); tdb_value_init(&run_max);
+      int run_have_mm = 0;
+
+      for (int k = p_start; k < p_end; k++) {
+        int r = order[k];
+        row_num++;
+        int peer_change = 1;
+        if (no && k > p_start) peer_change = (orderkey_cmp(prev_okey, okey[r], no, we->win->order->desc) != 0);
+        if (k == p_start) { rank = 1; dense = 1; }
+        else if (no) {
+          if (peer_change) { rank = row_num; dense++; }
+        } else { rank = 1; dense = 1; }       /* no ORDER BY: all are peers */
+
+        tdb_value *out = &wv[r][f];
+        switch (kind) {
+          case WK_ROW_NUMBER: tdb_value_set_int(out, (int64_t)row_num); break;
+          case WK_RANK:       tdb_value_set_int(out, (int64_t)rank); break;
+          case WK_DENSE_RANK: tdb_value_set_int(out, (int64_t)dense); break;
+          case WK_NTILE: {
+            int64_t buckets = has_arg ? tdb_value_as_int(&argv[r]) : 1;
+            if (buckets < 1) buckets = 1;
+            int64_t sz = (p_end - p_start);
+            int64_t small = sz / buckets, large_n = sz % buckets;
+            int64_t large_sz = small + 1;
+            int64_t boundary = large_n * large_sz;
+            int64_t idx = (int64_t)(k - p_start);
+            int64_t bucket = (idx < boundary) ? (idx / large_sz) + 1
+                                              : large_n + (idx - boundary) / (small ? small : 1) + 1;
+            tdb_value_set_int(out, bucket);
+            break;
+          }
+          case WK_COUNT:
+            if (no) {
+              if (star_arg || argv[r].type != TDB_VAL_NULL) run_cnt++;
+              tdb_value_set_int(out, run_cnt);
+            } else tdb_value_set_int(out, cnt);
+            break;
+          case WK_SUM:
+            if (no) {
+              if (argv[r].type != TDB_VAL_NULL) {
+                if (argv[r].type == TDB_VAL_REAL) { run_sum_d += argv[r].u.r; run_is_int = 0; }
+                else { run_sum_d += (double)tdb_value_as_int(&argv[r]); if (argv[r].type == TDB_VAL_INT) run_sum_i += argv[r].u.i; else run_is_int = 0; }
+              }
+              if (run_is_int) tdb_value_set_int(out, run_sum_i);
+              else tdb_value_set_real(out, run_sum_d);
+            } else {
+              if (sum_is_int) tdb_value_set_int(out, sum_i);
+              else tdb_value_set_real(out, sum_d);
+            }
+            break;
+          case WK_AVG:
+            if (no) {
+              if (argv[r].type != TDB_VAL_NULL) {
+                run_sum_d += tdb_value_as_real(&argv[r]);
+                run_cnt++;
+              }
+              if (run_cnt > 0) tdb_value_set_real(out, run_sum_d / (double)run_cnt);
+              else tdb_value_set_null(out);
+            } else {
+              if (cnt > 0) tdb_value_set_real(out, sum_d / (double)cnt);
+              else tdb_value_set_null(out);
+            }
+            break;
+          case WK_MIN:
+            if (no) {
+              if (argv[r].type != TDB_VAL_NULL) {
+                if (!run_have_mm) { tdb_value_copy(&run_min, &argv[r]); run_have_mm = 1; }
+                else if (tdb_value_compare(&argv[r], &run_min, TDB_COLL_BINARY) < 0) {
+                  tdb_value_clear(&run_min); tdb_value_copy(&run_min, &argv[r]);
+                }
+              }
+              if (run_have_mm) tdb_value_copy(out, &run_min); else tdb_value_set_null(out);
+            } else {
+              if (have_mm) tdb_value_copy(out, &mn); else tdb_value_set_null(out);
+            }
+            break;
+          case WK_MAX:
+            if (no) {
+              if (argv[r].type != TDB_VAL_NULL) {
+                if (!run_have_mm) { tdb_value_copy(&run_max, &argv[r]); run_have_mm = 1; }
+                else if (tdb_value_compare(&argv[r], &run_max, TDB_COLL_BINARY) > 0) {
+                  tdb_value_clear(&run_max); tdb_value_copy(&run_max, &argv[r]);
+                }
+              }
+              if (run_have_mm) tdb_value_copy(out, &run_max); else tdb_value_set_null(out);
+            } else {
+              if (have_mm) tdb_value_copy(out, &mx); else tdb_value_set_null(out);
+            }
+            break;
+        }
+        prev_okey = okey[r];
+      }
+      tdb_value_clear(&mn); tdb_value_clear(&mx);
+      tdb_value_clear(&run_min); tdb_value_clear(&run_max);
+      p_start = p_end;
+    }
+
+    /* per-window scratch cleanup */
+    for (int r = 0; r < nr; r++) {
+      if (pkey[r]) { for (int i = 0; i < np; i++) tdb_value_clear(&pkey[r][i]); tdb_mfree(pkey[r]); }
+      if (okey[r]) { for (int i = 0; i < no; i++) tdb_value_clear(&okey[r][i]); tdb_mfree(okey[r]); }
+      tdb_value_clear(&argv[r]);
+    }
+    tdb_mfree(pkey); tdb_mfree(okey); tdb_mfree(argv);
+  }
+
+  tdb_mfree(order);
+  *winvals_out = wv;
+  return TDB_OK;
+}
+
+static void free_winvals(tdb_value **wv, int nr, int nw) {
+  if (!wv) return;
+  for (int r = 0; r < nr; r++) {
+    if (wv[r]) { for (int f = 0; f < nw; f++) tdb_value_clear(&wv[r][f]); tdb_mfree(wv[r]); }
+  }
+  tdb_mfree(wv);
 }
 
 static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer) {
@@ -448,9 +902,26 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer
   int rc = TDB_OK;
   int ngroup = q->group ? q->group->n : 0;
 
+  /* Window functions are only supported in non-aggregated queries: they
+  ** evaluate after WHERE filtering and any joins, in the projection step. */
+  if (Q.nwin > 0 && aggregated) {
+    tdb_db_seterr(db, "window functions over an aggregated query are not supported");
+    rowset_free(&in); FAILP;
+  }
+
+  tdb_value **winvals = NULL;
+  if (Q.nwin > 0) {
+    rc = eval_windows(db, st, &Q, &in, &winvals, outer);
+    if (rc) {
+      free_winvals(winvals, in.n, Q.nwin);
+      rowset_free(&in); FAILP;
+    }
+  }
+
   if (!aggregated) {
     for (int r = 0; r < in.n; r++) {
       ectx ec = { in.rows[r], in.ncol, NULL, 0, st, &Q, outer };
+      if (winvals) { ec.winvals = winvals[r]; ec.nwinvals = Q.nwin; }
       tdb_value *vr = row_alloc(nout);
       for (int i = 0; i < nout; i++) eval(db, &ec, oexpr[i], &vr[i]);
       tdb_value *kr = norder ? row_alloc(norder) : NULL;
@@ -517,6 +988,7 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer
     tdb_mfree(groups);
   }
 
+  free_winvals(winvals, in.n, Q.nwin);
   rowset_free(&in);
 
   /* 4b. DISTINCT — drop duplicate output rows (NULLs compare equal) */

@@ -18,6 +18,9 @@ static const type_alias k_aliases[] = {
   {"TINYINT", TDB_T_TINYINT},
   {"SMALLINT", TDB_T_SMALLINT}, {"INT2", TDB_T_SMALLINT},
   {"BIGINT", TDB_T_BIGINT}, {"INT8", TDB_T_BIGINT},
+  /* INTERVAL must precede the shorter "INT" alias so the prefix match resolves
+  ** correctly (INTERVAL also begins with I-N-T). */
+  {"INTERVAL", TDB_T_INTERVAL},
   {"INTEGER", TDB_T_INTEGER}, {"INT4", TDB_T_INTEGER}, {"INT", TDB_T_INTEGER},
   {"DECIMAL", TDB_T_DECIMAL}, {"NUMERIC", TDB_T_DECIMAL}, {"NUMBER", TDB_T_DECIMAL},
   {"DOUBLE", TDB_T_DOUBLE}, {"FLOAT8", TDB_T_DOUBLE},
@@ -33,6 +36,9 @@ static const type_alias k_aliases[] = {
   {"DATE", TDB_T_DATE},
   {"TIME", TDB_T_TIME},
   {"JSON", TDB_T_JSON}, {"JSONB", TDB_T_JSON},
+  {"XML", TDB_T_XML},
+  {"BIT VARYING", TDB_T_VARBIT}, {"VARBIT", TDB_T_VARBIT},
+  {"BIT", TDB_T_BIT},
   {"UUID", TDB_T_UUID}, {"GUID", TDB_T_UUID},
   {"GEOMETRY", TDB_T_GEOMETRY}, {"GEOM", TDB_T_GEOMETRY},
   {"POINT", TDB_T_POINT},
@@ -60,6 +66,10 @@ const char *tdb_typeid_name(tdb_typeid id) {
     case TDB_T_TIME:      return "TIME";
     case TDB_T_TIMESTAMP: return "TIMESTAMP";
     case TDB_T_JSON:      return "JSON";
+    case TDB_T_XML:       return "XML";
+    case TDB_T_INTERVAL:  return "INTERVAL";
+    case TDB_T_BIT:       return "BIT";
+    case TDB_T_VARBIT:    return "BIT VARYING";
     case TDB_T_UUID:      return "UUID";
     case TDB_T_GEOMETRY:  return "GEOMETRY";
     case TDB_T_POINT:     return "POINT";
@@ -119,6 +129,8 @@ tdb_valtype tdb_typespec_storage(const tdb_typespec *ts) {
     case TDB_T_BINARY:
     case TDB_T_VARBINARY:
     case TDB_T_BLOB:
+    case TDB_T_BIT:
+    case TDB_T_VARBIT:
     case TDB_T_GEOMETRY:
     case TDB_T_POINT:
     case TDB_T_GEOGRAPHY:
@@ -245,15 +257,79 @@ int tdb_typespec_coerce(tdb_value *v, const tdb_typespec *ts, const char **why) 
     case TDB_T_VARCHAR:
     case TDB_T_TEXT:
     case TDB_T_JSON: {
-      if (v->type != TDB_VAL_TEXT) {
+      if (v->type == TDB_VAL_BLOB) {
+        /* Reinterpret bytes as text in place; value_set_bytes guarantees a
+        ** trailing NUL on its allocation, so the only change is the type tag. */
+        v->type = TDB_VAL_TEXT;
+      } else if (v->type != TDB_VAL_TEXT) {
         const char *t = tdb_value_as_text(v);
-        tdb_value_set_text(v, t ? t : "", -1, 1);
+        char *dup = t ? tdb_strdup(t) : NULL;
+        tdb_value_set_text(v, dup ? dup : "", -1, 1);
+        tdb_mfree(dup);
       }
       if (ts->length > 0 && v->u.s.n > ts->length) {
         if (why) *why = "string longer than declared length";
         return TDB_CONSTRAINT;
       }
       return TDB_OK;
+    }
+    case TDB_T_XML: {
+      /* shape check: must be well-formed-ish (starts with '<', balanced tag
+      ** count) — a real XML parser is left to an extension. */
+      if (v->type != TDB_VAL_TEXT) {
+        const char *t = tdb_value_as_text(v);
+        tdb_value_set_text(v, t ? t : "", -1, 1);
+      }
+      const char *s = v->u.s.p ? v->u.s.p : "";
+      while (*s && isspace((unsigned char)*s)) s++;
+      if (*s != '<') { if (why) *why = "XML must begin with '<'"; return TDB_MISMATCH; }
+      int depth = 0;
+      for (const char *q = s; *q; q++) {
+        if (*q == '<') { if (q[1] == '/') depth--; else if (q[1] != '?' && q[1] != '!') depth++; }
+        else if (*q == '/' && q[1] == '>') depth--;
+      }
+      if (depth != 0) { if (why) *why = "unbalanced XML tags"; return TDB_MISMATCH; }
+      return TDB_OK;
+    }
+    case TDB_T_INTERVAL: {
+      /* ISO-8601 duration form ("P1Y2M3DT4H5M6S") or simple "N unit" form. */
+      if (v->type == TDB_VAL_INT) return TDB_OK;       /* seconds since epoch */
+      if (v->type != TDB_VAL_TEXT) {
+        const char *t = tdb_value_as_text(v);
+        tdb_value_set_text(v, t ? t : "", -1, 1);
+      }
+      const char *s = v->u.s.p; int has_digit = 0;
+      for (; *s; s++) {
+        if (isdigit((unsigned char)*s)) has_digit = 1;
+        else if (!strchr("PYMDTHSWnsecmidayhouroweINTERVAL- :.+", *s)) {
+          if (why) *why = "malformed INTERVAL"; return TDB_MISMATCH;
+        }
+      }
+      if (!has_digit) { if (why) *why = "malformed INTERVAL"; return TDB_MISMATCH; }
+      return TDB_OK;
+    }
+    case TDB_T_BIT:
+    case TDB_T_VARBIT: {
+      /* accept '101' text, x'AB' blob, or already-bit blob */
+      if (v->type == TDB_VAL_TEXT) {
+        for (int i = 0; i < v->u.s.n; i++)
+          if (v->u.s.p[i] != '0' && v->u.s.p[i] != '1') {
+            if (why) *why = "BIT string must contain only 0/1";
+            return TDB_MISMATCH;
+          }
+        if (ts->id == TDB_T_BIT && ts->length > 0 && v->u.s.n != ts->length) {
+          if (why) *why = "BIT(N) length mismatch";
+          return TDB_CONSTRAINT;
+        }
+        if (ts->id == TDB_T_VARBIT && ts->length > 0 && v->u.s.n > ts->length) {
+          if (why) *why = "BIT VARYING(N) too long";
+          return TDB_CONSTRAINT;
+        }
+        return TDB_OK;
+      }
+      if (v->type == TDB_VAL_BLOB) return TDB_OK;
+      if (why) *why = "not a bit string";
+      return TDB_MISMATCH;
     }
     case TDB_T_UUID: {
       if (v->type == TDB_VAL_TEXT) {

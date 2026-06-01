@@ -124,11 +124,12 @@ typedef struct tdb_op {
 
 /* ---- eligibility: reject anything the simple operators can't stream ---- */
 
-/* True if `e` contains a subquery — the streaming operators don't run those. */
+/* True if `e` contains something the streaming operators don't run:
+** subqueries and window functions both require full materialization. */
 static int expr_blocks_stream(const tdb_expr *e) {
   if (!e) return 0;
   switch (e->kind) {
-    case EX_SUBQUERY: case EX_EXISTS:
+    case EX_SUBQUERY: case EX_EXISTS: case EX_WINDOW:
       return 1;
     case EX_IN:
       if (e->subquery) return 1;
@@ -159,7 +160,10 @@ static int from_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   for (tdb_src *s = q->from; s; s = s->next) {
     if (s->subquery || !s->table || s->as_of) return 0;
     if (find_cte(st, s->table)) return 0;                /* CTE name shadows a table */
-    if (!tdb_catalog_find_table(db->cat, s->table)) return 0;   /* view / missing */
+    tdb_table *_st_t = tdb_catalog_find_table(db->cat, s->table);
+    if (!_st_t) return 0;   /* view / missing */
+    if (_st_t->partition_kind == TDB_PART_HASH && _st_t->partition_count > 0)
+      return 0;             /* partitioned parents must materialize */
     if (n > 0 && s->join != JOIN_INNER && s->join != JOIN_CROSS && s->join != JOIN_LEFT) return 0;
     if ((s->join == JOIN_INNER || s->join == JOIN_LEFT) && expr_blocks_stream(s->on)) return 0;
     if (++n > MAXSRC) return 0;
@@ -666,6 +670,13 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
   qctx Q; memset(&Q, 0, sizeof(Q));
   for (tdb_src *s = q->from; s; s = s->next) {
     tdb_table *t = tdb_catalog_find_table(db->cat, s->table);
+    if (db->current_user &&
+        !tdb_acl_check(tdb_catalog_acl(db->cat), db->current_user,
+                       "SELECT", TDB_ACL_TABLE, s->table)) {
+      tdb_db_seterr(db, "permission denied: SELECT on table '%s' for user '%s'",
+                    s->table, db->current_user);
+      return NULL;
+    }
     qsrc *qs = &Q.src[Q.nsrc];
     qs->tbl = t; qs->alias = s->alias; qs->base = Q.totalcols; qs->ncol = t->ncol;
     qs->join = s->join; qs->on = s->on;

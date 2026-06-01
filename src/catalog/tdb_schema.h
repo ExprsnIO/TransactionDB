@@ -125,6 +125,14 @@ typedef struct tdb_table {
   char *before_insert_lua;
   char *before_update_lua;
   char *before_delete_lua;
+
+  /* Phase 11: physical placement and partitioning. */
+  char    *tablespace;          /* tablespace name, or NULL */
+  char    *compression;         /* "zstd", "lz4", "off", etc., or NULL */
+  int      partition_kind;      /* tdb_partition_kind: 0 none, 1 RANGE, 2 LIST, 3 HASH */
+  char   **partition_cols;
+  int      npart_col;
+  int      partition_count;     /* number of children (HASH); 0 = unpartitioned */
 } tdb_table;
 
 typedef struct tdb_view {

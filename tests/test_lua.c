@@ -57,6 +57,27 @@ static void test_procedure(void) {
   tdb_close(db);
 }
 
+/* Lua's tdb.prepare/bind/step/finalize: a stored procedure that drives a
+** parameterized prepared statement from inside a Lua routine. */
+static void test_prepared_in_lua(void) {
+  tdb_db *db; tdb_open(":memory:", &db);
+  exec(db, "CREATE TABLE accts (id INTEGER PRIMARY KEY, owner TEXT, balance INTEGER)");
+  exec(db, "INSERT INTO accts VALUES (1,'alice',100),(2,'bob',50),(3,'carol',75)");
+
+  /* sum_for(owner_name) — Lua-side prepared statement with a bind */
+  TDB_CHECK_EQ(exec(db,
+    "CREATE FUNCTION sum_for(name) LANGUAGE LUA AS $$ "
+    "  local s = tdb.prepare('SELECT balance FROM accts WHERE owner = ?') "
+    "  s:bind(1, name) "
+    "  local total = 0 "
+    "  while true do local r = s:step(); if r == nil then break end; total = total + r.balance end "
+    "  s:finalize() "
+    "  return total $$"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT sum_for('alice')"), 100);
+  TDB_CHECK_EQ(scalar(db, "SELECT sum_for('bob')"), 50);
+  tdb_close(db);
+}
+
 static void test_persist_function(void) {
   const char *path = "test_lua.db";
   remove(path); remove("test_lua.db-wal");
@@ -74,6 +95,7 @@ static tdb_test_case cases[] = {
   {"scalar_function", test_scalar_function},
   {"nested_query", test_nested_query},
   {"procedure", test_procedure},
+  {"prepared_in_lua", test_prepared_in_lua},
   {"persist_function", test_persist_function},
 };
 TDB_MAIN(cases)

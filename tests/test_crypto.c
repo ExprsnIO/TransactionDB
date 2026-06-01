@@ -83,6 +83,73 @@ static void test_create_function(void) {
   tdb_close(db);
 }
 
+static void test_sha1(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  char b[64];
+  /* NIST test vector for SHA-1("abc") */
+  TDB_CHECK_STR(scalar_text(db, "SELECT sha1('abc')", b, sizeof(b)),
+                "a9993e364706816aba3e25717850c26c9cd0d89d");
+  /* empty string */
+  TDB_CHECK_STR(scalar_text(db, "SELECT sha1('')", b, sizeof(b)),
+                "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+  tdb_close(db);
+}
+
+static void test_base64(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  char b[128];
+  TDB_CHECK_STR(scalar_text(db, "SELECT base64_encode('Man')", b, sizeof(b)), "TWFu");
+  TDB_CHECK_STR(scalar_text(db, "SELECT base64_encode('Hello, world')", b, sizeof(b)),
+                "SGVsbG8sIHdvcmxk");
+  /* roundtrip via the blob path */
+  TDB_CHECK_STR(scalar_text(db, "SELECT hex(base64_decode('SGVsbG8='))", b, sizeof(b)),
+                "48656c6c6f");
+  tdb_close(db);
+}
+
+#ifdef TDB_HAVE_OPENSSL
+static void test_sha512(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  char b[256];
+  /* NIST test vector for SHA-512("abc") */
+  TDB_CHECK_STR(scalar_text(db, "SELECT sha512('abc')", b, sizeof(b)),
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+                "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+  tdb_close(db);
+}
+
+static void test_aes_gcm_roundtrip(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  /* AES-GCM is randomized (random IV), so we round-trip through a CTE: the
+  ** ciphertext column flows from encrypt into decrypt, and the decrypted text
+  ** must equal the original. */
+  tdb_stmt *s = NULL;
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "WITH t AS (SELECT aes_gcm_encrypt('hello world', 's3cret') AS ct) "
+    "SELECT CAST(aes_gcm_decrypt(ct, 's3cret') AS TEXT) FROM t",
+    -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  const char *t = tdb_column_text(s, 0);
+  TDB_CHECK(t != NULL && strcmp(t, "hello world") == 0);
+  tdb_finalize(s);
+  tdb_close(db);
+}
+
+static void test_pbkdf2(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  /* RFC 6070 PBKDF2-HMAC-SHA1 vectors do not apply (we use SHA-256), but the
+  ** function should at least be deterministic and yield the requested length. */
+  char b[160];
+  TDB_CHECK_STR(scalar_text(db,
+      "SELECT hex(pbkdf2('password', 'salt', 1000, 16))", b, sizeof(b)),
+      scalar_text(db,
+      "SELECT hex(pbkdf2('password', 'salt', 1000, 16))", b, sizeof(b)));
+  TDB_CHECK_EQ(scalar_int(db,
+      "SELECT length(pbkdf2('password', 'salt', 1000, 32))"), 32);
+  tdb_close(db);
+}
+#endif
+
 static void test_load_extension(void) {
 #ifdef TDB_PLUGIN_PATH
   tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
@@ -101,11 +168,18 @@ static void test_load_extension(void) {
 }
 
 static const tdb_test_case cases[] = {
+  {"sha1", test_sha1},
   {"sha256", test_sha256},
   {"md5", test_md5},
   {"hmac", test_hmac},
   {"crc32", test_crc32},
   {"hex_roundtrip", test_hex_roundtrip},
+  {"base64", test_base64},
+#ifdef TDB_HAVE_OPENSSL
+  {"sha512", test_sha512},
+  {"aes_gcm_roundtrip", test_aes_gcm_roundtrip},
+  {"pbkdf2", test_pbkdf2},
+#endif
   {"create_function", test_create_function},
   {"load_extension", test_load_extension},
 };

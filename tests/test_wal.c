@@ -117,9 +117,48 @@ static void test_checkpoint(void) {
   remove(dbpath); remove(wpath);
 }
 
+/* v2 frames carry a per-frame physical size and codec id. The build wires
+** to zstd via tdb_compress; in passthrough mode (TDB_COMP_NONE) the frame
+** payload equals the page size and codec=0. Either way: round-trip + replay
+** must reproduce the committed page bytes. */
+static void test_compressed_frames(void) {
+  const char *path = "test_wal_compressed.wal";
+  remove(path);
+  tdb_file *f = open_file(path, TDB_OPEN_READWRITE | TDB_OPEN_CREATE);
+  TDB_CHECK(f != NULL);
+  tdb_wal *w = NULL;
+  TDB_CHECK_EQ(tdb_wal_open(f, PS, &w), TDB_OK);
+
+  /* highly compressible page — zeros */
+  uint8_t buf[PS]; memset(buf, 0, sizeof(buf));
+  TDB_CHECK_EQ(tdb_wal_append(w, 7, buf, 1, 8), TDB_OK);
+  TDB_CHECK_EQ(tdb_wal_sync(w), TDB_OK);
+
+  uint8_t out[PS]; memset(out, 0xff, sizeof(out));
+  int found = 0;
+  TDB_CHECK_EQ(tdb_wal_read_page(w, 7, out, &found), TDB_OK);
+  TDB_CHECK(found);
+  for (int i = 0; i < PS; i++) TDB_CHECK_EQ(out[i], 0);
+
+  tdb_wal_close(w); tdb_file_close(f);
+
+  /* reopen + replay */
+  f = open_file(path, TDB_OPEN_READWRITE);
+  TDB_CHECK_EQ(tdb_wal_open(f, PS, &w), TDB_OK);
+  memset(out, 0xff, sizeof(out));
+  found = 0;
+  TDB_CHECK_EQ(tdb_wal_read_page(w, 7, out, &found), TDB_OK);
+  TDB_CHECK(found);
+  for (int i = 0; i < PS; i++) TDB_CHECK_EQ(out[i], 0);
+  TDB_CHECK_EQ(tdb_wal_db_size(w), 8u);
+  tdb_wal_close(w); tdb_file_close(f);
+  remove(path);
+}
+
 static tdb_test_case cases[] = {
   {"append_read_recover", test_append_read_recover},
   {"uncommitted_discarded", test_uncommitted_discarded},
   {"checkpoint", test_checkpoint},
+  {"compressed_frames", test_compressed_frames},
 };
 TDB_MAIN(cases)

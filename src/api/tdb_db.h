@@ -87,6 +87,7 @@ struct tdb_db {
   int          autocommit; /* 1 = no explicit BEGIN in effect */
   int          flags;
   char        *path;
+  char        *current_user; /* identity for ACL checks; NULL = superuser */
   char         errmsg[256];
   tdb_mutex   *mu;         /* serializes API calls: makes one tdb_db thread-safe */
 };

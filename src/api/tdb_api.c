@@ -100,8 +100,22 @@ int tdb_close(tdb_db *db) {
   if (db->env) tdb_env_release(db->env);
   if (db->mu) tdb_mutex_free(db->mu);
   tdb_mfree(db->path);
+  tdb_mfree(db->current_user);
   tdb_mfree(db);
   return TDB_OK;
+}
+
+int tdb_set_user(tdb_db *db, const char *name) {
+  if (!db) return TDB_MISUSE;
+  db_lock(db);
+  tdb_mfree(db->current_user);
+  db->current_user = (name && *name) ? tdb_strdup(name) : NULL;
+  db_unlock(db);
+  return TDB_OK;
+}
+
+const char *tdb_get_user(tdb_db *db) {
+  return db ? db->current_user : NULL;
 }
 
 const char *tdb_errmsg(tdb_db *db) {

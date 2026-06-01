@@ -1,5 +1,5 @@
 /*
-** tdb_catalog.h — the system catalog (schema persistence).
+** tdb_catalog.h — the system catalog (schema persistence and ACLs).
 **
 ** Schema objects (tables, views, routines) are stored in a dedicated catalog
 ** b-tree — the analogue of sqlite_master — whose root page is recorded in the
@@ -15,6 +15,7 @@
 #define TDB_CATALOG_H
 
 #include "tdb_schema.h"
+#include "tdb_acl.h"
 #include "../storage/tdb_pager.h"
 
 typedef struct tdb_catalog tdb_catalog;
@@ -49,5 +50,10 @@ void       tdb_catalog_drop_view(tdb_catalog *c, const char *name);
 ** name (used by ALTER TABLE ... RENAME TO). */
 int        tdb_catalog_update_table(tdb_catalog *c, tdb_table *t);
 int        tdb_catalog_update_table_as(tdb_catalog *c, const char *find_name, tdb_table *t);
+
+/* The in-memory ACL list (mutated by GRANT/REVOKE; persisted via the
+** catalog b-tree under CAT_GRANT records). */
+tdb_acl   *tdb_catalog_acl(tdb_catalog *c);
+int        tdb_catalog_acl_persist(tdb_catalog *c, const tdb_acl_entry *e);
 
 #endif /* TDB_CATALOG_H */

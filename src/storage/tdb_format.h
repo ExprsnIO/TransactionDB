@@ -110,4 +110,14 @@
 #define TDB_WAL_FR_CRC1        16  /* u32 rolling checksum-1 */
 #define TDB_WAL_FR_CRC2        20  /* u32 rolling checksum-2 */
 
+/* WAL format versions: v1 (the original) writes each frame with a fixed
+** page_size payload right after the frame header. v2 prefixes the payload
+** with a u32 physical_size (the bytes actually on disk; ≤ page_size) and
+** a u8 codec id (TDB_COMP_NONE / TDB_COMP_ZSTD); the rest of the header is
+** unchanged. The format-version field in the WAL header tells the recovery
+** path which layout to expect. */
+#define TDB_WAL_VERSION_V1        1u
+#define TDB_WAL_VERSION_V2        2u
+#define TDB_WAL_V2_PAYLOAD_HDR    5u   /* u32 size + u8 codec */
+
 #endif /* TDB_FORMAT_H */

@@ -41,6 +41,21 @@ tdb_table *tdb_ast_to_table(const tdb_create_table *ct, char **err) {
 
   if (ct->check_sql) t->check_sql = tdb_strdup(ct->check_sql);
   t->columnar = ct->columnar;
+  if (ct->tablespace) t->tablespace = tdb_strdup(ct->tablespace);
+  if (ct->compression) t->compression = tdb_strdup(ct->compression);
+  t->partition_kind = (int)ct->partition_kind;
+  if (ct->npart_col > 0) {
+    t->partition_cols = (char **)tdb_calloc(sizeof(char *) * (size_t)ct->npart_col);
+    if (!t->partition_cols) { tdb_table_free(t); if (err) *err = tdb_strdup("out of memory"); return NULL; }
+    for (int i = 0; i < ct->npart_col; i++) t->partition_cols[i] = tdb_strdup(ct->partition_cols[i]);
+    t->npart_col = ct->npart_col;
+  }
+  /* Default partition count for HASH partitioning is 4 if unspecified. */
+  if (ct->partition_kind == TDB_PART_HASH) {
+    t->partition_count = ct->partition_count > 0 ? ct->partition_count : 4;
+  } else if (ct->partition_kind != TDB_PART_NONE) {
+    t->partition_count = ct->partition_count;
+  }
 
   /* system-versioned temporal table: add hidden period bound columns */
   if (ct->system_versioning) {

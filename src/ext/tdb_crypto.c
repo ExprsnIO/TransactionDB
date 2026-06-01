@@ -13,6 +13,7 @@
 #ifdef TDB_HAVE_OPENSSL
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/hmac.h>
 #endif
 
 /* ============================ SHA-256 ================================= */
@@ -168,6 +169,55 @@ static void md5(const uint8_t *p, size_t n, uint8_t out[16]) {
   }
 }
 
+/* =============================== SHA-1 ================================ */
+
+typedef struct { uint32_t h[5]; uint64_t len; uint8_t buf[64]; size_t n; } sha1_ctx;
+
+static void sha1_block(sha1_ctx *c, const uint8_t *p) {
+  uint32_t w[80];
+  for (int i = 0; i < 16; i++)
+    w[i] = (uint32_t)p[i*4] << 24 | (uint32_t)p[i*4+1] << 16 |
+           (uint32_t)p[i*4+2] << 8 | (uint32_t)p[i*4+3];
+  for (int i = 16; i < 80; i++) {
+    uint32_t v = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16];
+    w[i] = (v << 1) | (v >> 31);
+  }
+  uint32_t a=c->h[0], b=c->h[1], cc=c->h[2], d=c->h[3], e=c->h[4];
+  for (int i = 0; i < 80; i++) {
+    uint32_t f, k;
+    if (i < 20)      { f = (b & cc) | (~b & d);          k = 0x5a827999u; }
+    else if (i < 40) { f = b ^ cc ^ d;                   k = 0x6ed9eba1u; }
+    else if (i < 60) { f = (b & cc) | (b & d) | (cc & d);k = 0x8f1bbcdcu; }
+    else             { f = b ^ cc ^ d;                   k = 0xca62c1d6u; }
+    uint32_t t = ((a << 5) | (a >> 27)) + f + e + k + w[i];
+    e = d; d = cc; cc = (b << 30) | (b >> 2); b = a; a = t;
+  }
+  c->h[0]+=a; c->h[1]+=b; c->h[2]+=cc; c->h[3]+=d; c->h[4]+=e;
+}
+
+static void sha1(const uint8_t *p, size_t n, uint8_t out[20]) {
+  sha1_ctx c;
+  c.h[0]=0x67452301u; c.h[1]=0xefcdab89u; c.h[2]=0x98badcfeu;
+  c.h[3]=0x10325476u; c.h[4]=0xc3d2e1f0u;
+  c.len = (uint64_t)n; c.n = 0;
+  size_t full = n / 64;
+  for (size_t i = 0; i < full; i++) sha1_block(&c, p + i*64);
+  uint8_t tail[128]; size_t r = n - full*64;
+  memcpy(tail, p + full*64, r);
+  tail[r++] = 0x80;
+  size_t padto = (r <= 56) ? 56 : 120;
+  while (r < padto) tail[r++] = 0;
+  uint64_t bits = (uint64_t)n * 8;
+  for (int i = 0; i < 8; i++) tail[r++] = (uint8_t)(bits >> (56 - i*8));
+  for (size_t i = 0; i < r; i += 64) sha1_block(&c, tail + i);
+  for (int i = 0; i < 5; i++) {
+    out[i*4]   = (uint8_t)(c.h[i] >> 24);
+    out[i*4+1] = (uint8_t)(c.h[i] >> 16);
+    out[i*4+2] = (uint8_t)(c.h[i] >> 8);
+    out[i*4+3] = (uint8_t)(c.h[i]);
+  }
+}
+
 /* ============================== CRC32 ================================= */
 
 static uint32_t crc32_bytes(const uint8_t *p, size_t n) {
@@ -207,6 +257,11 @@ static void result_hex(tdb_context *ctx, const uint8_t *p, int n) {
 }
 
 /* ============================ functions =============================== */
+
+static void fn_sha1(tdb_context *ctx, int argc, tdb_value **argv) {
+  (void)argc; int n; const unsigned char *p = arg_bytes(argv[0], &n);
+  uint8_t d[20]; sha1(p, (size_t)n, d); result_hex(ctx, d, 20);
+}
 
 static void fn_sha256(tdb_context *ctx, int argc, tdb_value **argv) {
   (void)argc; int n; const unsigned char *p = arg_bytes(argv[0], &n);
@@ -258,6 +313,69 @@ static void fn_unhex(tdb_context *ctx, int argc, tdb_value **argv) {
     out[i/2] = (uint8_t)(hi << 4 | lo);
   }
   tdb_result_blob(ctx, out, (int)(len / 2));
+  free(out);
+}
+
+/* =============================== Base64 =============================== */
+
+static const char k_b64[] =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int b64val(int c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+static void fn_base64_encode(tdb_context *ctx, int argc, tdb_value **argv) {
+  (void)argc;
+  int n; const unsigned char *p = arg_bytes(argv[0], &n);
+  size_t olen = (size_t)((n + 2) / 3) * 4;
+  char *out = (char *)malloc(olen + 1);
+  if (!out) { tdb_result_error(ctx, "out of memory"); return; }
+  size_t i = 0, j = 0;
+  while ((int)i + 3 <= n) {
+    uint32_t v = ((uint32_t)p[i] << 16) | ((uint32_t)p[i+1] << 8) | (uint32_t)p[i+2];
+    out[j++] = k_b64[(v >> 18) & 63];
+    out[j++] = k_b64[(v >> 12) & 63];
+    out[j++] = k_b64[(v >> 6) & 63];
+    out[j++] = k_b64[v & 63];
+    i += 3;
+  }
+  if ((int)i < n) {
+    uint32_t v = (uint32_t)p[i] << 16;
+    if ((int)i + 1 < n) v |= (uint32_t)p[i+1] << 8;
+    out[j++] = k_b64[(v >> 18) & 63];
+    out[j++] = k_b64[(v >> 12) & 63];
+    out[j++] = ((int)i + 1 < n) ? k_b64[(v >> 6) & 63] : '=';
+    out[j++] = '=';
+  }
+  out[j] = '\0';
+  tdb_result_text(ctx, out, (int)j);
+  free(out);
+}
+
+static void fn_base64_decode(tdb_context *ctx, int argc, tdb_value **argv) {
+  (void)argc;
+  const char *s = tdb_value_text(argv[0]);
+  if (!s) { tdb_result_null(ctx); return; }
+  size_t n = strlen(s);
+  uint8_t *out = (uint8_t *)malloc(n + 1);
+  if (!out) { tdb_result_error(ctx, "out of memory"); return; }
+  size_t j = 0; uint32_t v = 0; int bits = 0;
+  for (size_t i = 0; i < n; i++) {
+    int c = (unsigned char)s[i];
+    if (c == '=' || c == '\n' || c == '\r' || c == ' ') continue;
+    int d = b64val(c);
+    if (d < 0) { free(out); tdb_result_error(ctx, "base64: invalid character"); return; }
+    v = (v << 6) | (uint32_t)d;
+    bits += 6;
+    if (bits >= 8) { bits -= 8; out[j++] = (uint8_t)((v >> bits) & 0xff); }
+  }
+  tdb_result_blob(ctx, out, (int)j);
   free(out);
 }
 
@@ -313,19 +431,120 @@ static void fn_aes(tdb_context *ctx, int enc, tdb_value **argv) {
 
 static void fn_aes_encrypt(tdb_context *ctx, int argc, tdb_value **argv) { (void)argc; fn_aes(ctx, 1, argv); }
 static void fn_aes_decrypt(tdb_context *ctx, int argc, tdb_value **argv) { (void)argc; fn_aes(ctx, 0, argv); }
+
+/* sha512 / sha384 — hex-encoded digest, OpenSSL-backed. */
+static void fn_sha_evp(tdb_context *ctx, int argc, tdb_value **argv, const EVP_MD *md, int dlen) {
+  (void)argc;
+  int n; const unsigned char *p = arg_bytes(argv[0], &n);
+  unsigned char d[64]; unsigned int outl = 0;
+  EVP_MD_CTX *c = EVP_MD_CTX_new();
+  if (!c || EVP_DigestInit_ex(c, md, NULL) != 1 ||
+      EVP_DigestUpdate(c, p, (size_t)n) != 1 ||
+      EVP_DigestFinal_ex(c, d, &outl) != 1) {
+    if (c) EVP_MD_CTX_free(c);
+    tdb_result_error(ctx, "EVP digest failed");
+    return;
+  }
+  EVP_MD_CTX_free(c);
+  result_hex(ctx, d, (int)outl < dlen ? (int)outl : dlen);
+}
+static void fn_sha512(tdb_context *ctx, int argc, tdb_value **argv) { fn_sha_evp(ctx, argc, argv, EVP_sha512(), 64); }
+static void fn_sha384(tdb_context *ctx, int argc, tdb_value **argv) { fn_sha_evp(ctx, argc, argv, EVP_sha384(), 48); }
+
+/* AES-256-GCM authenticated encryption. The 12-byte IV is randomly generated
+** and prepended to the ciphertext; the 16-byte tag is appended. Key is
+** SHA-256(passphrase). aes_gcm_encrypt(plaintext, key) returns iv||ct||tag;
+** aes_gcm_decrypt(blob, key) reverses it (or returns NULL on auth failure). */
+static void fn_aes_gcm_encrypt(tdb_context *ctx, int argc, tdb_value **argv) {
+  (void)argc;
+  int dn; const unsigned char *data = arg_bytes(argv[0], &dn);
+  int kn; const unsigned char *kp = arg_bytes(argv[1], &kn);
+  uint8_t key[32]; sha256(kp, (size_t)kn, key);
+  uint8_t iv[12]; if (RAND_bytes(iv, 12) != 1) { tdb_result_error(ctx, "RAND_bytes failed"); return; }
+  EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+  uint8_t *out = (uint8_t *)malloc((size_t)dn + 12 + 16);
+  int outl = 0, finl = 0, ok = 0;
+  if (c && out &&
+      EVP_EncryptInit_ex(c, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+      EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+      EVP_EncryptInit_ex(c, NULL, NULL, key, iv) == 1 &&
+      EVP_EncryptUpdate(c, out + 12, &outl, data, dn) == 1 &&
+      EVP_EncryptFinal_ex(c, out + 12 + outl, &finl) == 1 &&
+      EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, 16, out + 12 + outl + finl) == 1) {
+    memcpy(out, iv, 12);
+    tdb_result_blob(ctx, out, 12 + outl + finl + 16);
+    ok = 1;
+  }
+  if (c) EVP_CIPHER_CTX_free(c);
+  free(out);
+  if (!ok) tdb_result_error(ctx, "aes_gcm_encrypt failed");
+}
+
+static void fn_aes_gcm_decrypt(tdb_context *ctx, int argc, tdb_value **argv) {
+  (void)argc;
+  int dn; const unsigned char *data = arg_bytes(argv[0], &dn);
+  int kn; const unsigned char *kp = arg_bytes(argv[1], &kn);
+  if (dn < 12 + 16) { tdb_result_error(ctx, "aes_gcm_decrypt: input too short"); return; }
+  uint8_t key[32]; sha256(kp, (size_t)kn, key);
+  int ctlen = dn - 12 - 16;
+  EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+  uint8_t *out = (uint8_t *)malloc((size_t)ctlen + 16);
+  int outl = 0, finl = 0, ok = 0;
+  if (c && out &&
+      EVP_DecryptInit_ex(c, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+      EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+      EVP_DecryptInit_ex(c, NULL, NULL, key, data /* iv */) == 1 &&
+      EVP_DecryptUpdate(c, out, &outl, data + 12, ctlen) == 1 &&
+      EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_TAG, 16, (void *)(data + 12 + ctlen)) == 1 &&
+      EVP_DecryptFinal_ex(c, out + outl, &finl) == 1) {
+    tdb_result_blob(ctx, out, outl + finl);
+    ok = 1;
+  }
+  if (c) EVP_CIPHER_CTX_free(c);
+  free(out);
+  if (!ok) tdb_result_null(ctx);   /* authentication failure -> NULL */
+}
+
+/* PBKDF2-HMAC-SHA256(password, salt, iters, dklen) -> derived key blob. */
+static void fn_pbkdf2(tdb_context *ctx, int argc, tdb_value **argv) {
+  (void)argc;
+  const char *pw = tdb_value_text(argv[0]); if (!pw) pw = "";
+  int sn; const unsigned char *salt = arg_bytes(argv[1], &sn);
+  int64_t iters = tdb_value_int64(argv[2]);
+  int64_t dklen = tdb_value_int64(argv[3]);
+  if (iters <= 0 || iters > 10000000 || dklen <= 0 || dklen > 4096) {
+    tdb_result_error(ctx, "pbkdf2: bad iters/dklen"); return;
+  }
+  unsigned char *out = (unsigned char *)malloc((size_t)dklen);
+  if (!out) { tdb_result_error(ctx, "out of memory"); return; }
+  if (PKCS5_PBKDF2_HMAC(pw, (int)strlen(pw), salt, sn, (int)iters,
+                        EVP_sha256(), (int)dklen, out) != 1) {
+    free(out); tdb_result_error(ctx, "PKCS5_PBKDF2_HMAC failed"); return;
+  }
+  tdb_result_blob(ctx, out, (int)dklen);
+  free(out);
+}
 #endif
 
 int tdb_register_crypto(tdb_db *db) {
+  tdb_create_function(db, "sha1", 1, fn_sha1, NULL);
   tdb_create_function(db, "sha256", 1, fn_sha256, NULL);
   tdb_create_function(db, "md5", 1, fn_md5, NULL);
   tdb_create_function(db, "hmac_sha256", 2, fn_hmac_sha256, NULL);
   tdb_create_function(db, "crc32", 1, fn_crc32, NULL);
   tdb_create_function(db, "hex", 1, fn_hex, NULL);
   tdb_create_function(db, "unhex", 1, fn_unhex, NULL);
+  tdb_create_function(db, "base64_encode", 1, fn_base64_encode, NULL);
+  tdb_create_function(db, "base64_decode", 1, fn_base64_decode, NULL);
   tdb_create_function(db, "randomblob", 1, fn_randomblob, NULL);
 #ifdef TDB_HAVE_OPENSSL
+  tdb_create_function(db, "sha384", 1, fn_sha384, NULL);
+  tdb_create_function(db, "sha512", 1, fn_sha512, NULL);
   tdb_create_function(db, "aes_encrypt", 2, fn_aes_encrypt, NULL);
   tdb_create_function(db, "aes_decrypt", 2, fn_aes_decrypt, NULL);
+  tdb_create_function(db, "aes_gcm_encrypt", 2, fn_aes_gcm_encrypt, NULL);
+  tdb_create_function(db, "aes_gcm_decrypt", 2, fn_aes_gcm_decrypt, NULL);
+  tdb_create_function(db, "pbkdf2", 4, fn_pbkdf2, NULL);
 #endif
   return TDB_OK;
 }

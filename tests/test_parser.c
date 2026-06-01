@@ -139,6 +139,83 @@ static void test_txn_drop(void) {
   tdb_arena_free(a);
 }
 
+static void test_phase11_syntax(void) {
+  tdb_arena *a = tdb_arena_new(4096);
+  tdb_ast_stmt *s;
+
+  /* TRUNCATE / ANALYZE / REINDEX / COMMENT / LOCK */
+  s = parse1(a, "TRUNCATE TABLE customers RESTART IDENTITY CASCADE");
+  TDB_CHECK_EQ(s->kind, ST_TRUNCATE);
+  TDB_CHECK_STR(s->u.truncate.name, "customers");
+  TDB_CHECK_EQ(s->u.truncate.restart, 1);
+  TDB_CHECK_EQ(s->u.truncate.cascade, 1);
+
+  s = parse1(a, "ANALYZE orders");
+  TDB_CHECK_EQ(s->kind, ST_ANALYZE);
+  TDB_CHECK_STR(s->u.analyze.name, "orders");
+
+  s = parse1(a, "REINDEX INDEX i_users_email");
+  TDB_CHECK_EQ(s->kind, ST_REINDEX);
+  TDB_CHECK_EQ(s->u.reindex.is_index, 1);
+
+  s = parse1(a, "COMMENT ON TABLE accounts IS 'audited daily'");
+  TDB_CHECK_EQ(s->kind, ST_COMMENT);
+  TDB_CHECK_EQ(s->u.comment_on.on_kind, 1);
+  TDB_CHECK_STR(s->u.comment_on.body, "audited daily");
+
+  s = parse1(a, "LOCK TABLE inventory IN EXCLUSIVE MODE");
+  TDB_CHECK_EQ(s->kind, ST_LOCK_TABLE);
+  TDB_CHECK_EQ(s->u.lock_tbl.exclusive, 1);
+
+  /* TABLESPACE + PARTITION BY + COMPRESSION on CREATE TABLE */
+  s = parse1(a,
+    "CREATE TABLE m (id INTEGER PRIMARY KEY, region TEXT, ts TIMESTAMP) "
+    "TABLESPACE ts_warm "
+    "WITH COMPRESSION=zstd "
+    "PARTITION BY RANGE (ts)");
+  TDB_CHECK_EQ(s->kind, ST_CREATE_TABLE);
+  tdb_create_table *ct = s->u.create_table;
+  TDB_CHECK_STR(ct->tablespace, "ts_warm");
+  TDB_CHECK_STR(ct->compression, "zstd");
+  TDB_CHECK_EQ(ct->partition_kind, TDB_PART_RANGE);
+  TDB_CHECK_EQ(ct->npart_col, 1);
+  TDB_CHECK_STR(ct->partition_cols[0], "ts");
+
+  s = parse1(a, "CREATE TABLESPACE warm LOCATION '/srv/db/warm'");
+  TDB_CHECK_EQ(s->kind, ST_CREATE_TABLESPACE);
+  TDB_CHECK_STR(s->u.create_tablespace.name, "warm");
+  TDB_CHECK_STR(s->u.create_tablespace.location, "/srv/db/warm");
+
+  s = parse1(a, "DROP TABLESPACE IF EXISTS warm");
+  TDB_CHECK_EQ(s->kind, ST_DROP_TABLESPACE);
+  TDB_CHECK_EQ(s->u.drop_tablespace.if_exists, 1);
+
+  /* GRANT / REVOKE (parsed; semantics are stubs) */
+  s = parse1(a, "GRANT SELECT, INSERT ON TABLE t TO alice");
+  TDB_CHECK_EQ(s->kind, ST_GRANT);
+  TDB_CHECK_STR(s->u.grant.grantee, "alice");
+
+  s = parse1(a, "REVOKE INSERT ON TABLE t FROM bob");
+  TDB_CHECK_EQ(s->kind, ST_REVOKE);
+  TDB_CHECK_STR(s->u.grant.grantee, "bob");
+
+  /* New types parsed via CREATE TABLE */
+  s = parse1(a,
+    "CREATE TABLE x ("
+    " doc XML,"
+    " range INTERVAL,"
+    " flags BIT(8),"
+    " mask  BIT VARYING(64)"
+    ")");
+  TDB_CHECK_EQ(s->kind, ST_CREATE_TABLE);
+  ct = s->u.create_table;
+  TDB_CHECK_EQ(ct->cols[0].type.id, TDB_T_XML);
+  TDB_CHECK_EQ(ct->cols[1].type.id, TDB_T_INTERVAL);
+  TDB_CHECK_EQ(ct->cols[2].type.id, TDB_T_BIT);
+  TDB_CHECK_EQ(ct->cols[3].type.id, TDB_T_VARBIT);
+  tdb_arena_free(a);
+}
+
 static void test_errors_and_tail(void) {
   tdb_arena *a = tdb_arena_new(4096);
   tdb_ast_stmt *s = NULL; char *err = NULL; const char *tail = NULL;
@@ -164,6 +241,7 @@ static tdb_test_case cases[] = {
   {"dml", test_dml},
   {"index_view_routine", test_index_view_routine},
   {"txn_drop", test_txn_drop},
+  {"phase11_syntax", test_phase11_syntax},
   {"errors_and_tail", test_errors_and_tail},
 };
 TDB_MAIN(cases)

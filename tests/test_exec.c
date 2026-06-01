@@ -1606,6 +1606,244 @@ static void test_stream_distinct(void) {
   tdb_close(db);
 }
 
+static void test_hash_partitioning(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+
+  /* CREATE TABLE ... PARTITION BY HASH (id) PARTITIONS 4 spawns 4 child
+  ** tables named "evt__p0..3". */
+  TDB_CHECK_EQ(exec(db,
+    "CREATE TABLE evt (id INTEGER PRIMARY KEY, k TEXT) "
+    "PARTITION BY HASH (id) PARTITIONS 4"), TDB_OK);
+  for (int i = 0; i < 4; i++) {
+    char q[80]; snprintf(q, sizeof(q), "SELECT COUNT(*) FROM evt__p%d", i);
+    TDB_CHECK_EQ(scalar(db, q), 0);
+  }
+
+  /* Insert 12 rows; HASH should distribute them across the 4 children. */
+  for (int i = 1; i <= 12; i++) {
+    char q[100]; snprintf(q, sizeof(q), "INSERT INTO evt VALUES (%d, 'r%d')", i, i);
+    TDB_CHECK_EQ(exec(db, q), TDB_OK);
+  }
+  /* Parent SELECT unions all children. */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM evt"), 12);
+  /* Children are non-empty and total back up to 12. */
+  int64_t sum = 0;
+  for (int i = 0; i < 4; i++) {
+    char q[80]; snprintf(q, sizeof(q), "SELECT COUNT(*) FROM evt__p%d", i);
+    int64_t n = scalar(db, q);
+    TDB_CHECK(n > 0);
+    sum += n;
+  }
+  TDB_CHECK_EQ(sum, 12);
+
+  /* DELETE WHERE id=N — applies to the correct child, parent SELECT reflects it. */
+  TDB_CHECK_EQ(exec(db, "DELETE FROM evt WHERE id = 3"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM evt"), 11);
+
+  /* UPDATE k — value visible through parent SELECT regardless of which child holds the row */
+  TDB_CHECK_EQ(exec(db, "UPDATE evt SET k = 'X' WHERE id = 5"), TDB_OK);
+  tdb_stmt *s = NULL;
+  TDB_CHECK_EQ(tdb_prepare_v2(db, "SELECT k FROM evt WHERE id = 5", -1, &s, NULL), TDB_OK);
+  TDB_CHECK_EQ(tdb_step(s), TDB_ROW);
+  TDB_CHECK_STR(tdb_column_text(s, 0), "X");
+  tdb_finalize(s);
+
+  /* TRUNCATE empties every child. */
+  TDB_CHECK_EQ(exec(db, "TRUNCATE TABLE evt"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM evt"), 0);
+  tdb_close(db);
+}
+
+static void test_acl_grant_revoke(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (1,10),(2,20)"), TDB_OK);
+
+  /* open mode: no user set, all ops allowed */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 2);
+
+  /* set a user with no grants — every op is denied */
+  tdb_set_user(db, "alice");
+  TDB_CHECK_STR(tdb_get_user(db), "alice");
+  TDB_CHECK(exec(db, "SELECT * FROM t") != TDB_OK);
+  TDB_CHECK(exec(db, "INSERT INTO t VALUES (3,30)") != TDB_OK);
+
+  /* grant SELECT only — reads ok, writes still denied */
+  tdb_set_user(db, NULL);
+  TDB_CHECK_EQ(exec(db, "GRANT SELECT ON TABLE t TO alice"), TDB_OK);
+  tdb_set_user(db, "alice");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM t"), 2);
+  TDB_CHECK(exec(db, "INSERT INTO t VALUES (3,30)") != TDB_OK);
+
+  /* grant the rest (comma-list parsing) */
+  tdb_set_user(db, NULL);
+  TDB_CHECK_EQ(exec(db, "GRANT INSERT, UPDATE, DELETE ON TABLE t TO alice"), TDB_OK);
+  tdb_set_user(db, "alice");
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (3,30)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "UPDATE t SET v = v + 1"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "DELETE FROM t WHERE id = 1"), TDB_OK);
+
+  /* revoke INSERT and verify */
+  tdb_set_user(db, NULL);
+  TDB_CHECK_EQ(exec(db, "REVOKE INSERT ON TABLE t FROM alice"), TDB_OK);
+  tdb_set_user(db, "alice");
+  TDB_CHECK(exec(db, "INSERT INTO t VALUES (9,90)") != TDB_OK);
+
+  /* GRANT ALL — broad wildcard */
+  tdb_set_user(db, NULL);
+  TDB_CHECK_EQ(exec(db, "GRANT ALL ON TABLE t TO alice"), TDB_OK);
+  tdb_set_user(db, "alice");
+  TDB_CHECK_EQ(exec(db, "INSERT INTO t VALUES (9,90)"), TDB_OK);
+
+  /* PUBLIC grant is honored for any user */
+  tdb_set_user(db, NULL);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE u (id INTEGER PRIMARY KEY)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "GRANT SELECT ON TABLE u TO PUBLIC"), TDB_OK);
+  tdb_set_user(db, "bob");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM u"), 0);
+  tdb_close(db);
+
+  /* persistence: a GRANT survives reopening the database file */
+  const char *path = "test_acl_persist.db";
+  remove(path); remove("test_acl_persist.db-wal");
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE x (v INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO x VALUES (7)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "GRANT SELECT ON TABLE x TO carol"), TDB_OK);
+  tdb_close(db);
+
+  TDB_CHECK_EQ(tdb_open(path, &db), TDB_OK);
+  tdb_set_user(db, "carol");
+  TDB_CHECK_EQ(scalar(db, "SELECT v FROM x"), 7);
+  tdb_set_user(db, "dave");                 /* unrelated user — still denied */
+  TDB_CHECK(exec(db, "SELECT v FROM x") != TDB_OK);
+  tdb_close(db);
+  remove(path); remove("test_acl_persist.db-wal");
+}
+
+static void test_window_functions(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE s (region TEXT, q INTEGER, amt INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db,
+    "INSERT INTO s VALUES ('east',1,10),('east',2,20),('east',3,30),"
+    "('west',1,5),('west',2,15),('west',3,25)"), TDB_OK);
+
+  /* ROW_NUMBER per partition, ordered by q */
+  tdb_stmt *st = NULL;
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "SELECT region, q, ROW_NUMBER() OVER (PARTITION BY region ORDER BY q) "
+    "FROM s ORDER BY region, q", -1, &st, NULL), TDB_OK);
+  int counters[2] = {0, 0};
+  while (tdb_step(st) == TDB_ROW) {
+    const char *region = tdb_column_text(st, 0);
+    int rn = tdb_column_int(st, 2);
+    TDB_CHECK(region && (region[0] == 'e' || region[0] == 'w'));
+    int *idx = region[0] == 'e' ? &counters[0] : &counters[1];
+    (*idx)++;
+    TDB_CHECK_EQ(rn, *idx);
+  }
+  TDB_CHECK_EQ(counters[0], 3);
+  TDB_CHECK_EQ(counters[1], 3);
+  tdb_finalize(st);
+
+  /* Running SUM per partition ordered by q: east 10,30,60; west 5,20,45 */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "SELECT region, q, SUM(amt) OVER (PARTITION BY region ORDER BY q) "
+    "FROM s ORDER BY region, q", -1, &st, NULL), TDB_OK);
+  int expected[6] = {10, 30, 60, 5, 20, 45};
+  for (int i = 0; i < 6; i++) {
+    TDB_CHECK_EQ(tdb_step(st), TDB_ROW);
+    TDB_CHECK_EQ(tdb_column_int(st, 2), expected[i]);
+  }
+  tdb_finalize(st);
+
+  /* Full-partition SUM (no ORDER BY) — same total for each row in the partition */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "SELECT region, SUM(amt) OVER (PARTITION BY region) "
+    "FROM s ORDER BY region", -1, &st, NULL), TDB_OK);
+  while (tdb_step(st) == TDB_ROW) {
+    const char *r = tdb_column_text(st, 0);
+    int total = tdb_column_int(st, 1);
+    TDB_CHECK(total == (r[0] == 'e' ? 60 : 45));
+  }
+  tdb_finalize(st);
+
+  /* RANK / DENSE_RANK with ties */
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE scores (id INTEGER, v INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO scores VALUES (1,10),(2,20),(3,20),(4,30)"), TDB_OK);
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "SELECT id, RANK() OVER (ORDER BY v), DENSE_RANK() OVER (ORDER BY v) "
+    "FROM scores ORDER BY id", -1, &st, NULL), TDB_OK);
+  int rk[]    = {1, 2, 2, 4};
+  int dense[] = {1, 2, 2, 3};
+  for (int i = 0; i < 4; i++) {
+    TDB_CHECK_EQ(tdb_step(st), TDB_ROW);
+    TDB_CHECK_EQ(tdb_column_int(st, 1), rk[i]);
+    TDB_CHECK_EQ(tdb_column_int(st, 2), dense[i]);
+  }
+  tdb_finalize(st);
+  tdb_close(db);
+}
+
+static void test_recursive_cte(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+
+  /* Generate-series: 1..5. SUM = 15. */
+  TDB_CHECK_EQ(scalar(db,
+    "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL "
+    "  SELECT n+1 FROM t WHERE n < 5) "
+    "SELECT SUM(n) FROM t"), 15);
+
+  /* Bounded factorial — exercises UNION ALL termination and frontier semantics. */
+  TDB_CHECK_EQ(scalar(db,
+    "WITH RECURSIVE f(i, v) AS ( "
+    "  SELECT 1, 1 UNION ALL "
+    "  SELECT i+1, v*(i+1) FROM f WHERE i < 6) "
+    "SELECT v FROM f WHERE i = 6"), 720);
+
+  /* Graph reachability with UNION (DISTINCT) — must terminate even when
+  ** the recursion would otherwise revisit nodes. */
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE edges (src TEXT, dst TEXT)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db,
+    "INSERT INTO edges VALUES ('a','b'),('b','c'),('c','d'),('d','b')"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db,
+    "WITH RECURSIVE reach(node) AS ( "
+    "  SELECT 'a' UNION "
+    "  SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node) "
+    "SELECT COUNT(*) FROM reach"), 4);
+  tdb_close(db);
+}
+
+static void test_phase11_utility(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db,
+    "CREATE TABLE log (id INTEGER PRIMARY KEY, msg TEXT) "
+    "TABLESPACE warm "
+    "WITH COMPRESSION=zstd "
+    "PARTITION BY HASH (id)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO log VALUES (1,'a'),(2,'b'),(3,'c')"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 3);
+
+  /* TRUNCATE empties the table */
+  TDB_CHECK_EQ(exec(db, "TRUNCATE TABLE log"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 0);
+
+  /* ANALYZE / REINDEX / COMMENT are accepted; they do not error on a valid
+  ** table even though their internal effects are stubbed. */
+  TDB_CHECK_EQ(exec(db, "ANALYZE log"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "REINDEX TABLE log"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE log IS 'truncated'"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "LOCK TABLE log IN EXCLUSIVE MODE"), TDB_OK);
+
+  /* CREATE TABLESPACE / DROP TABLESPACE are parsed and accepted. */
+  TDB_CHECK_EQ(exec(db, "CREATE TABLESPACE warm LOCATION '/tmp/warm'"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "DROP TABLESPACE warm"), TDB_OK);
+
+  /* Unknown target rejected */
+  TDB_CHECK(exec(db, "TRUNCATE TABLE nope") != TDB_OK);
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"geospatial", test_geospatial},
   {"spatial_index", test_spatial_index},
@@ -1622,6 +1860,11 @@ static tdb_test_case cases[] = {
   {"returning", test_returning},
   {"cte", test_cte},
   {"ddl_dml_select", test_ddl_dml_select},
+  {"hash_partitioning", test_hash_partitioning},
+  {"acl_grant_revoke", test_acl_grant_revoke},
+  {"window_functions", test_window_functions},
+  {"recursive_cte", test_recursive_cte},
+  {"phase11_utility", test_phase11_utility},
   {"derived_and_view", test_derived_and_view},
   {"outer_joins", test_outer_joins},
   {"setops", test_setops},

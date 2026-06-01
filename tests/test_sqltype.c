@@ -88,6 +88,46 @@ static void test_varchar_and_bool(void) {
   tdb_value_clear(&v);
 }
 
+static void test_phase11_types(void) {
+  /* XML, INTERVAL, BIT, BIT VARYING — new in Phase 11. */
+  TDB_CHECK_EQ(tdb_typespec_parse("XML").id, TDB_T_XML);
+  TDB_CHECK_EQ(tdb_typespec_parse("INTERVAL").id, TDB_T_INTERVAL);
+  TDB_CHECK_EQ(tdb_typespec_parse("BIT(8)").id, TDB_T_BIT);
+  TDB_CHECK_EQ(tdb_typespec_parse("BIT(8)").length, 8);
+  TDB_CHECK_EQ(tdb_typespec_parse("BIT VARYING(32)").id, TDB_T_VARBIT);
+  TDB_CHECK_EQ(tdb_typespec_parse("VARBIT(32)").id, TDB_T_VARBIT);
+
+  /* XML coerce: must begin with '<' and have balanced tags */
+  const char *why = NULL;
+  tdb_typespec tx = tdb_typespec_parse("XML");
+  tdb_value v; tdb_value_init(&v);
+  tdb_value_set_text(&v, "<a>hi</a>", -1, 1);
+  TDB_CHECK_EQ(tdb_typespec_coerce(&v, &tx, &why), TDB_OK);
+  tdb_value_set_text(&v, "not xml", -1, 1);
+  TDB_CHECK_EQ(tdb_typespec_coerce(&v, &tx, &why), TDB_MISMATCH);
+  tdb_value_clear(&v);
+
+  /* BIT(8) coerce: exactly 8 chars of 0/1 */
+  tdb_typespec tb = tdb_typespec_parse("BIT(8)");
+  tdb_value_init(&v);
+  tdb_value_set_text(&v, "10101010", -1, 1);
+  TDB_CHECK_EQ(tdb_typespec_coerce(&v, &tb, &why), TDB_OK);
+  tdb_value_set_text(&v, "10101", -1, 1);
+  TDB_CHECK_EQ(tdb_typespec_coerce(&v, &tb, &why), TDB_CONSTRAINT);
+  tdb_value_set_text(&v, "10102", -1, 1);
+  TDB_CHECK_EQ(tdb_typespec_coerce(&v, &tb, &why), TDB_MISMATCH);
+  tdb_value_clear(&v);
+
+  /* INTERVAL coerce: ISO-8601 duration text */
+  tdb_typespec ti = tdb_typespec_parse("INTERVAL");
+  tdb_value_init(&v);
+  tdb_value_set_text(&v, "P1Y2M3D", -1, 1);
+  TDB_CHECK_EQ(tdb_typespec_coerce(&v, &ti, &why), TDB_OK);
+  tdb_value_set_text(&v, "bogus", -1, 1);
+  TDB_CHECK_EQ(tdb_typespec_coerce(&v, &ti, &why), TDB_MISMATCH);
+  tdb_value_clear(&v);
+}
+
 static void test_null_passes(void) {
   tdb_typespec ti = tdb_typespec_parse("INTEGER");
   const char *why = NULL;
@@ -102,6 +142,7 @@ static tdb_test_case cases[] = {
   {"int_strict", test_int_strict},
   {"decimal_strict", test_decimal_strict},
   {"varchar_and_bool", test_varchar_and_bool},
+  {"phase11_types", test_phase11_types},
   {"null_passes", test_null_passes},
 };
 TDB_MAIN(cases)

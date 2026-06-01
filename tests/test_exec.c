@@ -1834,9 +1834,15 @@ static void test_phase11_utility(void) {
   TDB_CHECK_EQ(exec(db, "INSERT INTO log VALUES (1,'a'),(2,'b'),(3,'c')"), TDB_OK);
   TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 3);
 
-  /* TRUNCATE empties the table */
+  /* TRUNCATE empties the table; CASCADE is a recognized no-op (no FK
+  ** enforcement) and RESTART IDENTITY is explicitly rejected since rowid
+  ** generation cannot actually reset without a hard b-tree rebuild. */
   TDB_CHECK_EQ(exec(db, "TRUNCATE TABLE log"), TDB_OK);
   TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 0);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO log VALUES (4,'d')"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "TRUNCATE TABLE log CASCADE"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 0);
+  TDB_CHECK(exec(db, "TRUNCATE TABLE log RESTART IDENTITY") != TDB_OK);
 
   /* ANALYZE / REINDEX are accepted; they do not error on a valid table even
   ** though their internal effects are stubbed. */

@@ -874,8 +874,13 @@ static int exec_alter(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
 
 /* ------------------------ Phase 11: utility DDL ------------------------ */
 
-/* TRUNCATE TABLE — delete every visible row. (Identity reset / CASCADE
-** are parsed and remembered on the AST but not yet executed.) */
+/* TRUNCATE TABLE — delete every visible row. CASCADE is a recognized
+** no-op (the engine does not enforce foreign keys, so there are no
+** dependent rows to follow). RESTART IDENTITY is rejected: rowid
+** generation tracks tdb_btree_max_rowid + 1 and TRUNCATE leaves
+** MVCC-tombstoned slots in the b-tree, so the counter cannot actually
+** reset without a hard rebuild (which would also break concurrent
+** snapshots — left for a future vacuum/AccessExclusive path). */
 static int truncate_one(tdb_db *db, tdb_stmt *st, tdb_table *t) {
   tdb_scan *sc;
   int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, 0, NULL, &sc);
@@ -903,6 +908,13 @@ static int truncate_one(tdb_db *db, tdb_stmt *st, tdb_table *t) {
 static int exec_truncate(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   tdb_table *t = tdb_catalog_find_table(db->cat, a->u.truncate.name);
   if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.truncate.name); return TDB_ERROR; }
+  if (a->u.truncate.restart) {
+    tdb_db_seterr(db,
+      "TRUNCATE ... RESTART IDENTITY is not supported: rowids are derived "
+      "from b-tree max + 1 and TRUNCATE leaves MVCC tombstones in place");
+    return TDB_UNSUPPORTED;
+  }
+  /* a->u.truncate.cascade is intentionally ignored: no FK enforcement. */
   if (is_hash_partitioned(t)) {
     for (int k = 0; k < t->partition_count; k++) {
       char child[256];

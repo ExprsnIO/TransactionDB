@@ -28,11 +28,18 @@ ctest --test-dir build -R mvcc               # run one test (by CTest name, see 
 ./build/tdb_shell [path|:memory:]            # interactive REPL (defaults to :memory:)
 ```
 
-Useful configure options (all default `ON`): `-DTDB_BUILD_TESTS=OFF`, `-DTDB_BUILD_CLI=OFF`,
-`-DTDB_BUILD_LUA=OFF`. **`TDB_BUILD_LUA=ON` fetches Lua 5.4.7 over the network** via
-`FetchContent` (see `cmake/FetchLua.cmake`); for offline builds either drop a copy under
-`third_party/lua/` or configure with `-DTDB_BUILD_LUA=OFF`. Lua-gated code is guarded by the
-`TDB_HAVE_LUA` macro.
+Configure options (defaults in parens):
+
+- `TDB_BUILD_TESTS` (ON), `TDB_BUILD_CLI` (ON), `TDB_BUILD_LUA` (ON) — the common toggles.
+- `TDB_BUILD_OPENSSL` (OFF) — links OpenSSL to provide AES + a CSPRNG; gated by `TDB_HAVE_OPENSSL`.
+- `TDB_BUILD_ZSTD` (OFF) — fetches Zstandard (`cmake/FetchZstd.cmake`) for page/blob compression;
+  gated by `TDB_HAVE_ZSTD`.
+- `TDB_BUILD_FRAMEWORK` (OFF) — package as an Apple `.framework` bundle; forces the lib to be
+  `SHARED` and pulls in `cmake/AppleFramework.cmake` (no-op off Apple).
+
+**`TDB_BUILD_LUA=ON` fetches Lua 5.4.7 over the network** via `FetchContent` (see
+`cmake/FetchLua.cmake`); for offline builds either drop a copy under `third_party/lua/` or
+configure with `-DTDB_BUILD_LUA=OFF`. Lua-gated code is guarded by the `TDB_HAVE_LUA` macro.
 
 There is **no separate lint step and no `.clang-format`/`.clang-tidy`** — the "lint" is a strict
 warning set (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion`, MSVC `/W4`)
@@ -80,11 +87,28 @@ Bottom to top:
   (used when there is no ORDER BY).
   Anything more complex
   falls back to materialization. Correlated subqueries are supported (unbound columns resolve outward
-  through enclosing query contexts, re-run per outer row).
+  through enclosing query contexts, re-run per outer row). Other SQL surface implemented here:
+  CTEs (`WITH`), set ops (`UNION` / `INTERSECT` / `EXCEPT`), `CREATE TABLE AS SELECT`, savepoints
+  (`SAVEPOINT` / `RELEASE` / `ROLLBACK TO`), composite (`ROW`/`STRUCT`) values, sequences
+  (`nextval` / `currval` / `setval`), JSON helpers, date/time builtins, and the R-tree / spatial
+  `ST_*` family. The canonical, feature-by-feature reference (including parsed-but-not-enforced
+  cases and tdb-only extensions) is `docs/SQL_COMPATIBILITY.md`.
+- **`src/plsql/`** — the procedural language layer driven by `CREATE FUNCTION`/`PROCEDURE
+  ... LANGUAGE PLSQL` and `CALL`. Source is parsed into a routine AST (`tdb_plsql_parse.c`) and
+  then executed by **either** a tree-walking interpreter (`tdb_plsql_interp.c`) **or** the LLVM
+  IR backend (`tdb_plsql_llvm.c`, constant-folding + textual LLVM module emission). Public surface
+  is in `tdb_plsql.h`; `tdb_plsql_int.h` is the internal contract shared between parser/interp/llvm.
+  Stored routines persist as catalog rows.
+- **`src/ext/`** — built-in extension functions. Today this is the crypto suite
+  (`tdb_crypto.c/.h`): `sha256`, `md5`, `hmac_sha256`, `crc32`, `hex`/`unhex`, `randomblob` always
+  available; AES + CSPRNG behind `TDB_HAVE_OPENSSL`.
 - **`src/api/`** — `tdb_api.c` implements the public C API over everything above. `tdb_db.h`
   (internal) defines `struct tdb_db` (the connection: pager, catalog, lockmgr, txnmgr, storage
   engine, optional lua, current txn, autocommit flag) and `struct tdb_stmt` (a prepared statement
-  with its arena, AST, bound params, and materialized result set).
+  with its arena, AST, bound params, and materialized result set). The C/C++ plugin entry points
+  also live here: `tdb_create_function` for in-process registration, `tdb_load_extension` for
+  loading a shared module via `dlopen` (see `examples/tdb_plugin_example.cpp` and its
+  test-driven wiring described below).
 - **`src/lua/`** — optional embedded Lua integration (compiled only when `TDB_BUILD_LUA`).
 - **`cli/shell.c`** — the `tdb_shell` REPL. As a first-party tool it intentionally reaches into
   internal headers (e.g. for `.tables` / `.schema` introspection).
@@ -98,9 +122,17 @@ Bottom to top:
   is placed on the include path per target in `CMakeLists.txt`. When you add a new target or a new
   subdirectory of sources, add the matching `target_include_directories` entries.
 - Library sources are auto-discovered via `file(GLOB_RECURSE … CONFIGURE_DEPENDS src/*.c)`, so a
-  new `src/**/foo.c` is picked up on the next configure with no CMake edit. **Tests are not
-  globbed**: to add `tests/test_<name>.c`, append `<name>` to the `TDB_TESTS` list in
-  `CMakeLists.txt` (the CTest case is registered as `<name>`, the binary as `test_<name>`).
+  new `src/**/foo.c` is picked up on the next configure with no CMake edit (Lua sources under
+  `src/lua/` are filtered out when `TDB_BUILD_LUA=OFF`). **Tests are not globbed**: to add
+  `tests/test_<name>.c`, append `<name>` to the `TDB_TESTS` list in `CMakeLists.txt` (the CTest
+  case is registered as `<name>`, the binary as `test_<name>`). Two tests are special-cased
+  outside that loop: `test_cpp` (the C++ wrapper, always built) and `test_lua` (only when
+  `TDB_BUILD_LUA`) — don't add `cpp` / `lua` to `TDB_TESTS`.
+- The dynamic-load path is exercised by `test_crypto`: the example plugin
+  `examples/tdb_plugin_example.cpp` is built as a `MODULE` library (`tdb_plugin_example`), its
+  path is passed to the test via `-DTDB_PLUGIN_PATH=...`, and `test_crypto` is built with
+  `ENABLE_EXPORTS ON` so the plugin can resolve `tdb_*` symbols back into the host. If you change
+  the plugin API surface, both ends need to stay in sync.
 - Tests use the tiny built-in harness in `tests/tdb_test.h` (no GoogleTest/Catch2): write
   `TDB_CHECK` / `TDB_CHECK_EQ` / `TDB_CHECK_STR` assertions, list cases in a table, and end with
   `TDB_MAIN(cases)`. Failures print `file:line` and continue; non-zero exit means a failure.

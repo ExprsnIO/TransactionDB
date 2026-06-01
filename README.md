@@ -61,7 +61,7 @@ include:
   `TRIM`/`LTRIM`/`RTRIM` (1- or 2-arg), `REPLACE`, `INSTR`, `ABS`, `ROUND`,
   `COALESCE`/`IFNULL`/`NULLIF`, `TYPEOF`, `HEX`/`UNHEX`, `QUOTE`, `CHAR`,
   `UNICODE`, `RANDOM`, `PRINTF`/`FORMAT`, `LAST_INSERT_ROWID`, `CHANGES`,
-  `TOTAL_CHANGES`, `SQLITE_VERSION`, and the spatial `ST_*` family
+  `TOTAL_CHANGES`, `TDB_VERSION`, and the spatial `ST_*` family
 - Date/time: `DATE`, `TIME`, `DATETIME`, `STRFTIME`, `JULIANDAY`, `UNIXEPOCH`,
   `CURRENT_*` — with `'now'`, ISO timestamps, and `+/-N unit` / `start of unit`
   modifiers

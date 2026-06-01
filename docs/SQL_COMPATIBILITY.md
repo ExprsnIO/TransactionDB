@@ -183,7 +183,8 @@ types than SQLite's five storage classes, but enforced rather than advisory.
 | `HEX`, `UNHEX` | ✅ | ✅ | From the built-in crypto suite. |
 | `QUOTE`, `CHAR`, `UNICODE`, `RANDOM`, `RANDOMBLOB` | ✅ | ✅ | |
 | `PRINTF`/`FORMAT` | ✅ | ✅ | `%d %u %x %o %f %g %e %s %c %q %Q %%` + width/precision. |
-| `LAST_INSERT_ROWID`, `CHANGES`, `TOTAL_CHANGES`, `SQLITE_VERSION` | ✅ | ✅ | Also exposed as `tdb_last_insert_rowid()` / `tdb_changes()` / `tdb_total_changes()` in the C API. |
+| `LAST_INSERT_ROWID`, `CHANGES`, `TOTAL_CHANGES` | ✅ | ✅ | Also exposed as `tdb_last_insert_rowid()` / `tdb_changes()` / `tdb_total_changes()` in the C API. |
+| `TDB_VERSION()` / `VERSION()` | ➕ | — | SQLite calls its equivalent `sqlite_version()`; tdb is named after itself. |
 | Date/time: `DATE`, `TIME`, `DATETIME`, `STRFTIME`, `JULIANDAY`, `UNIXEPOCH` | ✅ | ✅ | `'now'`, ISO timestamps, JD, and `+/-N day|hour|minute|second|month|year` / `start of day|month|year` / `unixepoch` modifiers. |
 | `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP` (as functions) | ✅ | ✅ | |
 | JSON: `json_object`, `json_array`, `json_extract`, `json_type`, `json_valid`, `json_array_length`, `json` | ✅ | ⚠️ (`JSON1`) | Minimal but functional. `$.path` / `$[idx]` accessors. JSON-typed text composes cleanly. |

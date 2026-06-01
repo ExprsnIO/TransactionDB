@@ -106,7 +106,7 @@ static void test_scalar_funcs(void) {
   scalar_t(db, "SELECT rtrim('hixy', 'xy')",  buf, sizeof buf);  TDB_CHECK_STR(buf, "hi");
 
   /* version */
-  scalar_t(db, "SELECT sqlite_version()", buf, sizeof buf);
+  scalar_t(db, "SELECT tdb_version()", buf, sizeof buf);
   TDB_CHECK(strlen(buf) > 0);
 
   /* random returns an integer */

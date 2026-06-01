@@ -3,7 +3,8 @@
 ** This file extends eval_func() with the SQLite-compatible function library:
 ** date/time helpers, JSON construction/inspection, formatting (printf/format),
 ** char/unicode conversions, quoting, randoms, last_insert_rowid()/changes(),
-** sqlite_version()/tdb_version(), and the 2-argument forms of trim/ltrim/rtrim.
+** sqlite-style helpers like changes()/last_insert_rowid()/tdb_version(), and
+** the 2-argument forms of trim/ltrim/rtrim.
 **
 ** Entry point is try_builtin_extra(): returns 1 if it handled the function (and
 ** wrote `out`), 0 if it did not recognize it (caller falls through). On
@@ -763,8 +764,7 @@ static int try_builtin_extra(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *
   if (!strcasecmp(fn, "total_changes") && argc == 0) {
     tdb_value_set_int(out, db->total_changes); return 1;
   }
-  if ((!strcasecmp(fn, "sqlite_version") || !strcasecmp(fn, "tdb_version") ||
-       !strcasecmp(fn, "version")) && argc == 0) {
+  if ((!strcasecmp(fn, "tdb_version") || !strcasecmp(fn, "version")) && argc == 0) {
     tdb_value_set_text(out, TDB_VERSION_STRING, -1, 1); return 1;
   }
   if (!strcasecmp(fn, "random") && argc == 0) {

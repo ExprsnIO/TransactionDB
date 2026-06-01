@@ -14,6 +14,7 @@ tdb_expr *tdb_expr_new(tdb_arena *a, tdb_expr_kind k) {
     e->col_index = -1;
     e->agg_index = -1;
     e->fn_id = -1;
+    e->win_index = -1;
     tdb_value_init(&e->lit);
   }
   return e;

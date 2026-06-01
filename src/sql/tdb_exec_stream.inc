@@ -124,11 +124,12 @@ typedef struct tdb_op {
 
 /* ---- eligibility: reject anything the simple operators can't stream ---- */
 
-/* True if `e` contains a subquery — the streaming operators don't run those. */
+/* True if `e` contains something the streaming operators don't run:
+** subqueries and window functions both require full materialization. */
 static int expr_blocks_stream(const tdb_expr *e) {
   if (!e) return 0;
   switch (e->kind) {
-    case EX_SUBQUERY: case EX_EXISTS:
+    case EX_SUBQUERY: case EX_EXISTS: case EX_WINDOW:
       return 1;
     case EX_IN:
       if (e->subquery) return 1;

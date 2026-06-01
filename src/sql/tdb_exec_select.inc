@@ -522,6 +522,269 @@ static int exec_select(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer) {
   return rc;
 }
 
+/* ---------------------------- window functions ---------------------------
+**
+** Compute one value per (row, window-call) pair, returned as winvals[r][f].
+** The implementation supports four ranking functions (ROW_NUMBER, RANK,
+** DENSE_RANK, NTILE) and the standard scalar aggregates as window
+** aggregates (COUNT, SUM, AVG, MIN, MAX).
+**
+** Semantics: rows are first partitioned by `OVER (PARTITION BY ...)` (one
+** partition if absent), then ordered within each partition by ORDER BY (an
+** indeterminate but stable order if absent). Without an ORDER BY clause an
+** aggregate window function returns the same value (the full-partition
+** aggregate) for every row; with ORDER BY it returns the running aggregate
+** up to and including the current row's peer group (the default frame in
+** SQL is "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"). */
+
+typedef struct { tdb_expr *w; int kind; } winkind;
+enum { WK_ROW_NUMBER = 1, WK_RANK, WK_DENSE_RANK, WK_NTILE,
+       WK_COUNT, WK_SUM, WK_AVG, WK_MIN, WK_MAX };
+
+static int classify_win(tdb_expr *w) {
+  if (!w->name) return 0;
+  if (!strcasecmp(w->name, "row_number"))  return WK_ROW_NUMBER;
+  if (!strcasecmp(w->name, "rank"))        return WK_RANK;
+  if (!strcasecmp(w->name, "dense_rank"))  return WK_DENSE_RANK;
+  if (!strcasecmp(w->name, "ntile"))       return WK_NTILE;
+  if (!strcasecmp(w->name, "count"))       return WK_COUNT;
+  if (!strcasecmp(w->name, "sum") ||
+      !strcasecmp(w->name, "total"))       return WK_SUM;
+  if (!strcasecmp(w->name, "avg"))         return WK_AVG;
+  if (!strcasecmp(w->name, "min"))         return WK_MIN;
+  if (!strcasecmp(w->name, "max"))         return WK_MAX;
+  return 0;
+}
+
+/* Within-partition comparator over an order-by row of values. */
+static int orderkey_cmp(tdb_value *a, tdb_value *b, int n, const uint8_t *desc) {
+  for (int i = 0; i < n; i++) {
+    int c = tdb_value_compare(&a[i], &b[i], TDB_COLL_BINARY);
+    if (desc && desc[i]) c = -c;
+    if (c) return c;
+  }
+  return 0;
+}
+
+/* Compute winvals[r][f] for every row r and every window-call f in Q.
+** Caller owns winvals: free with tdb_value_clear per cell then tdb_mfree. */
+static int eval_windows(tdb_db *db, tdb_stmt *st, qctx *Q, rowset *in,
+                        tdb_value ***winvals_out, ectx *outer) {
+  int nr = in->n, nw = Q->nwin;
+  if (nw == 0) { *winvals_out = NULL; return TDB_OK; }
+  tdb_value **wv = (tdb_value **)tdb_calloc(sizeof(tdb_value *) * (size_t)nr);
+  if (!wv) return TDB_NOMEM;
+  for (int r = 0; r < nr; r++) {
+    wv[r] = row_alloc(nw);
+    for (int f = 0; f < nw; f++) tdb_value_set_null(&wv[r][f]);
+  }
+
+  /* Per-row idx; reused for partitioning. */
+  int *order = (int *)tdb_malloc(sizeof(int) * (size_t)(nr ? nr : 1));
+  for (int r = 0; r < nr; r++) order[r] = r;
+
+  for (int f = 0; f < nw; f++) {
+    tdb_expr *we = Q->wins[f];
+    int kind = classify_win(we);
+    if (!kind) { tdb_db_seterr(db, "unsupported window function: %s", we->name ? we->name : "?"); tdb_mfree(order); return TDB_ERROR; }
+    int np = we->win && we->win->partition ? we->win->partition->n : 0;
+    int no = we->win && we->win->order ? we->win->order->n : 0;
+
+    /* compute partition key + order key per row */
+    tdb_value **pkey = (tdb_value **)tdb_calloc(sizeof(void *) * (size_t)nr);
+    tdb_value **okey = (tdb_value **)tdb_calloc(sizeof(void *) * (size_t)nr);
+    /* argument value for aggregate funcs (the first arg; COUNT(*) treated as constant 1) */
+    tdb_value *argv = (tdb_value *)tdb_calloc(sizeof(tdb_value) * (size_t)(nr ? nr : 1));
+    int has_arg = we->args && we->args->n > 0;
+    int star_arg = has_arg && we->args->items[0]->kind == EX_STAR;
+
+    for (int r = 0; r < nr; r++) {
+      ectx ec = { in->rows[r], in->ncol, NULL, 0, st, Q, outer };
+      if (np) {
+        pkey[r] = row_alloc(np);
+        for (int i = 0; i < np; i++) eval(db, &ec, we->win->partition->items[i], &pkey[r][i]);
+      }
+      if (no) {
+        okey[r] = row_alloc(no);
+        for (int i = 0; i < no; i++) eval(db, &ec, we->win->order->exprs[i], &okey[r][i]);
+      }
+      tdb_value_init(&argv[r]);
+      if (has_arg && !star_arg) eval(db, &ec, we->args->items[0], &argv[r]);
+      else if (star_arg) tdb_value_set_int(&argv[r], 1);
+    }
+
+    /* sort row indices: partition-key first, then order-key */
+    for (int r = 0; r < nr; r++) order[r] = r;
+    for (int i = 1; i < nr; i++) {        /* simple insertion sort */
+      int v = order[i]; int j = i - 1;
+      while (j >= 0) {
+        int a = order[j];
+        int c = np ? orderkey_cmp(pkey[a], pkey[v], np, NULL) : 0;
+        if (c == 0 && no) c = orderkey_cmp(okey[a], okey[v], no, we->win->order->desc);
+        if (c <= 0) break;
+        order[j + 1] = order[j]; j--;
+      }
+      order[j + 1] = v;
+    }
+
+    /* Walk the sorted rows, computing the window value for each. */
+    int p_start = 0;
+    while (p_start < nr) {
+      /* find end of partition */
+      int p_end = p_start + 1;
+      while (p_end < nr) {
+        if (np && orderkey_cmp(pkey[order[p_start]], pkey[order[p_end]], np, NULL) != 0) break;
+        p_end++;
+      }
+
+      /* If kind is a full-partition aggregate (no ORDER BY), pre-compute it. */
+      double sum_d = 0; int64_t sum_i = 0; int sum_is_int = 1;
+      int64_t cnt = 0;
+      tdb_value mn, mx; tdb_value_init(&mn); tdb_value_init(&mx);
+      int have_mm = 0;
+      for (int k = p_start; k < p_end; k++) {
+        int r = order[k];
+        if (kind == WK_COUNT) {
+          if (star_arg || argv[r].type != TDB_VAL_NULL) cnt++;
+        } else if (kind == WK_SUM || kind == WK_AVG) {
+          if (argv[r].type == TDB_VAL_NULL) continue;
+          if (argv[r].type == TDB_VAL_REAL) { sum_d += argv[r].u.r; sum_is_int = 0; }
+          else { sum_d += (double)tdb_value_as_int(&argv[r]); if (argv[r].type != TDB_VAL_INT) sum_is_int = 0; else sum_i += argv[r].u.i; }
+          cnt++;
+        } else if (kind == WK_MIN || kind == WK_MAX) {
+          if (argv[r].type == TDB_VAL_NULL) continue;
+          if (!have_mm) { tdb_value_copy(&mn, &argv[r]); tdb_value_copy(&mx, &argv[r]); have_mm = 1; }
+          else {
+            if (tdb_value_compare(&argv[r], &mn, TDB_COLL_BINARY) < 0) { tdb_value_clear(&mn); tdb_value_copy(&mn, &argv[r]); }
+            if (tdb_value_compare(&argv[r], &mx, TDB_COLL_BINARY) > 0) { tdb_value_clear(&mx); tdb_value_copy(&mx, &argv[r]); }
+          }
+        }
+      }
+
+      /* Per-row outputs. For ranking + running aggregates we walk the partition
+      ** in sorted order and emit values as we go. */
+      int row_num = 0, rank = 0, dense = 0;
+      tdb_value *prev_okey = NULL;
+      int64_t run_cnt = 0; double run_sum_d = 0; int64_t run_sum_i = 0; int run_is_int = 1;
+      tdb_value run_min, run_max; tdb_value_init(&run_min); tdb_value_init(&run_max);
+      int run_have_mm = 0;
+
+      for (int k = p_start; k < p_end; k++) {
+        int r = order[k];
+        row_num++;
+        int peer_change = 1;
+        if (no && k > p_start) peer_change = (orderkey_cmp(prev_okey, okey[r], no, we->win->order->desc) != 0);
+        if (k == p_start) { rank = 1; dense = 1; }
+        else if (no) {
+          if (peer_change) { rank = row_num; dense++; }
+        } else { rank = 1; dense = 1; }       /* no ORDER BY: all are peers */
+
+        tdb_value *out = &wv[r][f];
+        switch (kind) {
+          case WK_ROW_NUMBER: tdb_value_set_int(out, (int64_t)row_num); break;
+          case WK_RANK:       tdb_value_set_int(out, (int64_t)rank); break;
+          case WK_DENSE_RANK: tdb_value_set_int(out, (int64_t)dense); break;
+          case WK_NTILE: {
+            int64_t buckets = has_arg ? tdb_value_as_int(&argv[r]) : 1;
+            if (buckets < 1) buckets = 1;
+            int64_t sz = (p_end - p_start);
+            int64_t small = sz / buckets, large_n = sz % buckets;
+            int64_t large_sz = small + 1;
+            int64_t boundary = large_n * large_sz;
+            int64_t idx = (int64_t)(k - p_start);
+            int64_t bucket = (idx < boundary) ? (idx / large_sz) + 1
+                                              : large_n + (idx - boundary) / (small ? small : 1) + 1;
+            tdb_value_set_int(out, bucket);
+            break;
+          }
+          case WK_COUNT:
+            if (no) {
+              if (star_arg || argv[r].type != TDB_VAL_NULL) run_cnt++;
+              tdb_value_set_int(out, run_cnt);
+            } else tdb_value_set_int(out, cnt);
+            break;
+          case WK_SUM:
+            if (no) {
+              if (argv[r].type != TDB_VAL_NULL) {
+                if (argv[r].type == TDB_VAL_REAL) { run_sum_d += argv[r].u.r; run_is_int = 0; }
+                else { run_sum_d += (double)tdb_value_as_int(&argv[r]); if (argv[r].type == TDB_VAL_INT) run_sum_i += argv[r].u.i; else run_is_int = 0; }
+              }
+              if (run_is_int) tdb_value_set_int(out, run_sum_i);
+              else tdb_value_set_real(out, run_sum_d);
+            } else {
+              if (sum_is_int) tdb_value_set_int(out, sum_i);
+              else tdb_value_set_real(out, sum_d);
+            }
+            break;
+          case WK_AVG:
+            if (no) {
+              if (argv[r].type != TDB_VAL_NULL) {
+                run_sum_d += tdb_value_as_real(&argv[r]);
+                run_cnt++;
+              }
+              if (run_cnt > 0) tdb_value_set_real(out, run_sum_d / (double)run_cnt);
+              else tdb_value_set_null(out);
+            } else {
+              if (cnt > 0) tdb_value_set_real(out, sum_d / (double)cnt);
+              else tdb_value_set_null(out);
+            }
+            break;
+          case WK_MIN:
+            if (no) {
+              if (argv[r].type != TDB_VAL_NULL) {
+                if (!run_have_mm) { tdb_value_copy(&run_min, &argv[r]); run_have_mm = 1; }
+                else if (tdb_value_compare(&argv[r], &run_min, TDB_COLL_BINARY) < 0) {
+                  tdb_value_clear(&run_min); tdb_value_copy(&run_min, &argv[r]);
+                }
+              }
+              if (run_have_mm) tdb_value_copy(out, &run_min); else tdb_value_set_null(out);
+            } else {
+              if (have_mm) tdb_value_copy(out, &mn); else tdb_value_set_null(out);
+            }
+            break;
+          case WK_MAX:
+            if (no) {
+              if (argv[r].type != TDB_VAL_NULL) {
+                if (!run_have_mm) { tdb_value_copy(&run_max, &argv[r]); run_have_mm = 1; }
+                else if (tdb_value_compare(&argv[r], &run_max, TDB_COLL_BINARY) > 0) {
+                  tdb_value_clear(&run_max); tdb_value_copy(&run_max, &argv[r]);
+                }
+              }
+              if (run_have_mm) tdb_value_copy(out, &run_max); else tdb_value_set_null(out);
+            } else {
+              if (have_mm) tdb_value_copy(out, &mx); else tdb_value_set_null(out);
+            }
+            break;
+        }
+        prev_okey = okey[r];
+      }
+      tdb_value_clear(&mn); tdb_value_clear(&mx);
+      tdb_value_clear(&run_min); tdb_value_clear(&run_max);
+      p_start = p_end;
+    }
+
+    /* per-window scratch cleanup */
+    for (int r = 0; r < nr; r++) {
+      if (pkey[r]) { for (int i = 0; i < np; i++) tdb_value_clear(&pkey[r][i]); tdb_mfree(pkey[r]); }
+      if (okey[r]) { for (int i = 0; i < no; i++) tdb_value_clear(&okey[r][i]); tdb_mfree(okey[r]); }
+      tdb_value_clear(&argv[r]);
+    }
+    tdb_mfree(pkey); tdb_mfree(okey); tdb_mfree(argv);
+  }
+
+  tdb_mfree(order);
+  *winvals_out = wv;
+  return TDB_OK;
+}
+
+static void free_winvals(tdb_value **wv, int nr, int nw) {
+  if (!wv) return;
+  for (int r = 0; r < nr; r++) {
+    if (wv[r]) { for (int f = 0; f < nw; f++) tdb_value_clear(&wv[r][f]); tdb_mfree(wv[r]); }
+  }
+  tdb_mfree(wv);
+}
+
 static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer) {
   if (q->setop) return exec_setop_chain(db, st, q, outer);
 
@@ -632,9 +895,26 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer
   int rc = TDB_OK;
   int ngroup = q->group ? q->group->n : 0;
 
+  /* Window functions are only supported in non-aggregated queries: they
+  ** evaluate after WHERE filtering and any joins, in the projection step. */
+  if (Q.nwin > 0 && aggregated) {
+    tdb_db_seterr(db, "window functions over an aggregated query are not supported");
+    rowset_free(&in); FAILP;
+  }
+
+  tdb_value **winvals = NULL;
+  if (Q.nwin > 0) {
+    rc = eval_windows(db, st, &Q, &in, &winvals, outer);
+    if (rc) {
+      free_winvals(winvals, in.n, Q.nwin);
+      rowset_free(&in); FAILP;
+    }
+  }
+
   if (!aggregated) {
     for (int r = 0; r < in.n; r++) {
       ectx ec = { in.rows[r], in.ncol, NULL, 0, st, &Q, outer };
+      if (winvals) { ec.winvals = winvals[r]; ec.nwinvals = Q.nwin; }
       tdb_value *vr = row_alloc(nout);
       for (int i = 0; i < nout; i++) eval(db, &ec, oexpr[i], &vr[i]);
       tdb_value *kr = norder ? row_alloc(norder) : NULL;
@@ -701,6 +981,7 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer
     tdb_mfree(groups);
   }
 
+  free_winvals(winvals, in.n, Q.nwin);
   rowset_free(&in);
 
   /* 4b. DISTINCT — drop duplicate output rows (NULLs compare equal) */

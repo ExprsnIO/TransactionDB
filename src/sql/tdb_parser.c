@@ -193,6 +193,33 @@ static tdb_expr *parse_primary(P *p) {
           while (accept(p, TK_COMMA));
         }
         expect(p, TK_RP, "expected ) after arguments");
+        /* optional OVER (PARTITION BY ... ORDER BY ...) — promotes the call
+        ** to a window function. */
+        if (id_is(&p->cur, "OVER")) {
+          advance(p);
+          expect(p, TK_LP, "expected ( after OVER");
+          tdb_window *w = (tdb_window *)tdb_arena_alloc(p->a, sizeof(*w));
+          memset(w, 0, sizeof(*w));
+          if (accept(p, TK_PARTITION)) {
+            expect(p, TK_BY, "expected BY after PARTITION");
+            w->partition = tdb_exprlist_new(p->a);
+            do { tdb_exprlist_add(p->a, w->partition, parse_expr(p, 0), NULL); }
+            while (accept(p, TK_COMMA));
+          }
+          if (accept(p, TK_ORDER)) {
+            expect(p, TK_BY, "expected BY after ORDER");
+            w->order = tdb_orderby_new(p->a);
+            do {
+              tdb_expr *oe = parse_expr(p, 0);
+              int desc = 0;
+              if (accept(p, TK_ASC)) desc = 0; else if (accept(p, TK_DESC)) desc = 1;
+              tdb_orderby_add(p->a, w->order, oe, desc);
+            } while (accept(p, TK_COMMA));
+          }
+          expect(p, TK_RP, "expected ) after OVER");
+          e->kind = EX_WINDOW;
+          e->win = w;
+        }
         return e;
       }
       e = tdb_expr_new(p->a, EX_COLUMN); e->name = name; return e;

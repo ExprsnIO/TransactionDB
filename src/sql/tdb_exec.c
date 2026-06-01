@@ -47,6 +47,11 @@ typedef struct qctx {
   int       totalcols;
   tdb_expr *aggs[64];
   int       nagg;
+  /* Window function calls (EX_WINDOW) in this query, in collection order.
+  ** Indexed by EX_WINDOW.win_index; values pre-computed per row before
+  ** projection (see eval_windows). */
+  tdb_expr *wins[32];
+  int       nwin;
   int       paramcount;
   int       err;
   struct qctx *outer;   /* enclosing query's context (correlated subqueries) */
@@ -149,6 +154,21 @@ static int resolve_expr(tdb_db *db, qctx *q, tdb_expr *e) {
     case EX_AGG:
       if (q->nagg < 64) { e->agg_index = q->nagg; q->aggs[q->nagg++] = e; }
       return resolve_list(db, q, e->args);
+    case EX_WINDOW: {
+      if (q->nwin < 32) { e->win_index = q->nwin; q->wins[q->nwin++] = e; }
+      if (resolve_list(db, q, e->args)) return TDB_ERROR;
+      if (e->win) {
+        if (e->win->partition) {
+          for (int i = 0; i < e->win->partition->n; i++)
+            if (resolve_expr(db, q, e->win->partition->items[i])) return TDB_ERROR;
+        }
+        if (e->win->order) {
+          for (int i = 0; i < e->win->order->n; i++)
+            if (resolve_expr(db, q, e->win->order->exprs[i])) return TDB_ERROR;
+        }
+      }
+      return TDB_OK;
+    }
     case EX_BINARY:
     case EX_UNARY:
       if (resolve_expr(db, q, e->left)) return TDB_ERROR;
@@ -176,6 +196,12 @@ typedef struct ectx {
   tdb_stmt  *stmt;
   qctx        *qc;      /* this query's resolution context (for subqueries) */
   struct ectx *outer;   /* enclosing query's per-row context (correlation) */
+  /* Pre-computed window-function values for `row` (size nwinvals). NULL
+  ** outside a windowed projection pass. Kept at end of the struct so that
+  ** the existing positional initializers across the codebase still work
+  ** (the trailing fields zero-initialize). */
+  tdb_value *winvals;
+  int        nwinvals;
 } ectx;
 
 static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out);
@@ -744,6 +770,10 @@ static int eval(tdb_db *db, ectx *c, const tdb_expr *e, tdb_value *out) {
     case EX_AGG:
       if (c->aggvals && e->agg_index >= 0 && e->agg_index < c->naggvals)
         return tdb_value_copy(out, &c->aggvals[e->agg_index]);
+      tdb_value_set_null(out); return TDB_OK;
+    case EX_WINDOW:
+      if (c->winvals && e->win_index >= 0 && e->win_index < c->nwinvals)
+        return tdb_value_copy(out, &c->winvals[e->win_index]);
       tdb_value_set_null(out); return TDB_OK;
     case EX_UNARY: {
       tdb_value v; tdb_value_init(&v);

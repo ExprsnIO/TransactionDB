@@ -1606,6 +1606,70 @@ static void test_stream_distinct(void) {
   tdb_close(db);
 }
 
+static void test_window_functions(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE s (region TEXT, q INTEGER, amt INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db,
+    "INSERT INTO s VALUES ('east',1,10),('east',2,20),('east',3,30),"
+    "('west',1,5),('west',2,15),('west',3,25)"), TDB_OK);
+
+  /* ROW_NUMBER per partition, ordered by q */
+  tdb_stmt *st = NULL;
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "SELECT region, q, ROW_NUMBER() OVER (PARTITION BY region ORDER BY q) "
+    "FROM s ORDER BY region, q", -1, &st, NULL), TDB_OK);
+  int counters[2] = {0, 0};
+  while (tdb_step(st) == TDB_ROW) {
+    const char *region = tdb_column_text(st, 0);
+    int rn = tdb_column_int(st, 2);
+    TDB_CHECK(region && (region[0] == 'e' || region[0] == 'w'));
+    int *idx = region[0] == 'e' ? &counters[0] : &counters[1];
+    (*idx)++;
+    TDB_CHECK_EQ(rn, *idx);
+  }
+  TDB_CHECK_EQ(counters[0], 3);
+  TDB_CHECK_EQ(counters[1], 3);
+  tdb_finalize(st);
+
+  /* Running SUM per partition ordered by q: east 10,30,60; west 5,20,45 */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "SELECT region, q, SUM(amt) OVER (PARTITION BY region ORDER BY q) "
+    "FROM s ORDER BY region, q", -1, &st, NULL), TDB_OK);
+  int expected[6] = {10, 30, 60, 5, 20, 45};
+  for (int i = 0; i < 6; i++) {
+    TDB_CHECK_EQ(tdb_step(st), TDB_ROW);
+    TDB_CHECK_EQ(tdb_column_int(st, 2), expected[i]);
+  }
+  tdb_finalize(st);
+
+  /* Full-partition SUM (no ORDER BY) — same total for each row in the partition */
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "SELECT region, SUM(amt) OVER (PARTITION BY region) "
+    "FROM s ORDER BY region", -1, &st, NULL), TDB_OK);
+  while (tdb_step(st) == TDB_ROW) {
+    const char *r = tdb_column_text(st, 0);
+    int total = tdb_column_int(st, 1);
+    TDB_CHECK(total == (r[0] == 'e' ? 60 : 45));
+  }
+  tdb_finalize(st);
+
+  /* RANK / DENSE_RANK with ties */
+  TDB_CHECK_EQ(exec(db, "CREATE TABLE scores (id INTEGER, v INTEGER)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO scores VALUES (1,10),(2,20),(3,20),(4,30)"), TDB_OK);
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "SELECT id, RANK() OVER (ORDER BY v), DENSE_RANK() OVER (ORDER BY v) "
+    "FROM scores ORDER BY id", -1, &st, NULL), TDB_OK);
+  int rk[]    = {1, 2, 2, 4};
+  int dense[] = {1, 2, 2, 3};
+  for (int i = 0; i < 4; i++) {
+    TDB_CHECK_EQ(tdb_step(st), TDB_ROW);
+    TDB_CHECK_EQ(tdb_column_int(st, 1), rk[i]);
+    TDB_CHECK_EQ(tdb_column_int(st, 2), dense[i]);
+  }
+  tdb_finalize(st);
+  tdb_close(db);
+}
+
 static void test_recursive_cte(void) {
   tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
 
@@ -1681,6 +1745,7 @@ static tdb_test_case cases[] = {
   {"returning", test_returning},
   {"cte", test_cte},
   {"ddl_dml_select", test_ddl_dml_select},
+  {"window_functions", test_window_functions},
   {"recursive_cte", test_recursive_cte},
   {"phase11_utility", test_phase11_utility},
   {"derived_and_view", test_derived_and_view},

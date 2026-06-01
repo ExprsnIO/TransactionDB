@@ -24,12 +24,25 @@
 typedef enum tdb_expr_kind {
   EX_LITERAL, EX_NULL, EX_COLUMN, EX_PARAM, EX_UNARY, EX_BINARY,
   EX_FUNC, EX_AGG, EX_CASE, EX_CAST, EX_IN, EX_BETWEEN, EX_EXISTS,
-  EX_SUBQUERY, EX_STAR
+  EX_SUBQUERY, EX_STAR,
+  /* Window function call: function name + args (like EX_FUNC) plus a window
+  ** spec (PARTITION BY / ORDER BY) on `win`. */
+  EX_WINDOW
 } tdb_expr_kind;
 
 typedef struct tdb_expr     tdb_expr;
 typedef struct tdb_exprlist tdb_exprlist;
 typedef struct tdb_select   tdb_select;
+typedef struct tdb_orderby  tdb_orderby;
+
+/* Window spec: PARTITION BY <exprs> ORDER BY <exprs>. Frame clauses are
+** unsupported; the executor implicitly uses "ROWS BETWEEN UNBOUNDED PRECEDING
+** AND CURRENT ROW" for running aggregates, and the whole partition for
+** ranking functions (ROW_NUMBER/RANK/DENSE_RANK). */
+typedef struct tdb_window {
+  tdb_exprlist *partition;       /* PARTITION BY ..., or NULL */
+  tdb_orderby  *order;           /* ORDER BY ..., or NULL */
+} tdb_window;
 
 struct tdb_exprlist {
   tdb_expr **items;
@@ -51,10 +64,12 @@ struct tdb_expr {
   int           outer_level;/* 0 = local; >0 = correlated ref N scopes outward */
   int           agg_index;/* analyzer: aggregate slot, or -1 */
   int           fn_id;    /* analyzer: resolved builtin/aggregate id */
+  int           win_index;/* analyzer: resolved window slot, or -1 */
   tdb_expr     *left;
   tdb_expr     *right;
   tdb_exprlist *args;     /* func args / IN list / CASE when-then pairs */
   tdb_select   *subquery; /* EX_SUBQUERY / EX_EXISTS / EX_IN (subquery form) */
+  tdb_window   *win;      /* EX_WINDOW: OVER (PARTITION BY ... ORDER BY ...) */
 };
 
 /* ------------------------------- SELECT ------------------------------- */

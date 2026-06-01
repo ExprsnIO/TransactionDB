@@ -1,14 +1,15 @@
 /* tdb_exec_stream.inc — pull-based (volcano) operator tree.
 **
 ** Included by tdb_exec.c after the materializing executor, this introduces a
-** small family of demand-driven operators — Scan, Filter, Sort, Project, Limit
-** — wired child-to-parent so each next() pulls one row from below. A SELECT
-** that is a single base-table scan with an optional WHERE / ORDER BY /
-** projection / LIMIT is compiled into such a tree; the row at a time pull means
-** a LIMIT stops the scan early instead of materializing the whole table first.
-** Sort is the one blocking operator: it drains its child once, but when ORDER
-** BY is paired with LIMIT it keeps only the top (OFFSET+LIMIT) rows in a
-** bounded heap rather than buffering the entire input.
+** small family of demand-driven operators — Scan, Join, Filter, Sort, Project,
+** Limit — wired child-to-parent so each next() pulls one row from below. A
+** SELECT over one or more base tables (INNER/CROSS joins, left-deep) with an
+** optional WHERE / ORDER BY / projection / LIMIT is compiled into such a tree;
+** the row at a time pull means a LIMIT stops the scan early instead of
+** materializing the whole result first. Join is a nested loop: it re-scans the
+** inner table for each outer row. Sort is the one blocking operator: it drains
+** its child once, but when ORDER BY is paired with LIMIT it keeps only the top
+** (OFFSET+LIMIT) rows in a bounded heap rather than buffering the entire input.
 **
 ** tdb_step() pulls one row per call straight through the tree (see
 ** tdb_stmt_stream_next): nothing is collected into st->rows, so memory stays
@@ -18,7 +19,7 @@
 ** even as the connection commits other writes.
 */
 
-typedef enum { OP_SCAN, OP_FILTER, OP_SORT, OP_PROJECT, OP_LIMIT } op_kind;
+typedef enum { OP_SCAN, OP_JOIN, OP_FILTER, OP_SORT, OP_PROJECT, OP_LIMIT } op_kind;
 
 /* one buffered row inside a Sort operator: the (owned) source row and its
 ** computed sort-key vector */
@@ -39,9 +40,22 @@ typedef struct tdb_op {
   int            has_range;
   uint8_t        colmask[64];
   int            has_mask;
+  tdb_txn       *txn;         /* read transaction (for re-opening on rewind) */
 
   /* OP_FILTER */
   tdb_expr      *pred;
+
+  /* OP_JOIN (left-deep nested loop over INNER/CROSS base-table joins). `child`
+  ** is the outer (left) subtree; `inner` is the right Scan, re-scanned per
+  ** outer row. The join emits a combined row of `joinncol` values: the outer
+  ** row's columns followed by the inner table's, at offset `inner_base`. */
+  struct tdb_op *inner;
+  tdb_expr      *on;          /* INNER join ON predicate (NULL for CROSS) */
+  tdb_value     *joinrow;     /* reused combined row (joinncol values) */
+  int            joinncol;
+  int            inner_base;  /* column offset of the inner table in joinrow */
+  int            join_started;/* outer row pulled at least once */
+  int            join_eof;
 
   /* OP_PROJECT */
   tdb_expr     **oexpr;
@@ -83,20 +97,31 @@ static int expr_blocks_stream(const tdb_expr *e) {
   return 0;
 }
 
-static int select_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_table **out_tbl) {
+/* A streamable FROM is one or more base tables joined left-deep by INNER or
+** CROSS joins (no derived tables, views, outer joins, AS OF, or CTE shadowing).
+** Returns the source count (>=1) or 0 if not streamable. */
+static int from_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q) {
+  int n = 0;
+  for (tdb_src *s = q->from; s; s = s->next) {
+    if (s->subquery || !s->table || s->as_of) return 0;
+    if (find_cte(st, s->table)) return 0;                /* CTE name shadows a table */
+    if (!tdb_catalog_find_table(db->cat, s->table)) return 0;   /* view / missing */
+    if (n > 0 && s->join != JOIN_INNER && s->join != JOIN_CROSS) return 0;
+    if (s->join == JOIN_INNER && expr_blocks_stream(s->on)) return 0;
+    if (++n > MAXSRC) return 0;
+  }
+  return n;
+}
+
+static int select_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q) {
   if (q->setop || q->group || q->having || q->distinct) return 0;
   if (q->with) return 0;        /* its CTEs (which may shadow a table) aren't in scope here */
-  if (!q->from || q->from->next || q->from->subquery) return 0;
-  if (!q->from->table || q->from->as_of) return 0;
-  if (find_cte(st, q->from->table)) return 0;            /* CTE name shadows a table */
-  tdb_table *t = tdb_catalog_find_table(db->cat, q->from->table);
-  if (!t) return 0;                                      /* view / missing: not here */
+  if (from_streamable(db, st, q) < 1) return 0;
   if (expr_blocks_stream(q->where)) return 0;
   if (q->cols) for (int i = 0; i < q->cols->n; i++)
     if (expr_blocks_stream(q->cols->items[i])) return 0;
   if (q->order) for (int i = 0; i < q->order->n; i++)   /* ORDER BY streams via a Sort op */
     if (expr_blocks_stream(q->order->exprs[i])) return 0;
-  *out_tbl = t;
   return 1;
 }
 
@@ -118,6 +143,55 @@ static int scan_next(tdb_op *op, tdb_value **row, int *ncol) {
   for (int i = 0; i < nc; i++) tdb_value_clear(&tmp[i]);
   *row = op->scanrow; *ncol = op->tbl->ncol;
   return TDB_ROW;
+}
+
+/* Re-open a Scan operator's underlying cursor from the start (inner side of a
+** nested-loop join, re-scanned once per outer row). */
+static int scan_rewind(tdb_op *op) {
+  if (op->scan) { op->db->engine->vtab->scan_close(op->scan); op->scan = NULL; }
+  return op->db->engine->vtab->scan_open(op->db->engine, op->txn, op->tbl,
+                                         NULL, NULL, 0,
+                                         op->has_mask ? op->colmask : NULL, &op->scan);
+}
+
+/* Nested-loop join: for each outer (left) row, scan the inner (right) table and
+** emit the combined rows that satisfy the ON predicate (all rows for CROSS).
+** The combined row is the outer row's columns followed by the inner table's. */
+static int join_next(tdb_op *op, tdb_value **row, int *ncol) {
+  for (;;) {
+    if (!op->join_started || op->join_eof) {
+      /* advance the outer side and (re)start the inner scan */
+      tdb_value *orow; int onc;
+      int rc = op_next(op->child, &orow, &onc);
+      if (rc != TDB_ROW) return rc;
+      for (int i = 0; i < op->inner_base; i++) {
+        tdb_value_clear(&op->joinrow[i]);
+        if (i < onc) tdb_value_copy(&op->joinrow[i], &orow[i]);
+      }
+      rc = scan_rewind(op->inner);
+      if (rc) return rc;
+      op->join_started = 1; op->join_eof = 0;
+    }
+    /* pull the next inner row */
+    tdb_value *irow; int inc;
+    int rc = scan_next(op->inner, &irow, &inc);
+    if (rc == TDB_DONE) { op->join_eof = 1; continue; }   /* outer advances */
+    if (rc != TDB_ROW) return rc;
+    for (int i = 0; i < op->inner->tbl->ncol; i++) {
+      tdb_value_clear(&op->joinrow[op->inner_base + i]);
+      if (i < inc) tdb_value_copy(&op->joinrow[op->inner_base + i], &irow[i]);
+    }
+    if (op->on) {
+      ectx ec = { op->joinrow, op->joinncol, NULL, 0, op->st, NULL, NULL };
+      tdb_value v; tdb_value_init(&v);
+      eval(op->db, &ec, op->on, &v);
+      int ok = val_true(&v);
+      tdb_value_clear(&v);
+      if (!ok) continue;
+    }
+    *row = op->joinrow; *ncol = op->joinncol;
+    return TDB_ROW;
+  }
 }
 
 static int filter_next(tdb_op *op, tdb_value **row, int *ncol) {
@@ -257,6 +331,7 @@ static int sort_next(tdb_op *op, tdb_value **row, int *ncol) {
 static int op_next(tdb_op *op, tdb_value **row, int *ncol) {
   switch (op->kind) {
     case OP_SCAN:    return scan_next(op, row, ncol);
+    case OP_JOIN:    return join_next(op, row, ncol);
     case OP_FILTER:  return filter_next(op, row, ncol);
     case OP_SORT:    return sort_next(op, row, ncol);
     case OP_PROJECT: return project_next(op, row, ncol);
@@ -279,6 +354,9 @@ static void op_close(tdb_op *op) {
   } else if (op->kind == OP_SORT) {
     for (int i = 0; i < op->nheap; i++) sortent_free(&op->heap[i], op->srcncol, op->nkey);
     tdb_mfree(op->heap);     /* okeys/odesc point into the AST (arena) */
+  } else if (op->kind == OP_JOIN) {
+    if (op->inner) op_close(op->inner);
+    if (op->joinrow) { for (int i = 0; i < op->joinncol; i++) tdb_value_clear(&op->joinrow[i]); tdb_mfree(op->joinrow); }
   }
   tdb_mfree(op);
 }
@@ -295,14 +373,23 @@ static tdb_op *op_new(op_kind k, tdb_db *db, tdb_stmt *st) {
 ** or return NULL (caller falls back to the materializing executor). On success
 ** st->ncol / st->colnames are set and the scan is opened against `txn`. */
 static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_txn *txn) {
-  tdb_table *t = NULL;
-  if (!select_streamable(db, st, q, &t)) return NULL;
+  if (!select_streamable(db, st, q)) return NULL;
 
-  /* resolve WHERE + projection against a single-source context */
+  /* resolve every clause against the combined multi-source context */
   qctx Q; memset(&Q, 0, sizeof(Q));
-  Q.src[0].tbl = t; Q.src[0].base = 0; Q.src[0].ncol = t->ncol;
-  Q.nsrc = 1; Q.totalcols = t->ncol;
+  for (tdb_src *s = q->from; s; s = s->next) {
+    tdb_table *t = tdb_catalog_find_table(db->cat, s->table);
+    qsrc *qs = &Q.src[Q.nsrc];
+    qs->tbl = t; qs->alias = s->alias; qs->base = Q.totalcols; qs->ncol = t->ncol;
+    qs->join = s->join; qs->on = s->on;
+    Q.totalcols += t->ncol;
+    Q.nsrc++;
+  }
+  tdb_table *t = Q.src[0].tbl;   /* the (left-most) driving table */
 
+  /* ON conditions, WHERE, ORDER BY all resolve against the full row */
+  for (int s = 0; s < Q.nsrc; s++)
+    if (Q.src[s].on && resolve_expr(db, &Q, Q.src[s].on)) return NULL;
   if (q->where && resolve_expr(db, &Q, q->where)) return NULL;
   if (q->order) for (int i = 0; i < q->order->n; i++)
     if (resolve_expr(db, &Q, q->order->exprs[i])) return NULL;
@@ -322,16 +409,21 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
     tdb_expr *item = q->cols->items[i];
     char *alias = q->cols->aliases[i];
     if (item->kind == EX_STAR) {
-      if (item->table) {
-        const char *nm = t->name;
-        if (strcasecmp(nm, item->table) != 0) SFAIL;
-      }
-      for (int k = 0; k < t->ncol; k++) {
-        if (t->cols[k].hidden) continue;
-        tdb_expr *col = tdb_expr_new(st->arena, EX_COLUMN);
-        col->name = (char *)t->cols[k].name;
-        col->col_index = k;
-        SADD_OUT(col, t->cols[k].name);
+      /* '*' or 't.*' expands to the columns of the matching source(s), in the
+      ** combined-row order */
+      for (int s = 0; s < Q.nsrc; s++) {
+        qsrc *qs = &Q.src[s];
+        if (item->table) {
+          const char *nm = qs->alias ? qs->alias : qs->tbl->name;
+          if (strcasecmp(nm, item->table) != 0) continue;
+        }
+        for (int k = 0; k < qs->tbl->ncol; k++) {
+          if (qs->tbl->cols[k].hidden) continue;
+          tdb_expr *col = tdb_expr_new(st->arena, EX_COLUMN);
+          col->name = (char *)qs->tbl->cols[k].name;
+          col->col_index = qs->base + k;
+          SADD_OUT(col, qs->tbl->cols[k].name);
+        }
       }
     } else {
       if (resolve_expr(db, &Q, item)) SFAIL;
@@ -340,16 +432,17 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
     }
   }
 
-  /* index / spatial pick + projection pushdown mask for the scan */
+  /* Driving (left-most) scan. With a single source we push an index pick and
+  ** projection mask into it; with a join the driving and inner scans are full
+  ** scans (columns from several tables are needed, and pushdown across tables
+  ** would be unsound here). */
   tdb_index *idx = NULL; tdb_keyrange kr; int have_idx = 0;
   tdb_value_init(&kr.lo); tdb_value_init(&kr.hi);
-  if (t->nindex > 0 && pick_index(db, st, t, q->where, &idx, &kr)) have_idx = 1;
+  if (Q.nsrc == 1 && t->nindex > 0 && pick_index(db, st, t, q->where, &idx, &kr)) have_idx = 1;
 
-  /* The scan op holds the colmask (the columnar engine keeps the pointer and
-  ** dereferences it during the drain — it must outlive this function). */
   tdb_op *scan = op_new(OP_SCAN, db, st);
-  scan->tbl = t;
-  scan->has_mask = compute_colmask(t, q, scan->colmask);
+  scan->tbl = t; scan->txn = txn;
+  if (Q.nsrc == 1) scan->has_mask = compute_colmask(t, q, scan->colmask);
 
   tdb_scan *sc = NULL;
   int rc = db->engine->vtab->scan_open(db->engine, txn, t, have_idx ? idx : NULL,
@@ -357,12 +450,32 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
                                        scan->has_mask ? scan->colmask : NULL, &sc);
   tdb_value_clear(&kr.lo); tdb_value_clear(&kr.hi);
   if (rc) { op_close(scan); SFAIL; }
-
-  /* assemble the operator tree */
   scan->scan = sc;
   scan->scanrow = row_alloc(t->ncol);
 
+  /* chain a nested-loop join for each remaining source */
   tdb_op *src = scan;
+  int s_idx = 1;
+  for (tdb_src *s = q->from->next; s; s = s->next, s_idx++) {
+    qsrc *qs = &Q.src[s_idx];
+    tdb_op *inner = op_new(OP_SCAN, db, st);
+    inner->tbl = qs->tbl; inner->txn = txn;
+    inner->scanrow = row_alloc(qs->tbl->ncol);
+    /* inner scan is (re)opened on first pull / rewind; open it once now so an
+    ** early teardown has something well-formed to close */
+    rc = db->engine->vtab->scan_open(db->engine, txn, qs->tbl, NULL, NULL, 0, NULL, &inner->scan);
+    if (rc) { op_close(inner); op_close(src); SFAIL; }
+
+    tdb_op *join = op_new(OP_JOIN, db, st);
+    join->child = src;
+    join->inner = inner;
+    join->on = (s->join == JOIN_INNER) ? s->on : NULL;   /* CROSS has no ON */
+    join->inner_base = qs->base;
+    join->joinncol = qs->base + qs->tbl->ncol;
+    join->joinrow = row_alloc(join->joinncol);
+    src = join;
+  }
+
   if (q->where) {
     tdb_op *flt = op_new(OP_FILTER, db, st);
     flt->child = src; flt->pred = q->where;

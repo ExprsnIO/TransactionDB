@@ -61,7 +61,7 @@ errors here. Conversely, schemas are more self-enforcing.
 | `UPDATE ... SET ... WHERE` | ✅ | ✅ | |
 | `DELETE ... WHERE` | ✅ | ✅ | |
 | `CREATE TABLE` | ✅ | ✅ | `IF NOT EXISTS`, `TEMP`/`TEMPORARY`. |
-| `CREATE TABLE ... AS SELECT` | ❌ | ✅ | Parse error (`expected (`). |
+| `CREATE TABLE ... AS SELECT` | ✅ | ✅ | Schema is derived from the SELECT projection. |
 | `DROP TABLE` | ✅ | ✅ | `IF EXISTS`. |
 | `ALTER TABLE` | ✅ | ✅ | `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `RENAME TO`. |
 | `CREATE INDEX` / `DROP INDEX` | ✅ | ✅ | `UNIQUE`, `IF [NOT] EXISTS`, `USING BTREE/RTREE/...`. |
@@ -70,7 +70,7 @@ errors here. Conversely, schemas are more self-enforcing.
 | `BEGIN` / `COMMIT` / `ROLLBACK` | ✅ | ✅ | `BEGIN [TRANSACTION]`. |
 | `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` | ✅ | ✅ | Nested savepoint rollback verified. |
 | `EXPLAIN` | ⚠️ | ✅ | Prints a textual plan (e.g. `SCAN t`). Format is tdb's own, **not** SQLite's opcode listing. |
-| `EXPLAIN QUERY PLAN` | ❌ | ✅ | Parse error. |
+| `EXPLAIN QUERY PLAN` | ⚠️ | ✅ | Accepted; behaves like bare `EXPLAIN` (tdb plan format). |
 | `VACUUM` | ⚠️ | ✅ | Accepted; compaction semantics differ from SQLite. |
 | `PRAGMA ...` | ❌ | ✅ | Unrecognized statement. No pragmas at all. |
 | `ATTACH` / `DETACH` | ❌ | ✅ | Unrecognized statement. |
@@ -92,13 +92,13 @@ types than SQLite's five storage classes, but enforced rather than advisory.
 | `REAL` / `DOUBLE` / `FLOAT` | ✅ | ✅ (`REAL` affinity) | |
 | `DECIMAL(p,s)` / `NUMERIC(p,s)` | ✅ | ⚠️ (`NUMERIC` affinity, no real precision) | tdb tracks precision/scale. |
 | `TEXT` / `CLOB` / `CHAR(n)` / `VARCHAR(n)` | ✅ | ✅ (`TEXT` affinity) | tdb enforces length bounds. |
-| `BLOB` / `BINARY(n)` / `VARBINARY(n)` | ✅ | ✅ | Storage works; see blob **literals** caveat below. |
+| `BLOB` / `BINARY(n)` / `VARBINARY(n)` | ✅ | ✅ | Including `x'AABB'` literals. |
 | `BOOLEAN` / `BOOL` | ✅ | ⚠️ (stored as int) | `TRUE`/`FALSE` → `1`/`0`. |
 | `DATE` / `TIME` / `TIMESTAMP` / `DATETIME` | ⚠️ | ⚠️ | Type declarable & storable, but **no date/time functions** (see below). |
 | `JSON` | ⚠️➕ | ⚠️ (`JSON1` ext) | Type exists; **no JSON functions** (`json_extract`, etc.). |
 | `UUID` | ➕ | ❌ | Declared type. |
 | `GEOMETRY` / `GEOGRAPHY` / `POINT` | ➕ | ❌ | Spatial types with `ST_*` functions. |
-| Blob literal `x'AABB'` | ❌ | ✅ | **Does not work** in practice (`unexpected trailing tokens` / `expected )`). Bind a blob via the API instead. |
+| Blob literal `x'AABB'` | ✅ | ✅ | Decoded to bytes at parse time. |
 
 ---
 
@@ -131,8 +131,8 @@ types than SQLite's five storage classes, but enforced rather than advisory.
 | `LEFT [OUTER] JOIN` | ✅ | ✅ | Unmatched right side → `NULL` (verified). |
 | `RIGHT [OUTER] JOIN` | ✅ | ❌ | tdb supports it; **SQLite historically did not** (added only in 3.39+). |
 | `FULL [OUTER] JOIN` | ✅ | ❌ | tdb supports it; **SQLite only since 3.39**. |
-| `JOIN ... USING (col)` | ❌ | ✅ | Parse error. |
-| `NATURAL JOIN` | ❌ | ✅ | `NATURAL` is **not a keyword** — silently misparsed as a table alias. Avoid. |
+| `JOIN ... USING (col)` | ✅ | ✅ | Desugared to an equi-`ON` at parse time. |
+| `NATURAL JOIN` | ✅ | ✅ | Join condition synthesized from shared column names. |
 
 ---
 
@@ -165,7 +165,7 @@ types than SQLite's five storage classes, but enforced rather than advisory.
 | `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT)` | ✅ | ✅ | |
 | `SUM` / `AVG` / `MIN` / `MAX` | ✅ | ✅ | |
 | `TOTAL` | ✅ | ✅ | Returns `0.0` (not NULL) over no rows. |
-| `GROUP_CONCAT` | ❌ | ✅ | Recognized as an aggregate name but **returns NULL** — not implemented. |
+| `GROUP_CONCAT(x[, sep])` | ✅ | ✅ | Default separator is `,`. |
 
 ### Scalar functions
 
@@ -173,17 +173,20 @@ types than SQLite's five storage classes, but enforced rather than advisory.
 | -------- | :-: | :----: | ----- |
 | `LENGTH`, `UPPER`, `LOWER` | ✅ | ✅ | |
 | `SUBSTR(s,pos[,len])` | ✅ | ✅ | |
-| `TRIM` / `LTRIM` / `RTRIM` | ⚠️ | ✅ | Whitespace only — **no custom trim-character argument**. |
+| `TRIM` / `LTRIM` / `RTRIM` | ✅ | ✅ | 1- or 2-arg form (custom trim chars in the 2nd). |
 | `REPLACE(s,from,to)` | ✅ | ✅ | |
 | `INSTR(s,sub)` | ✅ | ✅ | 1-based. |
 | `ABS`, `ROUND(x[,n])` | ✅ | ✅ | |
 | `COALESCE`, `IFNULL`, `NULLIF` | ✅ | ✅ | |
 | `TYPEOF` | ✅ | ✅ | |
 | `MIN(a,b,...)` / `MAX(a,b,...)` (scalar form) | ✅ | ✅ | Multi-arg scalar variant. |
-| `HEX`, `QUOTE`, `RANDOM`, `PRINTF`/`FORMAT`, `CHAR`, `UNICODE`, `GLOB()` | ❌ | ✅ | Not implemented. |
-| `LAST_INSERT_ROWID`, `CHANGES`, `SQLITE_VERSION` | ❌ | ✅ | Use the C API (`tdb_last_insert_rowid`, etc.) instead. |
-| Date/time: `DATE`, `TIME`, `DATETIME`, `STRFTIME`, `JULIANDAY` | ❌ | ✅ | `date('now')` returns NULL. No date/time function library. |
-| JSON: `json_extract`, `json_object`, … | ❌ | ⚠️ (`JSON1`) | None, despite the `JSON` type. |
+| `HEX`, `UNHEX` | ✅ | ✅ | From the built-in crypto suite. |
+| `QUOTE`, `CHAR`, `UNICODE`, `RANDOM`, `RANDOMBLOB` | ✅ | ✅ | |
+| `PRINTF`/`FORMAT` | ✅ | ✅ | `%d %u %x %o %f %g %e %s %c %q %Q %%` + width/precision. |
+| `LAST_INSERT_ROWID`, `CHANGES`, `TOTAL_CHANGES`, `SQLITE_VERSION` | ✅ | ✅ | Also exposed as `tdb_last_insert_rowid()` / `tdb_changes()` / `tdb_total_changes()` in the C API. |
+| Date/time: `DATE`, `TIME`, `DATETIME`, `STRFTIME`, `JULIANDAY`, `UNIXEPOCH` | ✅ | ✅ | `'now'`, ISO timestamps, JD, and `+/-N day|hour|minute|second|month|year` / `start of day|month|year` / `unixepoch` modifiers. |
+| `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_TIMESTAMP` (as functions) | ✅ | ✅ | |
+| JSON: `json_object`, `json_array`, `json_extract`, `json_type`, `json_valid`, `json_array_length`, `json` | ✅ | ⚠️ (`JSON1`) | Minimal but functional. `$.path` / `$[idx]` accessors. JSON-typed text composes cleanly. |
 
 ---
 
@@ -197,9 +200,9 @@ violate them** — they are recognized syntactically but not yet enforced.
 | `PRIMARY KEY` (single & composite) | ✅ | ✅ | `INTEGER PRIMARY KEY` ↔ rowid. |
 | `NOT NULL` | ✅ | ✅ | **Enforced** (`NOT NULL constraint failed`). |
 | `AUTOINCREMENT` | ✅ | ✅ | Monotonic ids verified. |
-| `DEFAULT` | ⚠️ | ✅ | Parsed but **not applied** — omitted column became `NULL`, not the default, in testing. |
-| `UNIQUE` | ⚠️ | ✅ | Parsed but **not enforced** — duplicate values were accepted. |
-| `CHECK (...)` | ⚠️ | ✅ | Parsed but **not enforced** — a violating row (`a > 0` with `-5`) was accepted. |
+| `DEFAULT` | ✅ | ✅ | Applied for columns omitted in `INSERT`. |
+| `UNIQUE` | ⚠️ | ✅ | Parsed but **not enforced** for non-PK columns. |
+| `CHECK (...)` | ✅ | ✅ | Evaluated on INSERT/UPDATE; failure raises `CHECK constraint failed`. |
 | `FOREIGN KEY` / `REFERENCES` | ⚠️ | ✅ (opt-in) | Parsed but **no referential integrity** — orphan rows accepted. |
 | `COLLATE` (in column def) | ⚠️ | ✅ | `BINARY`/`NOCASE` parsed; not usable in expressions. |
 | Named `CONSTRAINT` | ⚠️ | ✅ | Captured, not fully used. |
@@ -220,7 +223,7 @@ violate them** — they are recognized syntactically but not yet enforced.
 | Numbered `?N` | ✅ | ✅ | |
 | Named `:name` | ✅ | ✅ | |
 | Named `$name` / `$N` | ✅➕ | ⚠️ | PostgreSQL-style; SQLite accepts `$` but tdb leans into it. |
-| Named `@name` | ❌ | ✅ | Not recognized. |
+| Named `@name` | ✅ | ✅ | Accepted by the lexer as a parameter. |
 | `RETURNING (...)` on INSERT/UPDATE/DELETE | ✅ | ✅ (3.35+) | Verified. |
 | `INSERT OR REPLACE` / `OR IGNORE` | ✅ | ✅ | |
 | `ON CONFLICT (col) DO NOTHING` | ✅ | ✅ | |
@@ -269,16 +272,12 @@ Features TransactionDB has that SQLite does not:
 Things most likely to bite when porting SQLite SQL:
 
 1. **Strict typing.** Rows that violate declared column types are rejected, not coerced.
-2. **Unenforced constraints.** `UNIQUE`, `CHECK`, `FOREIGN KEY`, and `DEFAULT` are
-   parsed but do not yet guard/populate data — don't rely on them for correctness.
-3. **No `PRAGMA`, `ATTACH`, triggers, window functions, recursive CTEs, or `CREATE
-   TABLE AS SELECT`.**
-4. **No date/time, JSON, or many utility scalar functions** (`hex`, `printf`,
-   `random`, `last_insert_rowid`, `group_concat`, …). Use the C API where one exists.
-5. **Blob literals `x'..'` don't work** — bind blobs through the API.
-6. **`NATURAL JOIN` / `JOIN ... USING` aren't supported** (`NATURAL` is misread as an
-   alias). Write explicit `ON` conditions.
-7. **`EXPLAIN`** prints tdb's own plan format, not SQLite opcodes.
+2. **Partially enforced constraints.** `NOT NULL`, `CHECK`, and `DEFAULT` are now
+   enforced. `UNIQUE` (on non-PK columns) and `FOREIGN KEY` are still parsed but
+   not yet enforced.
+3. **No `PRAGMA`, `ATTACH`, triggers, window functions, or recursive CTEs.**
+4. **`EXPLAIN`** prints tdb's own plan format, not SQLite opcodes. `EXPLAIN
+   QUERY PLAN` is accepted but uses the same format.
 
 ---
 

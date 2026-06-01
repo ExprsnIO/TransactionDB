@@ -179,16 +179,8 @@ int tdb_lex_next(tdb_lexer *lx, tdb_token *out) {
   int c = at(lx, 0);
   out->z = start;
 
-  /* identifiers / keywords */
-  if (is_id_start(c)) {
-    size_t s = lx->pos;
-    while (lx->pos < lx->len && is_id_char((unsigned char)lx->z[lx->pos])) lx->pos++;
-    out->n = (int)(lx->pos - s);
-    out->kind = tdb_keyword_lookup(out->z, out->n);
-    return out->kind;
-  }
-
-  /* x'AABB' blob */
+  /* x'AABB' blob literal — must be checked before the identifier branch so
+  ** the leading 'x' is not consumed as a name. */
   if ((c == 'x' || c == 'X') && at(lx, 1) == '\'') {
     lx->pos += 2;
     out->z = lx->z + lx->pos;
@@ -197,6 +189,15 @@ int tdb_lex_next(tdb_lexer *lx, tdb_token *out) {
     out->n = (int)(lx->pos - s);
     if (lx->pos < lx->len) lx->pos++;
     out->kind = TK_BLOB;
+    return out->kind;
+  }
+
+  /* identifiers / keywords */
+  if (is_id_start(c)) {
+    size_t s = lx->pos;
+    while (lx->pos < lx->len && is_id_char((unsigned char)lx->z[lx->pos])) lx->pos++;
+    out->n = (int)(lx->pos - s);
+    out->kind = tdb_keyword_lookup(out->z, out->n);
     return out->kind;
   }
 
@@ -270,7 +271,7 @@ int tdb_lex_next(tdb_lexer *lx, tdb_token *out) {
     out->kind = TK_PARAM;
     return out->kind;
   }
-  if (c == '?' || c == ':') {
+  if (c == '?' || c == ':' || c == '@') {
     lx->pos++;
     while (lx->pos < lx->len && is_id_char((unsigned char)lx->z[lx->pos])) lx->pos++;
     out->n = (int)(lx->z + lx->pos - start);

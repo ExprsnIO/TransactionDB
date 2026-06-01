@@ -10,6 +10,9 @@ typedef struct {
   int      has;
   tdb_value *seen;          /* DISTINCT: values already counted */
   int       nseen, capseen;
+  tdb_buf   gc;             /* GROUP_CONCAT accumulator */
+  int       gc_init;
+  char     *gc_sep;         /* separator (default ",") */
 } accum;
 
 typedef struct {
@@ -29,6 +32,7 @@ static int const_int(tdb_db *db, tdb_stmt *st, tdb_expr *e, int64_t dflt) {
 }
 
 static void accum_update(accum *ac, tdb_expr *agg, tdb_db *db, ectx *ec) {
+  int is_gc = agg->name && !strcasecmp(agg->name, "group_concat");
   int is_star = agg->args && agg->args->n == 1 && agg->args->items[0]->kind == EX_STAR;
   if (is_star) { ac->count++; return; }
   if (!agg->args || agg->args->n < 1) { ac->count++; return; }
@@ -54,6 +58,21 @@ static void accum_update(accum *ac, tdb_expr *agg, tdb_db *db, ectx *ec) {
       if (tdb_value_compare(&v, &ac->mn, TDB_COLL_BINARY) < 0) { tdb_value_clear(&ac->mn); tdb_value_copy(&ac->mn, &v); }
       if (tdb_value_compare(&v, &ac->mx, TDB_COLL_BINARY) > 0) { tdb_value_clear(&ac->mx); tdb_value_copy(&ac->mx, &v); }
     }
+    if (is_gc) {
+      if (!ac->gc_init) { tdb_buf_init(&ac->gc); ac->gc_init = 1; }
+      if (!ac->gc_sep) {
+        if (agg->args->n >= 2) {
+          tdb_value sv; tdb_value_init(&sv);
+          eval(db, ec, agg->args->items[1], &sv);
+          const char *st = tdb_value_as_text(&sv);
+          ac->gc_sep = tdb_strdup(st ? st : ",");
+          tdb_value_clear(&sv);
+        } else ac->gc_sep = tdb_strdup(",");
+      }
+      if (ac->gc.len > 0) tdb_buf_append(&ac->gc, ac->gc_sep, strlen(ac->gc_sep));
+      const char *t = tdb_value_as_text(&v);
+      if (t) tdb_buf_append(&ac->gc, t, strlen(t));
+    }
   }
   tdb_value_clear(&v);
 }
@@ -73,6 +92,9 @@ static void accum_result(const accum *ac, tdb_expr *agg, tdb_value *out) {
     if (ac->has) tdb_value_copy(out, &ac->mn); else tdb_value_set_null(out);
   } else if (!strcasecmp(fn, "max")) {
     if (ac->has) tdb_value_copy(out, &ac->mx); else tdb_value_set_null(out);
+  } else if (!strcasecmp(fn, "group_concat")) {
+    if (!ac->gc_init || ac->gc.len == 0) tdb_value_set_null(out);
+    else tdb_value_set_text(out, (const char *)ac->gc.data, (int)ac->gc.len, 1);
   } else tdb_value_set_null(out);
 }
 
@@ -259,6 +281,63 @@ static int compute_colmask(tdb_table *t, tdb_select *q, uint8_t *mask) {
   return 1;
 }
 
+/* Build "<prev>.col = <cur>.col" as a single equi-predicate expression. */
+static tdb_expr *make_join_eq(tdb_arena *a, qsrc *prev, qsrc *cur, const char *col) {
+  tdb_expr *l = tdb_expr_new(a, EX_COLUMN);
+  l->table = (char *)(prev->alias ? prev->alias : (prev->tbl ? prev->tbl->name : ""));
+  l->name = tdb_arena_strndup(a, col, strlen(col));
+  tdb_expr *r = tdb_expr_new(a, EX_COLUMN);
+  r->table = (char *)(cur->alias ? cur->alias : (cur->tbl ? cur->tbl->name : ""));
+  r->name = tdb_arena_strndup(a, col, strlen(col));
+  tdb_expr *eq = tdb_expr_new(a, EX_BINARY);
+  eq->op = TK_EQ; eq->left = l; eq->right = r;
+  return eq;
+}
+
+/* Conjoin two predicates with AND, allowing either to be NULL. */
+static tdb_expr *and_expr(tdb_arena *a, tdb_expr *l, tdb_expr *r) {
+  if (!l) return r;
+  if (!r) return l;
+  tdb_expr *e = tdb_expr_new(a, EX_BINARY);
+  e->op = TK_AND; e->left = l; e->right = r;
+  return e;
+}
+
+/* True if column `name` exists in qsrc `s` (base table or derived). */
+static int qsrc_has_col(qsrc *s, const char *name) {
+  if (s->tbl) return tdb_table_find_column(s->tbl, name) >= 0;
+  for (int i = 0; i < s->ncol; i++)
+    if (s->colnames[i] && !strcasecmp(s->colnames[i], name)) return 1;
+  return 0;
+}
+
+/* Iterate the column names of qsrc `s` (callback receives name). */
+static const char *qsrc_col_name(qsrc *s, int i) {
+  if (s->tbl) return (i >= 0 && i < s->tbl->ncol) ? s->tbl->cols[i].name : NULL;
+  return (i >= 0 && i < s->ncol) ? s->colnames[i] : NULL;
+}
+
+/* Synthesize the join condition for a USING or NATURAL join. Updates qs->on so
+** the standard join code path (and resolve_expr) treats it like an ON. */
+static void synth_join_on(tdb_stmt *st, tdb_src *s, qctx *Q, int idx) {
+  if (idx <= 0) return;
+  qsrc *prev = &Q->src[idx - 1];
+  qsrc *cur  = &Q->src[idx];
+  tdb_expr *cond = NULL;
+  if (s->nusing > 0) {
+    for (int i = 0; i < s->nusing; i++)
+      cond = and_expr(st->arena, cond, make_join_eq(st->arena, prev, cur, s->using_cols[i]));
+  } else if (s->natural) {
+    int n = cur->tbl ? cur->tbl->ncol : cur->ncol;
+    for (int i = 0; i < n; i++) {
+      const char *cn = qsrc_col_name(cur, i);
+      if (cn && qsrc_has_col(prev, cn))
+        cond = and_expr(st->arena, cond, make_join_eq(st->arena, prev, cur, cn));
+    }
+  }
+  if (cond) cur->on = cond;
+}
+
 /* Resolve a FROM item (base table / derived table / view) and materialize its
 ** rows into `set`, filling Q->src[idx] (caller advances totalcols/nsrc). */
 static int materialize_source(tdb_db *db, tdb_stmt *st, qctx *Q, int idx,
@@ -374,6 +453,9 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer
               tdb_value_clear(&krange.lo); tdb_value_clear(&krange.hi); return rc; }
     Q.totalcols += Q.src[idx].ncol;
     Q.nsrc++;
+    /* USING (..) / NATURAL JOIN: build the implicit ON from column names. */
+    if ((s->nusing > 0 || s->natural) && !Q.src[idx].on)
+      synth_join_on(st, s, &Q, idx);
   }
 
   /* 2. resolve ON conditions + clauses (collect aggregates) */
@@ -511,6 +593,8 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer
         tdb_value_clear(&groups[g].acc[j].mn); tdb_value_clear(&groups[g].acc[j].mx);
         for (int k = 0; k < groups[g].acc[j].nseen; k++) tdb_value_clear(&groups[g].acc[j].seen[k]);
         tdb_mfree(groups[g].acc[j].seen);
+        if (groups[g].acc[j].gc_init) tdb_buf_free(&groups[g].acc[j].gc);
+        tdb_mfree(groups[g].acc[j].gc_sep);
       }
       tdb_mfree(groups[g].acc);
     }

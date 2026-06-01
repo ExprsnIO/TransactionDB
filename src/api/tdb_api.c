@@ -109,6 +109,10 @@ const char *tdb_errmsg(tdb_db *db) {
   return db->errmsg[0] ? db->errmsg : "not an error";
 }
 
+int64_t tdb_last_insert_rowid(tdb_db *db) { return db ? db->last_insert_rowid : 0; }
+int     tdb_changes(tdb_db *db)           { return db ? (int)db->changes : 0; }
+int64_t tdb_total_changes(tdb_db *db)     { return db ? db->total_changes : 0; }
+
 void tdb_free(void *p) { tdb_mfree(p); }
 
 /* ------------------------------ statements ---------------------------- */

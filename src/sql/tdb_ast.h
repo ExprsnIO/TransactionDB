@@ -70,6 +70,9 @@ typedef struct tdb_src {
   tdb_join_kind  join;      /* join to the PRECEDING source */
   tdb_expr      *on;        /* ON condition */
   tdb_expr      *as_of;     /* FOR SYSTEM_TIME AS OF <expr>, or NULL */
+  char         **using_cols;/* USING (col, ...) — synthesized to ON at execution */
+  int            nusing;
+  int            natural;   /* NATURAL JOIN: join on all same-named columns */
   struct tdb_src *next;
 } tdb_src;
 
@@ -139,6 +142,7 @@ typedef struct tdb_create_table {
   int         columnar;             /* WITH COLUMNAR */
   char       *period_start;         /* PERIOD FOR SYSTEM_TIME (start,end) */
   char       *period_end;
+  tdb_select *as_select;            /* CREATE TABLE ... AS SELECT (or NULL) */
 } tdb_create_table;
 
 typedef struct tdb_create_index {

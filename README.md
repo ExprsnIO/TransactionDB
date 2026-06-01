@@ -49,15 +49,29 @@ readers proceed concurrently without blocking.
 The SQL surface is intentionally a subset and growing. Currently recognized constructs
 include:
 
-- `CREATE TABLE` / `DROP TABLE`, `CREATE INDEX`
+- `CREATE TABLE [AS SELECT]` / `DROP TABLE`, `CREATE INDEX`
 - `INSERT INTO ... VALUES`, `UPDATE ... SET`, `DELETE`
-- `SELECT` with `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, joins,
-  and the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` aggregates
-- Correlated subqueries
-- `BEGIN` / `COMMIT` / `ROLLBACK`
+- `SELECT` with `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, joins
+  (`INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS` / `NATURAL`, `ON` and `USING (col)`),
+  and the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` / `TOTAL` / `GROUP_CONCAT` aggregates
+- Correlated subqueries, CTEs (`WITH`), and `UNION` / `INTERSECT` / `EXCEPT`
+- `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT` / `RELEASE` / `ROLLBACK TO`
 - `CREATE FUNCTION`/`PROCEDURE ... LANGUAGE PLSQL`/`LUA`, and `CALL`
-- Scalar functions including `row(...)`/`composite_extract(...)`, the crypto suite,
-  and the sequence functions `nextval`/`currval`/`setval`
+- SQLite-compatible scalar functions: `LENGTH`, `UPPER`/`LOWER`, `SUBSTR`,
+  `TRIM`/`LTRIM`/`RTRIM` (1- or 2-arg), `REPLACE`, `INSTR`, `ABS`, `ROUND`,
+  `COALESCE`/`IFNULL`/`NULLIF`, `TYPEOF`, `HEX`/`UNHEX`, `QUOTE`, `CHAR`,
+  `UNICODE`, `RANDOM`, `PRINTF`/`FORMAT`, `LAST_INSERT_ROWID`, `CHANGES`,
+  `TOTAL_CHANGES`, `SQLITE_VERSION`, and the spatial `ST_*` family
+- Date/time: `DATE`, `TIME`, `DATETIME`, `STRFTIME`, `JULIANDAY`, `UNIXEPOCH`,
+  `CURRENT_*` — with `'now'`, ISO timestamps, and `+/-N unit` / `start of unit`
+  modifiers
+- JSON: `json_object`, `json_array`, `json_extract`, `json_type`, `json_valid`,
+  `json_array_length`, `json`
+- Built-in `row(...)` / `composite_extract(...)`, crypto suite, sequence functions
+  (`nextval` / `currval` / `setval`)
+- Constraints: `NOT NULL`, `CHECK` enforced; `DEFAULT` applied for omitted columns
+- Parameter binding: `?`, `?N`, `:name`, `$name`, `@name`
+- Blob literals `x'AABB'`
 - Types: `INTEGER`, `REAL`, `TEXT`, `BLOB`, `COMPOSITE`/`ROW`, with `PRIMARY KEY`
 - The full SQL keyword set is introspectable via `tdb_keyword_count` /
   `tdb_keyword_name` / `tdb_keyword_check` (à la SQLite)

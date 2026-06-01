@@ -848,11 +848,8 @@ int tdb_cursor_data(tdb_cursor *c, const uint8_t **val, int *vlen) {
   return TDB_OK;
 }
 
-int tdb_cursor_last(tdb_cursor *c) {
+static int descend_rightmost(tdb_cursor *c, tdb_pgno pgno, int level) {
   tdb_btree *bt = c->bt;
-  if (c->leaf) { tdb_pager_unref(bt->p, c->leaf); c->leaf = NULL; }
-  tdb_pgno pgno = bt->root;
-  int level = 0;
   for (;;) {
     c->page[level] = pgno;
     tdb_page *pg;
@@ -861,12 +858,12 @@ int tdb_cursor_last(tdb_cursor *c) {
     int n = pg_ncell(pg);
     if (pg_is_leaf(pg)) {
       c->depth = level;
-      c->cidx[level] = n - 1;
-      c->leaf = pg;
+      c->cidx[level] = (n > 0) ? n - 1 : 0;
+      c->leaf = pg;          /* keep pinned */
       c->eof = (n == 0);
       return TDB_OK;
     }
-    c->cidx[level] = n; /* right child */
+    c->cidx[level] = n; /* right pointer */
     tdb_pgno child = pg_right(pg);
     tdb_pager_unref(bt->p, pg);
     pgno = child;
@@ -874,11 +871,45 @@ int tdb_cursor_last(tdb_cursor *c) {
   }
 }
 
+int tdb_cursor_last(tdb_cursor *c) {
+  if (c->leaf) { tdb_pager_unref(c->bt->p, c->leaf); c->leaf = NULL; }
+  return descend_rightmost(c, c->bt->root, 0);
+}
+
+/* Step back to the predecessor leaf (used when the current leaf is exhausted
+** to the left). Mirror of next_leaf: walk up the ancestor stack until we find
+** an internal page whose previous child branch hasn't been visited, then
+** descend rightmost into it. */
+static int prev_leaf(tdb_cursor *c) {
+  tdb_btree *bt = c->bt;
+  if (c->leaf) { tdb_pager_unref(bt->p, c->leaf); c->leaf = NULL; }
+  for (int level = c->depth - 1; level >= 0; level--) {
+    tdb_page *pg;
+    int rc = tdb_pager_get(bt->p, c->page[level], &pg);
+    if (rc) return rc;
+    int prevci = c->cidx[level] - 1;
+    if (prevci >= 0) {
+      int n = pg_ncell(pg);
+      c->cidx[level] = prevci;
+      tdb_pgno child = (prevci < n) ? intcell_child(pg, prevci) : pg_right(pg);
+      tdb_pager_unref(bt->p, pg);
+      return descend_rightmost(c, child, level + 1);
+    }
+    tdb_pager_unref(bt->p, pg);
+  }
+  c->eof = 1;
+  return TDB_OK;
+}
+
 int tdb_cursor_prev(tdb_cursor *c) {
-  /* Only the simple within-leaf case is needed by current callers. */
   if (c->eof || !c->leaf) return TDB_OK;
   if (c->cidx[c->depth] > 0) { c->cidx[c->depth]--; return TDB_OK; }
-  c->eof = 1; /* crossing leaf boundary backwards is not yet supported */
+  int rc = prev_leaf(c);
+  if (rc) return rc;
+  while (!c->eof && pg_ncell(c->leaf) == 0) {
+    rc = prev_leaf(c);
+    if (rc) return rc;
+  }
   return TDB_OK;
 }
 

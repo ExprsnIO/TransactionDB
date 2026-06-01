@@ -7,7 +7,8 @@
 ** optional WHERE / ORDER BY / projection / LIMIT is compiled into such a tree;
 ** the row at a time pull means a LIMIT stops the scan early instead of
 ** materializing the whole result first. Join is a nested loop: it re-scans the
-** inner table for each outer row. Sort is the one blocking operator: it drains
+** inner table for each outer row, or seeks it via an index when the ON predicate
+** is an equijoin on an indexed inner column. Sort is the one blocking operator: it drains
 ** its child once, but when ORDER BY is paired with LIMIT it keeps only the top
 ** (OFFSET+LIMIT) rows in a bounded heap rather than buffering the entire input.
 **
@@ -56,6 +57,12 @@ typedef struct tdb_op {
   int            inner_base;  /* column offset of the inner table in joinrow */
   int            join_started;/* outer row pulled at least once */
   int            join_eof;
+  /* index-driven inner lookup: when the ON predicate has an equijoin on an
+  ** indexed inner column, seek the inner table to the outer value each pass
+  ** instead of full-scanning. `idx_join_key` is the outer expression supplying
+  ** the probe value; `inner_idx` is the inner index to seek. */
+  tdb_index     *inner_idx;
+  tdb_expr      *idx_join_key;
 
   /* OP_PROJECT */
   tdb_expr     **oexpr;
@@ -154,6 +161,21 @@ static int scan_rewind(tdb_op *op) {
                                          op->has_mask ? op->colmask : NULL, &op->scan);
 }
 
+/* Re-open a Scan operator seeking `idx` to the equality value `key` (one outer
+** probe of an index-driven join). Returns rows whose leading index column
+** equals `key`; the join's ON predicate is still re-checked per row. */
+static int scan_rewind_seek(tdb_op *op, tdb_index *idx, const tdb_value *key) {
+  if (op->scan) { op->db->engine->vtab->scan_close(op->scan); op->scan = NULL; }
+  tdb_keyrange kr; memset(&kr, 0, sizeof(kr));
+  tdb_value_init(&kr.lo); tdb_value_init(&kr.hi);
+  tdb_value_copy(&kr.lo, key); kr.has_lo = 1; kr.lo_incl = 1;
+  tdb_value_copy(&kr.hi, key); kr.has_hi = 1; kr.hi_incl = 1;
+  int rc = op->db->engine->vtab->scan_open(op->db->engine, op->txn, op->tbl,
+                                           idx, &kr, 0, NULL, &op->scan);
+  tdb_value_clear(&kr.lo); tdb_value_clear(&kr.hi);
+  return rc;
+}
+
 /* Nested-loop join: for each outer (left) row, scan the inner (right) table and
 ** emit the combined rows that satisfy the ON predicate (all rows for CROSS).
 ** The combined row is the outer row's columns followed by the inner table's. */
@@ -168,7 +190,20 @@ static int join_next(tdb_op *op, tdb_value **row, int *ncol) {
         tdb_value_clear(&op->joinrow[i]);
         if (i < onc) tdb_value_copy(&op->joinrow[i], &orow[i]);
       }
-      rc = scan_rewind(op->inner);
+      if (op->inner_idx) {
+        /* index-driven probe: seek the inner table to the outer key value */
+        ectx ec = { op->joinrow, op->inner_base, NULL, 0, op->st, NULL, NULL };
+        tdb_value probe; tdb_value_init(&probe);
+        eval(op->db, &ec, op->idx_join_key, &probe);
+        if (probe.type == TDB_VAL_NULL) {       /* NULL never equals: skip outer row */
+          tdb_value_clear(&probe);
+          op->join_eof = 1; op->join_started = 1; continue;
+        }
+        rc = scan_rewind_seek(op->inner, op->inner_idx, &probe);
+        tdb_value_clear(&probe);
+      } else {
+        rc = scan_rewind(op->inner);
+      }
       if (rc) return rc;
       op->join_started = 1; op->join_eof = 0;
     }
@@ -363,6 +398,52 @@ static void op_close(tdb_op *op) {
 
 /* ------------------------------ build --------------------------------- */
 
+/* True if every column reference in `e` resolves to a slot < `limit` (i.e. it
+** depends only on already-produced outer columns, not the inner table). */
+static int expr_below(const tdb_expr *e, int limit) {
+  if (!e) return 1;
+  if (e->kind == EX_COLUMN) return e->col_index >= 0 && e->col_index < limit;
+  if (e->kind == EX_AGG || e->kind == EX_SUBQUERY || e->kind == EX_EXISTS) return 0;
+  if (!expr_below(e->left, limit) || !expr_below(e->right, limit)) return 0;
+  if (e->args) for (int i = 0; i < e->args->n; i++)
+    if (!expr_below(e->args->items[i], limit)) return 0;
+  return 1;
+}
+
+/* If `on` is (or AND-contains) an equality `outer_expr = inner.col` where
+** inner.col (a column of `inner_src`, base `inner_base`) carries a usable
+** single-column index and outer_expr depends only on outer columns, return that
+** index and set *probe to the outer-side expression. Else NULL. */
+static tdb_index *find_join_index(tdb_db *db, const tdb_src *fsrc,
+                                  const qsrc *inner_src, int inner_base,
+                                  tdb_expr *on, tdb_expr **probe) {
+  TDB_UNUSED(db);
+  if (!on) return NULL;
+  if (on->kind == EX_BINARY && on->op == TK_AND) {
+    tdb_index *l = find_join_index(db, fsrc, inner_src, inner_base, on->left, probe);
+    if (l) return l;
+    return find_join_index(db, fsrc, inner_src, inner_base, on->right, probe);
+  }
+  if (on->kind != EX_BINARY || on->op != TK_EQ) return NULL;
+  tdb_table *it = inner_src->tbl;
+  int hi = inner_base + it->ncol;   /* inner column slots: [inner_base, hi) */
+
+  for (int side = 0; side < 2; side++) {
+    tdb_expr *icol = side ? on->right : on->left;
+    tdb_expr *ocol = side ? on->left  : on->right;
+    if (icol->kind != EX_COLUMN) continue;
+    if (icol->col_index < inner_base || icol->col_index >= hi) continue; /* not inner */
+    if (!expr_below(ocol, inner_base)) continue;                         /* probe = outer only */
+    int incol = icol->col_index - inner_base;                            /* inner column index */
+    for (int xi = 0; xi < it->nindex; xi++) {
+      tdb_index *ix = &it->indexes[xi];
+      if (ix->kind == TDB_IDX_RTREE) continue;
+      if (ix->ncol >= 1 && ix->col_idx[0] == incol) { *probe = ocol; return ix; }
+    }
+  }
+  return NULL;
+}
+
 static tdb_op *op_new(op_kind k, tdb_db *db, tdb_stmt *st) {
   tdb_op *op = (tdb_op *)tdb_calloc(sizeof(*op));
   if (op) { op->kind = k; op->db = db; op->st = st; }
@@ -473,6 +554,13 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
     join->inner_base = qs->base;
     join->joinncol = qs->base + qs->tbl->ncol;
     join->joinrow = row_alloc(join->joinncol);
+    /* index-driven inner lookup when the ON is an equijoin on an indexed inner
+    ** column (the ON is still re-checked per row, so this is a pure accelerator) */
+    if (join->on) {
+      tdb_expr *probe = NULL;
+      tdb_index *jidx = find_join_index(db, s, qs, qs->base, join->on, &probe);
+      if (jidx) { join->inner_idx = jidx; join->idx_join_key = probe; }
+    }
     src = join;
   }
 

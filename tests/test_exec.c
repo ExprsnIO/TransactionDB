@@ -1397,6 +1397,53 @@ static void test_stream_join(void) {
   tdb_close(db);
 }
 
+static void test_stream_join_index(void) {
+  /* An index on the inner join column turns the per-outer full scan into a
+  ** seek; results must match the unindexed plan exactly. The ON predicate is
+  ** re-checked per row, so duplicate index keys and NULL probes are handled. */
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  exec(db, "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept INTEGER)");
+  exec(db, "INSERT INTO emp VALUES (1,10),(2,20),(3,10),(4,99),(5,NULL)");
+  exec(db, "CREATE TABLE dept (did INTEGER, dname TEXT)");
+  exec(db, "INSERT INTO dept VALUES (10,'eng'),(20,'sales'),(10,'eng2')");
+  int ids[64], n;
+
+  /* baseline (no index): emp 1->{eng,eng2}, 2->{sales}, 3->{eng,eng2},
+  ** 4->none, 5(NULL)->none  =>  5 rows */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp e JOIN dept d ON e.dept = d.did"), 5);
+
+  /* now index the inner column and re-run: identical result via the seek path */
+  exec(db, "CREATE INDEX dept_did ON dept(did)");
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp e JOIN dept d ON e.dept = d.did"), 5);
+
+  /* row-level check: emp 1 matches both dept rows with did=10 */
+  n = collect_ints(db,
+    "SELECT e.id FROM emp e JOIN dept d ON e.dept = d.did ORDER BY e.id, d.dname", ids, 64);
+  TDB_CHECK_EQ(n, 5);
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 1);   /* eng, eng2 */
+  TDB_CHECK_EQ(ids[2], 2);                            /* sales */
+  TDB_CHECK_EQ(ids[3], 3); TDB_CHECK_EQ(ids[4], 3);   /* eng, eng2 */
+
+  /* reversed ON (inner column on the left) still uses the index */
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM emp e JOIN dept d ON d.did = e.dept"), 5);
+
+  /* an extra non-equijoin conjunct: index seeks on the equijoin, ON re-checks */
+  n = collect_ints(db,
+    "SELECT e.id FROM emp e JOIN dept d ON e.dept = d.did AND d.dname = 'eng' ORDER BY e.id", ids, 64);
+  TDB_CHECK_EQ(n, 2);   /* only the 'eng' dept row; emp 1 and 3 */
+  TDB_CHECK_EQ(ids[0], 1); TDB_CHECK_EQ(ids[1], 3);
+
+  /* three-table join with the middle table indexed on its join key */
+  exec(db, "CREATE TABLE loc (dept INTEGER, city TEXT)");
+  exec(db, "CREATE INDEX loc_dept ON loc(dept)");
+  exec(db, "INSERT INTO loc VALUES (10,'NYC'),(20,'SF')");
+  TDB_CHECK_EQ(scalar(db,
+    "SELECT COUNT(*) FROM emp e JOIN dept d ON e.dept = d.did "
+    "JOIN loc l ON l.dept = d.did"), 5);   /* same 5 matched emp/dept rows, each one loc */
+
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"geospatial", test_geospatial},
   {"spatial_index", test_spatial_index},
@@ -1405,6 +1452,7 @@ static tdb_test_case cases[] = {
   {"stream_snapshot", test_stream_snapshot},
   {"stream_sort", test_stream_sort},
   {"stream_join", test_stream_join},
+  {"stream_join_index", test_stream_join_index},
   {"upsert", test_upsert},
   {"returning", test_returning},
   {"cte", test_cte},

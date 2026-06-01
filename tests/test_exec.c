@@ -1821,6 +1821,19 @@ static void test_recursive_cte(void) {
     "  SELECT 'a' UNION "
     "  SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node) "
     "SELECT COUNT(*) FROM reach"), 4);
+
+  /* The iteration cap is configurable per connection. Lowering it below
+  ** the recursion depth makes the query fail with the convergence error. */
+  TDB_CHECK_EQ(tdb_get_max_recursive_iters(db), 8192);  /* default */
+  TDB_CHECK_EQ(tdb_set_max_recursive_iters(db, 3), TDB_OK);
+  TDB_CHECK_EQ(tdb_get_max_recursive_iters(db), 3);
+  tdb_stmt *st = NULL;
+  TDB_CHECK_EQ(tdb_prepare_v2(db,
+    "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL "
+    "  SELECT n+1 FROM t WHERE n < 100) "
+    "SELECT COUNT(*) FROM t", -1, &st, NULL), TDB_OK);
+  TDB_CHECK(tdb_step(st) != TDB_ROW);   /* aborts before convergence */
+  tdb_finalize(st);
   tdb_close(db);
 }
 

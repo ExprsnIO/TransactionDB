@@ -120,6 +120,19 @@ const char *tdb_get_user(tdb_db *db) {
   return db ? db->current_user : NULL;
 }
 
+int tdb_set_max_recursive_iters(tdb_db *db, int max_iters) {
+  if (!db) return TDB_MISUSE;
+  db_lock(db);
+  if (max_iters > 0) db->max_recursive_iters = max_iters;
+  db_unlock(db);
+  return TDB_OK;
+}
+
+int tdb_get_max_recursive_iters(tdb_db *db) {
+  if (!db) return 0;
+  return db->max_recursive_iters > 0 ? db->max_recursive_iters : 8192;
+}
+
 const char *tdb_errmsg(tdb_db *db) {
   if (!db) return "out of memory";
   return db->errmsg[0] ? db->errmsg : "not an error";

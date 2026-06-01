@@ -95,6 +95,8 @@ struct tdb_db {
   int64_t      last_insert_rowid;
   int64_t      changes;        /* rows changed by the most recent successful DML */
   int64_t      total_changes;  /* lifetime row-change count since open */
+
+  int          max_recursive_iters;  /* WITH RECURSIVE iteration cap; 0 = default */
 };
 
 struct tdb_stmt {

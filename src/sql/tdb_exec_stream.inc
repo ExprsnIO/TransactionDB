@@ -2,10 +2,10 @@
 **
 ** Included by tdb_exec.c after the materializing executor, this introduces a
 ** small family of demand-driven operators — Scan, Join, Filter, Agg, Sort,
-** Project, Limit — wired child-to-parent so each next() pulls one row from
-** below. A SELECT over one or more base tables (INNER/CROSS joins, left-deep)
-** with an optional WHERE / GROUP BY+aggregates / HAVING / ORDER BY / projection
-** / LIMIT is compiled into such a tree; the row at a time pull means a LIMIT
+** Distinct, Project, Limit — wired child-to-parent so each next() pulls one row
+** from below. A SELECT over one or more base tables (INNER/CROSS joins,
+** left-deep) with an optional WHERE / GROUP BY+aggregates / HAVING / ORDER BY /
+** projection / DISTINCT / LIMIT is compiled into such a tree; the row at a time pull means a LIMIT
 ** stops the scan early instead of materializing the whole result first. Join is
 ** a nested loop: it re-scans the inner table for each outer row, or seeks it via
 ** an index when the ON predicate is an equijoin on an indexed inner column. Agg
@@ -24,7 +24,7 @@
 ** even as the connection commits other writes.
 */
 
-typedef enum { OP_SCAN, OP_JOIN, OP_FILTER, OP_AGG, OP_SORT, OP_PROJECT, OP_LIMIT } op_kind;
+typedef enum { OP_SCAN, OP_JOIN, OP_FILTER, OP_AGG, OP_SORT, OP_DISTINCT, OP_PROJECT, OP_LIMIT } op_kind;
 
 /* one buffered row inside a Sort operator: the (owned) source row and its
 ** computed sort-key vector */
@@ -110,6 +110,13 @@ typedef struct tdb_op {
   tdb_value     *aggrow;      /* reused emitted combined row (gbase+naggx) */
   int            agg_done;    /* child drained + groups built */
   int            agg_emit;    /* next group index to emit */
+
+  /* OP_DISTINCT: emit only rows not seen before. `seen` retains one owned copy
+  ** of every distinct row already emitted (each `dwidth` values); a new child
+  ** row is compared against them (NULLs compare equal) and kept if unique. */
+  tdb_value    **seen_rows;
+  int            nseen_rows, seencap;
+  int            dwidth;
 } tdb_op;
 
 /* ---- eligibility: reject anything the simple operators can't stream ---- */
@@ -158,7 +165,12 @@ static int from_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q) {
 }
 
 static int select_streamable(tdb_db *db, tdb_stmt *st, tdb_select *q) {
-  if (q->setop || q->distinct) return 0;
+  if (q->setop) return 0;
+  /* DISTINCT streams via a dedup operator on the projected output. With ORDER
+  ** BY the sort runs below projection (keys may reference source columns), so
+  ** dedup-then-sort would need the sort above the projection — leave that to
+  ** the materializing path. */
+  if (q->distinct && q->order) return 0;
   if (q->with) return 0;        /* its CTEs (which may shadow a table) aren't in scope here */
   if (from_streamable(db, st, q) < 1) return 0;
   /* no subqueries anywhere (those still need the materializing executor) */
@@ -488,15 +500,38 @@ static int agg_next(tdb_op *op, tdb_value **row, int *ncol) {
   return TDB_ROW;
 }
 
+/* Emit only rows distinct from those already emitted. Retains one owned copy of
+** each distinct row (NULLs compare equal, matching the materializing path). */
+static int distinct_next(tdb_op *op, tdb_value **row, int *ncol) {
+  for (;;) {
+    tdb_value *r; int nc;
+    int rc = op_next(op->child, &r, &nc);
+    if (rc != TDB_ROW) return rc;
+    op->dwidth = nc;
+    int dup = 0;
+    for (int i = 0; i < op->nseen_rows; i++)
+      if (row_equal(op->seen_rows[i], r, nc)) { dup = 1; break; }
+    if (dup) continue;
+    if (op->nseen_rows == op->seencap) {
+      op->seencap = op->seencap ? op->seencap * 2 : 16;
+      op->seen_rows = (tdb_value **)tdb_realloc(op->seen_rows, sizeof(void *) * (size_t)op->seencap);
+    }
+    op->seen_rows[op->nseen_rows++] = dup_row(r, nc);
+    *row = r; *ncol = nc;
+    return TDB_ROW;
+  }
+}
+
 static int op_next(tdb_op *op, tdb_value **row, int *ncol) {
   switch (op->kind) {
-    case OP_SCAN:    return scan_next(op, row, ncol);
-    case OP_JOIN:    return join_next(op, row, ncol);
-    case OP_FILTER:  return filter_next(op, row, ncol);
-    case OP_AGG:     return agg_next(op, row, ncol);
-    case OP_SORT:    return sort_next(op, row, ncol);
-    case OP_PROJECT: return project_next(op, row, ncol);
-    case OP_LIMIT:   return limit_next(op, row, ncol);
+    case OP_SCAN:     return scan_next(op, row, ncol);
+    case OP_JOIN:     return join_next(op, row, ncol);
+    case OP_FILTER:   return filter_next(op, row, ncol);
+    case OP_AGG:      return agg_next(op, row, ncol);
+    case OP_SORT:     return sort_next(op, row, ncol);
+    case OP_DISTINCT: return distinct_next(op, row, ncol);
+    case OP_PROJECT:  return project_next(op, row, ncol);
+    case OP_LIMIT:    return limit_next(op, row, ncol);
   }
   return TDB_DONE;
 }
@@ -533,6 +568,9 @@ static void op_close(tdb_op *op) {
     tdb_mfree(op->grps);
     if (op->aggrow) { for (int i = 0; i < op->gbase + op->naggx; i++) tdb_value_clear(&op->aggrow[i]); tdb_mfree(op->aggrow); }
     tdb_mfree(op->aggx);     /* the array (its exprs are arena-owned) */
+  } else if (op->kind == OP_DISTINCT) {
+    for (int i = 0; i < op->nseen_rows; i++) free_row(op->seen_rows[i], op->dwidth);
+    tdb_mfree(op->seen_rows);
   }
   tdb_mfree(op);
 }
@@ -770,6 +808,14 @@ static tdb_op *build_stream_plan(tdb_db *db, tdb_stmt *st, tdb_select *q, tdb_tx
   proj->outrow = row_alloc(nout);
   proj->agg_base = agg_base; proj->agg_n = agg_n;
   src = proj;
+
+  /* DISTINCT dedups the projected output (no ORDER BY in the streamed case);
+  ** LIMIT below applies to the deduplicated stream. */
+  if (q->distinct) {
+    tdb_op *dis = op_new(OP_DISTINCT, db, st);
+    dis->child = src;
+    src = dis;
+  }
 
   if (q->has_limit || q->offset) {
     tdb_op *lim = op_new(OP_LIMIT, db, st);

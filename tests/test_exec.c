@@ -1606,6 +1606,36 @@ static void test_stream_distinct(void) {
   tdb_close(db);
 }
 
+static void test_phase11_utility(void) {
+  tdb_db *db; TDB_CHECK_EQ(tdb_open(":memory:", &db), TDB_OK);
+  TDB_CHECK_EQ(exec(db,
+    "CREATE TABLE log (id INTEGER PRIMARY KEY, msg TEXT) "
+    "TABLESPACE warm "
+    "WITH COMPRESSION=zstd "
+    "PARTITION BY HASH (id)"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "INSERT INTO log VALUES (1,'a'),(2,'b'),(3,'c')"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 3);
+
+  /* TRUNCATE empties the table */
+  TDB_CHECK_EQ(exec(db, "TRUNCATE TABLE log"), TDB_OK);
+  TDB_CHECK_EQ(scalar(db, "SELECT COUNT(*) FROM log"), 0);
+
+  /* ANALYZE / REINDEX / COMMENT are accepted; they do not error on a valid
+  ** table even though their internal effects are stubbed. */
+  TDB_CHECK_EQ(exec(db, "ANALYZE log"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "REINDEX TABLE log"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "COMMENT ON TABLE log IS 'truncated'"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "LOCK TABLE log IN EXCLUSIVE MODE"), TDB_OK);
+
+  /* CREATE TABLESPACE / DROP TABLESPACE are parsed and accepted. */
+  TDB_CHECK_EQ(exec(db, "CREATE TABLESPACE warm LOCATION '/tmp/warm'"), TDB_OK);
+  TDB_CHECK_EQ(exec(db, "DROP TABLESPACE warm"), TDB_OK);
+
+  /* Unknown target rejected */
+  TDB_CHECK(exec(db, "TRUNCATE TABLE nope") != TDB_OK);
+  tdb_close(db);
+}
+
 static tdb_test_case cases[] = {
   {"geospatial", test_geospatial},
   {"spatial_index", test_spatial_index},
@@ -1622,6 +1652,7 @@ static tdb_test_case cases[] = {
   {"returning", test_returning},
   {"cte", test_cte},
   {"ddl_dml_select", test_ddl_dml_select},
+  {"phase11_utility", test_phase11_utility},
   {"derived_and_view", test_derived_and_view},
   {"outer_joins", test_outer_joins},
   {"setops", test_setops},

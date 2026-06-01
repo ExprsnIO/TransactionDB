@@ -14,6 +14,7 @@ option(TDB_BUILD_TESTS     "Build the test suite" ON)
 option(TDB_BUILD_CLI       "Build the CLI shell" ON)
 option(TDB_BUILD_LUA       "Build with embedded Lua" ON)
 option(TDB_BUILD_OPENSSL   "Build crypto functions against OpenSSL (AES, CSPRNG)" OFF)
+option(TDB_BUILD_ZSTD      "Build with Zstandard page/blob compression" OFF)
 # Package as an Apple .framework bundle (no-op off Apple); see cmake/AppleFramework.cmake.
 option(TDB_BUILD_FRAMEWORK "Build as an Apple .framework bundle" OFF)
 
@@ -75,6 +76,12 @@ if(TDB_BUILD_OPENSSL)
   target_compile_definitions(transactiondb PRIVATE TDB_HAVE_OPENSSL=1)
 endif()
 
+if(TDB_BUILD_ZSTD)
+  include(FetchZstd)
+  target_link_libraries(transactiondb PRIVATE tdb_zstd)
+  target_compile_definitions(transactiondb PRIVATE TDB_HAVE_ZSTD=1)
+endif()
+
 # ---------------------------------------------------------------------------
 # CLI shell
 # ---------------------------------------------------------------------------
@@ -101,7 +108,7 @@ if(TDB_BUILD_TESTS)
   enable_testing()
   set(TDB_TESTS util value_record wal pager sqltype schema btree
                 mvcc lock engine catalog lexer parser exec concurrency geom rtree
-                plsql composite crypto routines keywords)
+                plsql composite crypto routines keywords compress)
   foreach(t ${TDB_TESTS})
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_${t}.c")
       add_executable(test_${t} "tests/test_${t}.c")
@@ -127,6 +134,12 @@ if(TDB_BUILD_TESTS)
   target_include_directories(test_cpp PRIVATE
     "${CMAKE_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/tests")
   add_test(NAME cpp COMMAND test_cpp)
+
+  # The OpenSSL-dependent assertions in test_crypto.c are guarded by
+  # TDB_HAVE_OPENSSL; propagate the define when the parent build has it.
+  if(TARGET test_crypto AND TDB_BUILD_OPENSSL)
+    target_compile_definitions(test_crypto PRIVATE TDB_HAVE_OPENSSL=1)
+  endif()
 
   # Example C++ plugin (shared module) + dynamic load test. The plugin's tdb_*
   # symbols are resolved from the host test executable at dlopen time, so

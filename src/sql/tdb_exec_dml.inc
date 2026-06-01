@@ -663,6 +663,101 @@ static int exec_alter(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   }
 }
 
+/* ------------------------ Phase 11: utility DDL ------------------------ */
+
+/* TRUNCATE TABLE — delete every visible row. (Identity reset / CASCADE
+** are parsed and remembered on the AST but not yet executed.) */
+static int exec_truncate(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st);
+  tdb_table *t = tdb_catalog_find_table(db->cat, a->u.truncate.name);
+  if (!t) { tdb_db_seterr(db, "no such table: %s", a->u.truncate.name); return TDB_ERROR; }
+  tdb_scan *sc;
+  int rc = db->engine->vtab->scan_open(db->engine, db->txn, t, NULL, NULL, 0, NULL, &sc);
+  if (rc) return rc;
+  tdb_rowid *ids = NULL; int nid = 0, capid = 0;
+  tdb_rowid rid; const uint8_t *rec; int reclen;
+  while ((rc = db->engine->vtab->scan_next(sc, &rid, &rec, &reclen)) == TDB_ROW) {
+    if (nid == capid) {
+      capid = capid ? capid * 2 : 64;
+      ids = (tdb_rowid *)tdb_realloc(ids, sizeof(tdb_rowid) * (size_t)capid);
+    }
+    ids[nid++] = rid;
+  }
+  db->engine->vtab->scan_close(sc);
+  if (rc != TDB_DONE) { tdb_mfree(ids); return rc; }
+  for (int i = 0; i < nid; i++) {
+    int dr = db->engine->vtab->remove(db->engine, db->txn, t, ids[i]);
+    if (dr) { tdb_mfree(ids); return dr; }
+    st->changes++;
+  }
+  tdb_mfree(ids);
+  return TDB_OK;
+}
+
+/* ANALYZE / REINDEX / COMMENT / LOCK / GRANT / REVOKE / ATTACH / DETACH —
+** parsing is the main deliverable; semantic effects are stubs at this
+** point (no stats catalog, ACL system, or attach manager exists yet). */
+static int exec_analyze(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st);
+  if (a->u.analyze.name && !tdb_catalog_find_table(db->cat, a->u.analyze.name)) {
+    tdb_db_seterr(db, "no such table: %s", a->u.analyze.name);
+    return TDB_ERROR;
+  }
+  return TDB_OK;
+}
+
+static int exec_reindex(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st);
+  if (a->u.reindex.name && !a->u.reindex.is_index) {
+    if (!tdb_catalog_find_table(db->cat, a->u.reindex.name)) {
+      tdb_db_seterr(db, "no such table: %s", a->u.reindex.name);
+      return TDB_ERROR;
+    }
+  }
+  return TDB_OK;
+}
+
+static int exec_comment(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
+  return TDB_OK;
+}
+
+static int exec_tablespace_create(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
+  return TDB_OK;
+}
+static int exec_tablespace_drop(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
+  return TDB_OK;
+}
+
+static int exec_grant(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(db); TDB_UNUSED(a);
+  return TDB_OK;
+}
+
+static int exec_attach(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(a);
+  tdb_db_seterr(db, "ATTACH DATABASE is parsed but not yet executable");
+  return TDB_UNSUPPORTED;
+}
+static int exec_detach(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st); TDB_UNUSED(a);
+  tdb_db_seterr(db, "DETACH DATABASE is parsed but not yet executable");
+  return TDB_UNSUPPORTED;
+}
+
+static int exec_lock(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
+  TDB_UNUSED(st);
+  if (a->u.lock_tbl.table && !tdb_catalog_find_table(db->cat, a->u.lock_tbl.table)) {
+    tdb_db_seterr(db, "no such table: %s", a->u.lock_tbl.table);
+    return TDB_ERROR;
+  }
+  /* pager is single-writer: the surrounding auto-txn already holds the write
+  ** slot, so LOCK TABLE is a no-op at this level. */
+  return TDB_OK;
+}
+
 static int exec_txn(tdb_db *db, tdb_stmt *st, tdb_ast_stmt *a) {
   TDB_UNUSED(st);
   int rc = TDB_OK;

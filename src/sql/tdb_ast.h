@@ -127,6 +127,14 @@ typedef struct tdb_coldef {
   char         *generated_sql;
 } tdb_coldef;
 
+/* PARTITION BY <strategy> (col, ...) — strategy values match the tokens. */
+typedef enum tdb_partition_kind {
+  TDB_PART_NONE = 0,
+  TDB_PART_RANGE,
+  TDB_PART_LIST,
+  TDB_PART_HASH
+} tdb_partition_kind;
+
 typedef struct tdb_create_table {
   char       *name;
   int         if_not_exists;
@@ -139,6 +147,13 @@ typedef struct tdb_create_table {
   int         columnar;             /* WITH COLUMNAR */
   char       *period_start;         /* PERIOD FOR SYSTEM_TIME (start,end) */
   char       *period_end;
+
+  /* Phase 11: placement and partitioning */
+  char       *tablespace;           /* TABLESPACE <name>, or NULL */
+  char       *compression;          /* WITH COMPRESSION=<name>, or NULL */
+  tdb_partition_kind partition_kind;
+  char      **partition_cols;       /* PARTITION BY <kind>(col, ...) */
+  int         npart_col;
 } tdb_create_table;
 
 typedef struct tdb_create_index {
@@ -159,7 +174,11 @@ typedef enum tdb_stmt_kind {
   ST_CREATE_TABLE, ST_DROP_TABLE, ST_CREATE_INDEX, ST_DROP_INDEX,
   ST_CREATE_VIEW, ST_DROP_VIEW, ST_CREATE_ROUTINE, ST_DROP_ROUTINE, ST_CALL,
   ST_BEGIN, ST_COMMIT, ST_ROLLBACK, ST_SAVEPOINT, ST_RELEASE, ST_ROLLBACK_TO,
-  ST_PREPARE, ST_ALTER_TABLE, ST_EXPLAIN, ST_VACUUM
+  ST_PREPARE, ST_ALTER_TABLE, ST_EXPLAIN, ST_VACUUM,
+  /* Phase 11: housekeeping / namespace / authorization */
+  ST_TRUNCATE, ST_ANALYZE, ST_REINDEX, ST_COMMENT,
+  ST_CREATE_TABLESPACE, ST_DROP_TABLESPACE,
+  ST_GRANT, ST_REVOKE, ST_ATTACH, ST_DETACH, ST_LOCK_TABLE
 } tdb_stmt_kind;
 
 typedef struct tdb_ast_stmt {
@@ -214,6 +233,30 @@ typedef struct tdb_ast_stmt {
 
     struct { char *table; int action; char *col; char *newname; tdb_coldef *add; } alter;
     struct { struct tdb_ast_stmt *inner; } explain;
+
+    /* Phase 11 — simple "name + optional target" statements. */
+    struct { char *name;        /* TRUNCATE TABLE <name> */
+             int   restart;     /* RESTART IDENTITY */
+             int   cascade;     /* CASCADE */
+    } truncate;
+    struct { char *name; } analyze;     /* ANALYZE [table]; name NULL => all */
+    struct { char *name;        /* REINDEX [TABLE|INDEX] name; */
+             int   is_index;
+    } reindex;
+    struct { int   on_kind;     /* 1 table, 2 column, 3 index, 4 view, 5 db */
+             char *target;      /* "tbl" or "tbl.col" */
+             char *body;        /* comment text */
+    } comment_on;
+    struct { char *name; char *location; int if_not_exists; } create_tablespace;
+    struct { char *name; int   if_exists; } drop_tablespace;
+    struct { char *privs;       /* comma-separated privilege keywords */
+             char *object;      /* "TABLE foo" etc. */
+             char *grantee;     /* role / user name */
+             int   revoke;      /* 1 if REVOKE, 0 if GRANT */
+    } grant;
+    struct { char *name; char *path; int read_only; } attach;
+    struct { char *name; } detach;
+    struct { char *table; int exclusive; } lock_tbl;
   } u;
 } tdb_ast_stmt;
 

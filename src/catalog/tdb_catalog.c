@@ -109,6 +109,15 @@ static void ser_table(const tdb_table *t, tdb_buf *b) {
   w_u8(b, (uint8_t)t->columnar);
   w_var(b, (uint64_t)t->ncol_roots);
   for (int i = 0; i < t->ncol_roots; i++) w_u32(b, t->col_roots[i]);
+
+  /* Phase 11: tablespace, compression, partitioning.
+  ** Appended to the end so older catalog records (no trailer) deserialize as
+  ** all-default (the read functions return zero / NULL once the buffer ends). */
+  w_str(b, t->tablespace);
+  w_str(b, t->compression);
+  w_u8(b, (uint8_t)t->partition_kind);
+  w_var(b, (uint64_t)t->npart_col);
+  for (int i = 0; i < t->npart_col; i++) w_str(b, t->partition_cols[i]);
 }
 
 static tdb_table *deser_table(rd *r) {
@@ -178,6 +187,19 @@ static tdb_table *deser_table(rd *r) {
   if (t->ncol_roots > 0) {
     t->col_roots = (tdb_pgno *)tdb_malloc(sizeof(tdb_pgno) * (size_t)t->ncol_roots);
     for (int i = 0; i < t->ncol_roots; i++) t->col_roots[i] = r_u32(r);
+  }
+  /* Phase 11 trailer (absent in older catalogs): only read if more bytes are
+  ** present, so we don't trip the loader's r.err corruption guard at EOF. */
+  if (r->pos < r->len && !r->err) {
+    t->tablespace = r_str(r);
+    t->compression = r_str(r);
+    t->partition_kind = r_u8(r);
+    int npc = (int)r_var(r);
+    if (npc > 0 && !r->err) {
+      t->partition_cols = (char **)tdb_calloc(sizeof(char *) * (size_t)npc);
+      for (int i = 0; i < npc && !r->err; i++) t->partition_cols[i] = r_str(r);
+      t->npart_col = npc;
+    }
   }
   return t;
 }

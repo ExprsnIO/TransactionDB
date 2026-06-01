@@ -103,6 +103,91 @@ static int l_tdb_query(lua_State *L) {
   return 1;
 }
 
+/* ------- prepared statement userdata wrappers (tdb.prepare etc.) ----- */
+
+#define TDB_STMT_MT "tdb.stmt"
+
+typedef struct { tdb_stmt *st; } luastmt;
+
+static int l_tdb_prepare(lua_State *L) {
+  tdb_db *db = module_db(L);
+  const char *sql = luaL_checkstring(L, 1);
+  tdb_stmt *st = NULL;
+  if (tdb_prepare_v2(db, sql, -1, &st, NULL) != TDB_OK || !st) {
+    lua_pushstring(L, tdb_errmsg(db));
+    return lua_error(L);
+  }
+  luastmt *ls = (luastmt *)lua_newuserdata(L, sizeof(*ls));
+  ls->st = st;
+  luaL_getmetatable(L, TDB_STMT_MT);
+  lua_setmetatable(L, -2);
+  return 1;
+}
+
+static int l_stmt_bind(lua_State *L) {
+  luastmt *ls = (luastmt *)luaL_checkudata(L, 1, TDB_STMT_MT);
+  int idx = (int)luaL_checkinteger(L, 2);
+  int rc = TDB_OK;
+  switch (lua_type(L, 3)) {
+    case LUA_TNIL: rc = tdb_bind_null(ls->st, idx); break;
+    case LUA_TBOOLEAN: rc = tdb_bind_int64(ls->st, idx, lua_toboolean(L, 3) ? 1 : 0); break;
+    case LUA_TNUMBER:
+      if (lua_isinteger(L, 3)) rc = tdb_bind_int64(ls->st, idx, (int64_t)lua_tointeger(L, 3));
+      else rc = tdb_bind_double(ls->st, idx, (double)lua_tonumber(L, 3));
+      break;
+    case LUA_TSTRING: {
+      size_t n; const char *s = lua_tolstring(L, 3, &n);
+      rc = tdb_bind_text(ls->st, idx, s, (int)n);
+      break;
+    }
+    default: return luaL_error(L, "unsupported bind value type");
+  }
+  if (rc != TDB_OK) return luaL_error(L, "bind failed (%d)", rc);
+  lua_pushvalue(L, 1);            /* return the stmt for chaining */
+  return 1;
+}
+
+static int l_stmt_step(lua_State *L) {
+  luastmt *ls = (luastmt *)luaL_checkudata(L, 1, TDB_STMT_MT);
+  int rc = tdb_step(ls->st);
+  if (rc == TDB_DONE) { lua_pushnil(L); return 1; }
+  if (rc != TDB_ROW) return luaL_error(L, "step failed (%d)", rc);
+  lua_newtable(L);
+  int nc = tdb_column_count(ls->st);
+  for (int i = 0; i < nc; i++) {
+    switch (tdb_column_type(ls->st, i)) {
+      case TDB_INTEGER: lua_pushinteger(L, (lua_Integer)tdb_column_int64(ls->st, i)); break;
+      case TDB_FLOAT:   lua_pushnumber(L, tdb_column_double(ls->st, i)); break;
+      case TDB_NULL:    lua_pushnil(L); break;
+      default: { const char *t = tdb_column_text(ls->st, i); lua_pushstring(L, t ? t : ""); break; }
+    }
+    lua_setfield(L, -2, tdb_column_name(ls->st, i));
+  }
+  return 1;
+}
+
+static int l_stmt_reset(lua_State *L) {
+  luastmt *ls = (luastmt *)luaL_checkudata(L, 1, TDB_STMT_MT);
+  tdb_reset(ls->st);
+  lua_pushvalue(L, 1);
+  return 1;
+}
+
+static int l_stmt_finalize(lua_State *L) {
+  luastmt *ls = (luastmt *)luaL_checkudata(L, 1, TDB_STMT_MT);
+  if (ls->st) { tdb_finalize(ls->st); ls->st = NULL; }
+  return 0;
+}
+
+static const luaL_Reg k_stmt_methods[] = {
+  {"bind",     l_stmt_bind},
+  {"step",     l_stmt_step},
+  {"reset",    l_stmt_reset},
+  {"finalize", l_stmt_finalize},
+  {"__gc",     l_stmt_finalize},
+  {NULL, NULL}
+};
+
 static void register_module(lua_State *L, void *db) {
   lua_pushlightuserdata(L, db);
   lua_setfield(L, LUA_REGISTRYINDEX, K_DB);
@@ -110,9 +195,16 @@ static void register_module(lua_State *L, void *db) {
   lua_newtable(L);                 /* routines registry table */
   lua_setfield(L, LUA_REGISTRYINDEX, K_ROUTINES);
 
+  /* stmt metatable: __index = self, plus method table */
+  luaL_newmetatable(L, TDB_STMT_MT);
+  lua_pushvalue(L, -1); lua_setfield(L, -2, "__index");
+  luaL_setfuncs(L, k_stmt_methods, 0);
+  lua_pop(L, 1);
+
   lua_newtable(L);                 /* the `tdb` module */
-  lua_pushcfunction(L, l_tdb_exec);  lua_setfield(L, -2, "exec");
-  lua_pushcfunction(L, l_tdb_query); lua_setfield(L, -2, "query");
+  lua_pushcfunction(L, l_tdb_exec);    lua_setfield(L, -2, "exec");
+  lua_pushcfunction(L, l_tdb_query);   lua_setfield(L, -2, "query");
+  lua_pushcfunction(L, l_tdb_prepare); lua_setfield(L, -2, "prepare");
   lua_setglobal(L, "tdb");
 }
 

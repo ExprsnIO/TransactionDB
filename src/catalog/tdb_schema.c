@@ -117,6 +117,10 @@ void tdb_table_free(tdb_table *t) {
   tdb_mfree(t->before_insert_lua);
   tdb_mfree(t->before_update_lua);
   tdb_mfree(t->before_delete_lua);
+  tdb_mfree(t->tablespace);
+  tdb_mfree(t->compression);
+  for (int i = 0; i < t->npart_col; i++) tdb_mfree(t->partition_cols[i]);
+  tdb_mfree(t->partition_cols);
   tdb_mfree(t->name);
   tdb_mfree(t);
 }

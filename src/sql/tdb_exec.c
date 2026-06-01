@@ -1071,6 +1071,16 @@ static int stmt_execute_locked(tdb_stmt *st) {
     case ST_CREATE_ROUTINE: rc = exec_create_routine(db, st, a); break;
     case ST_CALL: rc = exec_call(db, st, a); break;
     case ST_ALTER_TABLE: rc = exec_alter(db, st, a); break;
+    case ST_TRUNCATE:    rc = exec_truncate(db, st, a); break;
+    case ST_ANALYZE:     rc = exec_analyze(db, st, a); break;
+    case ST_REINDEX:     rc = exec_reindex(db, st, a); break;
+    case ST_COMMENT:     rc = exec_comment(db, st, a); break;
+    case ST_CREATE_TABLESPACE: rc = exec_tablespace_create(db, st, a); break;
+    case ST_DROP_TABLESPACE:   rc = exec_tablespace_drop(db, st, a); break;
+    case ST_GRANT: case ST_REVOKE: rc = exec_grant(db, st, a); break;
+    case ST_ATTACH:      rc = exec_attach(db, st, a); break;
+    case ST_DETACH:      rc = exec_detach(db, st, a); break;
+    case ST_LOCK_TABLE:  rc = exec_lock(db, st, a); break;
     default:
       tdb_db_seterr(db, "statement type not yet executable");
       rc = TDB_UNSUPPORTED;

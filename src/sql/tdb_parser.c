@@ -74,6 +74,8 @@ static tdb_expr *parse_expr(P *p, int minprec);
 static tdb_expr *parse_unary(P *p);
 static tdb_select *parse_select(P *p);
 static char **parse_name_list(P *p, int *count);
+static struct tdb_ast_stmt *parse_create_tablespace(P *p);
+static struct tdb_ast_stmt *parse_drop_tablespace(P *p);
 
 /* ------------------------------ expressions --------------------------- */
 
@@ -694,20 +696,46 @@ static tdb_ast_stmt *parse_create_table(P *p) {
   } while (accept(p, TK_COMMA) && !p->err);
 
   expect(p, TK_RP, "expected )");
-  /* table options: WITH SYSTEM VERSIONING and/or WITH COLUMNAR */
-  while (accept(p, TK_WITH)) {
-    if (p->cur.kind == TK_SYSTEM) {
-      advance(p);
-      expect(p, TK_VERSIONING, "expected VERSIONING");
-      ct->system_versioning = 1;
-    } else if (p->cur.kind == TK_ID && p->cur.n == 8 &&
-               strncasecmp(p->cur.z, "COLUMNAR", 8) == 0) {
-      advance(p);
-      ct->columnar = 1;
-    } else {
-      set_err(p, "expected SYSTEM VERSIONING or COLUMNAR");
-      break;
+  /* Trailing table options. Each is independent and may appear once. */
+  for (;;) {
+    if (accept(p, TK_WITH)) {
+      if (p->cur.kind == TK_SYSTEM) {
+        advance(p);
+        expect(p, TK_VERSIONING, "expected VERSIONING");
+        ct->system_versioning = 1;
+      } else if (p->cur.kind == TK_ID && p->cur.n == 8 &&
+                 strncasecmp(p->cur.z, "COLUMNAR", 8) == 0) {
+        advance(p);
+        ct->columnar = 1;
+      } else if (p->cur.kind == TK_COMPRESSION) {
+        advance(p);
+        if (!accept(p, TK_EQ)) {}                            /* WITH COMPRESSION zstd or WITH COMPRESSION=zstd */
+        ct->compression = dup_tok(p, &p->cur);
+        if (p->cur.kind == TK_ID || p->cur.kind == TK_STRING) advance(p);
+        else set_err(p, "expected compression name");
+      } else {
+        set_err(p, "expected SYSTEM VERSIONING, COLUMNAR, or COMPRESSION");
+        break;
+      }
+      continue;
     }
+    if (accept(p, TK_TABLESPACE)) {
+      ct->tablespace = dup_tok(p, &p->cur);
+      expect(p, TK_ID, "expected tablespace name");
+      continue;
+    }
+    if (accept(p, TK_PARTITION)) {
+      expect(p, TK_BY, "expected BY after PARTITION");
+      if (id_is(&p->cur, "RANGE"))      { advance(p); ct->partition_kind = TDB_PART_RANGE; }
+      else if (id_is(&p->cur, "LIST"))  { advance(p); ct->partition_kind = TDB_PART_LIST; }
+      else if (id_is(&p->cur, "HASH"))  { advance(p); ct->partition_kind = TDB_PART_HASH; }
+      else { set_err(p, "expected RANGE, LIST or HASH"); break; }
+      expect(p, TK_LP, "expected ( after partition kind");
+      ct->partition_cols = parse_name_list(p, &ct->npart_col);
+      expect(p, TK_RP, "expected ) after partition columns");
+      continue;
+    }
+    break;
   }
   return s;
 }
@@ -805,12 +833,14 @@ static tdb_ast_stmt *parse_create(P *p) {
   if (p->cur.kind == TK_VIEW) return parse_create_view(p, 0);
   if (p->cur.kind == TK_FUNCTION) return parse_create_routine(p, 1);
   if (p->cur.kind == TK_PROCEDURE) return parse_create_routine(p, 0);
+  if (p->cur.kind == TK_TABLESPACE) return parse_create_tablespace(p);
   /* CREATE [OR REPLACE] FUNCTION not handled via OR REPLACE keyword set; fallthrough */
   return parse_create_table(p);
 }
 
 static tdb_ast_stmt *parse_drop(P *p) {
   advance(p); /* DROP */
+  if (p->cur.kind == TK_TABLESPACE) return parse_drop_tablespace(p);
   tdb_stmt_kind k = ST_DROP_TABLE;
   if (p->cur.kind == TK_INDEX) k = ST_DROP_INDEX;
   else if (p->cur.kind == TK_VIEW) k = ST_DROP_VIEW;
@@ -898,6 +928,146 @@ static tdb_ast_stmt *parse_prepare(P *p) {
   return s;
 }
 
+static tdb_ast_stmt *parse_truncate(P *p) {
+  advance(p); /* TRUNCATE */
+  accept(p, TK_TABLE);
+  tdb_ast_stmt *s = new_stmt(p, ST_TRUNCATE);
+  s->u.truncate.name = dup_tok(p, &p->cur);
+  expect(p, TK_ID, "expected table name");
+  /* optional: RESTART IDENTITY | CASCADE | CONTINUE IDENTITY (consumed) */
+  for (;;) {
+    if (id_is(&p->cur, "RESTART")) { advance(p); accept(p, TK_ID); s->u.truncate.restart = 1; }
+    else if (id_is(&p->cur, "CONTINUE")) { advance(p); accept(p, TK_ID); }
+    else if (id_is(&p->cur, "CASCADE")) { advance(p); s->u.truncate.cascade = 1; }
+    else if (id_is(&p->cur, "RESTRICT")) { advance(p); }
+    else break;
+  }
+  return s;
+}
+
+static tdb_ast_stmt *parse_analyze(P *p) {
+  advance(p); /* ANALYZE */
+  tdb_ast_stmt *s = new_stmt(p, ST_ANALYZE);
+  if (p->cur.kind == TK_ID) { s->u.analyze.name = dup_tok(p, &p->cur); advance(p); }
+  return s;
+}
+
+static tdb_ast_stmt *parse_reindex(P *p) {
+  advance(p); /* REINDEX */
+  tdb_ast_stmt *s = new_stmt(p, ST_REINDEX);
+  if (accept(p, TK_TABLE)) s->u.reindex.is_index = 0;
+  else if (accept(p, TK_INDEX)) s->u.reindex.is_index = 1;
+  if (p->cur.kind == TK_ID) { s->u.reindex.name = dup_tok(p, &p->cur); advance(p); }
+  return s;
+}
+
+static tdb_ast_stmt *parse_comment(P *p) {
+  advance(p); /* COMMENT */
+  expect(p, TK_ON, "expected ON after COMMENT");
+  tdb_ast_stmt *s = new_stmt(p, ST_COMMENT);
+  if (accept(p, TK_TABLE))        s->u.comment_on.on_kind = 1;
+  else if (accept(p, TK_COLUMN))  s->u.comment_on.on_kind = 2;
+  else if (accept(p, TK_INDEX))   s->u.comment_on.on_kind = 3;
+  else if (accept(p, TK_VIEW))    s->u.comment_on.on_kind = 4;
+  else if (accept(p, TK_DATABASE))s->u.comment_on.on_kind = 5;
+  else { set_err(p, "expected TABLE/COLUMN/INDEX/VIEW/DATABASE"); return s; }
+  /* target is a (possibly dotted) name */
+  size_t s0 = off(p);
+  if (p->cur.kind == TK_ID) advance(p);
+  if (p->cur.kind == TK_DOT) { advance(p); expect(p, TK_ID, "expected name"); }
+  s->u.comment_on.target = span(p, s0, off(p));
+  expect(p, TK_IS, "expected IS after target");
+  if (p->cur.kind == TK_STRING) { s->u.comment_on.body = decode_string(p, &p->cur); advance(p); }
+  else if (p->cur.kind == TK_NULL) { advance(p); s->u.comment_on.body = NULL; }
+  else { set_err(p, "expected comment string"); }
+  return s;
+}
+
+static tdb_ast_stmt *parse_create_tablespace(P *p) {
+  /* CREATE has been consumed; current is TABLESPACE */
+  advance(p); /* TABLESPACE */
+  tdb_ast_stmt *s = new_stmt(p, ST_CREATE_TABLESPACE);
+  if (p->cur.kind == TK_IF) {
+    advance(p); expect(p, TK_NOT, "expected NOT"); expect(p, TK_EXISTS, "expected EXISTS");
+    s->u.create_tablespace.if_not_exists = 1;
+  }
+  s->u.create_tablespace.name = dup_tok(p, &p->cur);
+  expect(p, TK_ID, "expected tablespace name");
+  if (accept(p, TK_LOCATION)) {
+    if (p->cur.kind == TK_STRING) { s->u.create_tablespace.location = decode_string(p, &p->cur); advance(p); }
+    else set_err(p, "expected LOCATION string literal");
+  }
+  return s;
+}
+
+static tdb_ast_stmt *parse_drop_tablespace(P *p) {
+  /* DROP has been consumed; current is TABLESPACE */
+  advance(p); /* TABLESPACE */
+  tdb_ast_stmt *s = new_stmt(p, ST_DROP_TABLESPACE);
+  if (p->cur.kind == TK_IF) { advance(p); expect(p, TK_EXISTS, "expected EXISTS"); s->u.drop_tablespace.if_exists = 1; }
+  s->u.drop_tablespace.name = dup_tok(p, &p->cur);
+  expect(p, TK_ID, "expected tablespace name");
+  return s;
+}
+
+static tdb_ast_stmt *parse_grant_or_revoke(P *p, int is_revoke) {
+  advance(p); /* GRANT / REVOKE */
+  tdb_ast_stmt *s = new_stmt(p, is_revoke ? ST_REVOKE : ST_GRANT);
+  s->u.grant.revoke = is_revoke;
+  /* privilege list: consume identifiers up to ON */
+  size_t s0 = off(p);
+  while (p->cur.kind != TK_ON && p->cur.kind != TK_EOF && p->cur.kind != TK_SEMI) advance(p);
+  s->u.grant.privs = span(p, s0, off(p));
+  expect(p, TK_ON, "expected ON");
+  size_t o0 = off(p);
+  /* object spec: TABLE foo, VIEW foo, SCHEMA foo, etc. */
+  if (p->cur.kind == TK_TABLE || p->cur.kind == TK_VIEW || p->cur.kind == TK_DATABASE ||
+      p->cur.kind == TK_ID) advance(p);
+  if (p->cur.kind == TK_ID) advance(p);
+  if (p->cur.kind == TK_DOT) { advance(p); expect(p, TK_ID, "expected name"); }
+  s->u.grant.object = span(p, o0, off(p));
+  /* TO/FROM <role> */
+  if (is_revoke) accept(p, TK_FROM); else accept(p, TK_TO);
+  s->u.grant.grantee = dup_tok(p, &p->cur);
+  if (p->cur.kind == TK_ID) advance(p);
+  return s;
+}
+
+static tdb_ast_stmt *parse_attach(P *p) {
+  advance(p); /* ATTACH */
+  accept(p, TK_DATABASE);
+  tdb_ast_stmt *s = new_stmt(p, ST_ATTACH);
+  if (p->cur.kind == TK_STRING) { s->u.attach.path = decode_string(p, &p->cur); advance(p); }
+  else if (p->cur.kind == TK_ID) { s->u.attach.path = dup_tok(p, &p->cur); advance(p); }
+  expect(p, TK_AS, "expected AS");
+  s->u.attach.name = dup_tok(p, &p->cur);
+  expect(p, TK_ID, "expected attach name");
+  return s;
+}
+
+static tdb_ast_stmt *parse_detach(P *p) {
+  advance(p); /* DETACH */
+  accept(p, TK_DATABASE);
+  tdb_ast_stmt *s = new_stmt(p, ST_DETACH);
+  s->u.detach.name = dup_tok(p, &p->cur);
+  expect(p, TK_ID, "expected detach name");
+  return s;
+}
+
+static tdb_ast_stmt *parse_lock(P *p) {
+  advance(p); /* LOCK */
+  accept(p, TK_TABLE);
+  tdb_ast_stmt *s = new_stmt(p, ST_LOCK_TABLE);
+  s->u.lock_tbl.table = dup_tok(p, &p->cur);
+  expect(p, TK_ID, "expected table name");
+  if (accept(p, TK_IN)) {                       /* IN <mode> MODE */
+    if (id_is(&p->cur, "EXCLUSIVE")) s->u.lock_tbl.exclusive = 1;
+    if (p->cur.kind == TK_ID) advance(p);
+    if (id_is(&p->cur, "MODE")) advance(p);
+  }
+  return s;
+}
+
 static tdb_ast_stmt *parse_stmt(P *p) {
   switch (p->cur.kind) {
     case TK_WITH:
@@ -913,6 +1083,15 @@ static tdb_ast_stmt *parse_stmt(P *p) {
     case TK_BEGIN: case TK_COMMIT: case TK_ROLLBACK:
     case TK_SAVEPOINT: case TK_RELEASE: return parse_txn(p);
     case TK_VACUUM: advance(p); return new_stmt(p, ST_VACUUM);
+    case TK_TRUNCATE: return parse_truncate(p);
+    case TK_ANALYZE: return parse_analyze(p);
+    case TK_REINDEX: return parse_reindex(p);
+    case TK_COMMENT: return parse_comment(p);
+    case TK_GRANT:   return parse_grant_or_revoke(p, 0);
+    case TK_REVOKE:  return parse_grant_or_revoke(p, 1);
+    case TK_ATTACH:  return parse_attach(p);
+    case TK_DETACH:  return parse_detach(p);
+    case TK_LOCK:    return parse_lock(p);
     case TK_EXPLAIN: {
       advance(p);
       tdb_ast_stmt *inner = parse_stmt(p);

@@ -985,10 +985,16 @@ static int exec_select_body(tdb_db *db, tdb_stmt *st, tdb_select *q, ectx *outer
   int rc = TDB_OK;
   int ngroup = q->group ? q->group->n : 0;
 
-  /* Window functions are only supported in non-aggregated queries: they
-  ** evaluate after WHERE filtering and any joins, in the projection step. */
+  /* Window functions evaluate after WHERE/JOIN, in the projection step,
+  ** over the pre-aggregation rowset. Combining them with GROUP BY or
+  ** scalar aggregates would require windowing over the post-aggregation
+  ** rows, which the executor does not yet build a frame for. Reject
+  ** clearly so callers know to wrap the aggregate in a subquery. */
   if (Q.nwin > 0 && aggregated) {
-    tdb_db_seterr(db, "window functions over an aggregated query are not supported");
+    tdb_db_seterr(db,
+      "window functions are not allowed alongside GROUP BY or scalar "
+      "aggregates; wrap the aggregated query in a subquery and apply the "
+      "window over its result");
     rowset_free(&in); FAILP;
   }
 

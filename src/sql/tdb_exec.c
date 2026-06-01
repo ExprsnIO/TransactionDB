@@ -1174,7 +1174,10 @@ static int stmt_execute_locked(tdb_stmt *st) {
     case ST_DETACH:      rc = exec_detach(db, st, a); break;
     case ST_LOCK_TABLE:  rc = exec_lock(db, st, a); break;
     default:
-      tdb_db_seterr(db, "statement type not yet executable");
+      /* Defensive: every parser-produced statement kind should map to a
+      ** branch above. Include the kind code so an unfamiliar value is
+      ** traceable back to a missing dispatch entry. */
+      tdb_db_seterr(db, "statement type not executable (kind=%d)", (int)a->kind);
       rc = TDB_UNSUPPORTED;
       break;
   }
